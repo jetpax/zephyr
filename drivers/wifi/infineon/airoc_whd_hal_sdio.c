@@ -12,6 +12,7 @@
 #include <bus_protocols/whd_bus.h>
 #include <bus_protocols/whd_sdio.h>
 #include <zephyr/sd/sd.h>
+#include <zephyr/logging/log.h>
 
 LOG_MODULE_DECLARE(infineon_airoc_wifi, CONFIG_WIFI_LOG_LEVEL);
 

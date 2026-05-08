@@ -1,0 +1,15 @@
+# Copyright (c) 2026 SS/pyDirect contributors
+# SPDX-License-Identifier: Apache-2.0
+
+config MSPI_RPI_PICO
+	bool "Raspberry Pi RP2350 QMI MSPI controller driver"
+	default y
+	depends on DT_HAS_RASPBERRYPI_PICO_QMI_ENABLED
+	select PINCTRL
+	select MSPI_XIP
+	help
+	  Drives the RP2350 QSPI Memory Interface (QMI) as an MSPI bus.
+	  Exposes CS1 only — CS0/m[0] is owned by the existing
+	  raspberrypi,pico-flash-controller binding on the same hardware
+	  peripheral. Intended for boards that wire APS6404L pSRAM (or
+	  similar) on the second chip-select.

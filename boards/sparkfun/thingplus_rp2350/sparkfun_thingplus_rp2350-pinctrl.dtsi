@@ -1,0 +1,48 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * SparkFun Thing Plus RP2350 pin assignments (verified from schematic).
+ * Differs from rpi_pico2: SPI0 on GP2/3/4, Qwiic on I2C1 GP6/7,
+ * LED on GP14, microSD CS GP9, PSRAM CS GP8.
+ */
+
+#include <zephyr/dt-bindings/pinctrl/rpi-pico-rp2350a-pinctrl.h>
+
+&pinctrl {
+	uart0_default: uart0_default {
+		group1 {
+			pinmux = <UART0_TX_P0>;
+		};
+		group2 {
+			pinmux = <UART0_RX_P1>;
+			input-enable;
+		};
+	};
+
+	i2c1_default: i2c1_default {
+		group1 {
+			pinmux = <I2C1_SDA_P6>, <I2C1_SCL_P7>;
+			input-enable;
+			input-schmitt-enable;
+		};
+	};
+
+	adc_default: adc_default {
+		group1 {
+			pinmux = <ADC_CH0_P26>, <ADC_CH1_P27>, <ADC_CH2_P28>, <ADC_CH3_P29>;
+			input-enable;
+		};
+	};
+
+	/*
+	 * QMI second chip-select for on-board APS6404L pSRAM. GPIO8 →
+	 * function 9 = GPIO_FUNC_XIP_CS1 (per pico-sdk io_bank0.h:41).
+	 * The Zephyr pinctrl-common.h has no XIP_CS1_* alias yet, so we
+	 * emit the raw RP2XXX_PINMUX(pin, alt_func) form.
+	 */
+	qmi_cs1_default: qmi_cs1_default {
+		group1 {
+			pinmux = <RP2XXX_PINMUX(8, 9)>;
+		};
+	};
+};

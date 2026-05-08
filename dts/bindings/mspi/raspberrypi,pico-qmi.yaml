@@ -1,0 +1,23 @@
+# Copyright (c) 2026 SS/pyDirect contributors
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Raspberry Pi RP2350 QSPI Memory Interface (QMI) exposed as an MSPI
+  controller. Drives the second chip-select (CS1) only — CS0 is owned by
+  the existing flash-controller binding (raspberrypi,pico-flash-controller)
+  on the same hardware peripheral.
+
+  This binding is intended to be applied as a sibling node in a board
+  overlay; the controller driver uses the qmi_hw register window from the
+  pico-sdk HAL and does not consume the DT reg property.
+
+compatible: "raspberrypi,pico-qmi"
+
+include: [pinctrl-device.yaml, mspi-controller.yaml]
+
+properties:
+  pinctrl-0:
+    required: true
+
+  pinctrl-names:
+    required: true

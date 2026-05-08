@@ -1,0 +1,20 @@
+identifier: sparkfun_thingplus_rp2350/rp2350a/m33
+name: SparkFun Thing Plus RP2350 (Cortex-M33)
+type: mcu
+arch: arm
+flash: 16384
+ram: 520
+toolchain:
+  - zephyr
+  - gnuarmemb
+supported:
+  - adc
+  - clock
+  - counter
+  - gpio
+  - hwinfo
+  - i2c
+  - pwm
+  - uart
+  - usbd
+  - watchdog

@@ -1,0 +1,9 @@
+board:
+  name: sparkfun_thingplus_rp2350
+  full_name: SparkFun Thing Plus RP2350
+  vendor: sparkfun
+  socs:
+  - name: rp2350a
+    variants:
+      - name: w
+        cpucluster: m33
