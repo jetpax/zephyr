@@ -42,7 +42,7 @@ int handle_http1_to_websocket_upgrade(struct http_client_ctx *client)
 	char key_accept[HTTP_SERVER_WS_MAX_SEC_KEY_LEN + sizeof(WS_MAGIC)];
 	char accept[20];
 	size_t accept_len;
-	char tmp[64];
+	char tmp[128];
 	size_t key_len;
 	size_t olen;
 	int ret;
@@ -87,7 +87,7 @@ int handle_http1_to_websocket_upgrade(struct http_client_ctx *client)
 		goto error;
 	}
 
-	ret = snprintk(tmp, sizeof(tmp), "\r\nUser-Agent: %s\r\n\r\n",
+	ret = snprintk(tmp, sizeof(tmp), "\r\nSec-WebSocket-Protocol: webrepl.binary.v1\r\nUser-Agent: %s\r\n\r\n",
 		       ZEPHYR_USER_AGENT);
 	if (ret < 0 || ret >= sizeof(tmp)) {
 		goto error;
