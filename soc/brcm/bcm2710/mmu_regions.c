@@ -8,14 +8,14 @@
 #include <zephyr/arch/arm64/arm_mmu.h>
 
 static const struct arm_mmu_region mmu_regions[] = {
-	MMU_REGION_FLAT_ENTRY("GIC",
-			      DT_REG_ADDR_BY_IDX(DT_INST(0, arm_gic), 0),
-			      DT_REG_SIZE_BY_IDX(DT_INST(0, arm_gic), 0),
+	MMU_REGION_FLAT_ENTRY("BCM2836_L1_INTC",
+			      DT_REG_ADDR(DT_INST(0, brcm_bcm2836_l1_intc)),
+			      DT_REG_SIZE(DT_INST(0, brcm_bcm2836_l1_intc)),
 			      MT_DEVICE_nGnRnE | MT_P_RW_U_NA | MT_DEFAULT_SECURE_STATE),
 
-	MMU_REGION_FLAT_ENTRY("GIC",
-			      DT_REG_ADDR_BY_IDX(DT_INST(0, arm_gic), 1),
-			      DT_REG_SIZE_BY_IDX(DT_INST(0, arm_gic), 1),
+	MMU_REGION_FLAT_ENTRY("BCM2835_ARMCTRL_IC",
+			      DT_REG_ADDR(DT_INST(0, brcm_bcm2835_armctrl_ic)),
+			      DT_REG_SIZE(DT_INST(0, brcm_bcm2835_armctrl_ic)),
 			      MT_DEVICE_nGnRnE | MT_P_RW_U_NA | MT_DEFAULT_SECURE_STATE),
 };
 

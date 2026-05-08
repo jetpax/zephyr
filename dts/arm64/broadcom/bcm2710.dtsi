@@ -5,22 +5,25 @@
  *
  * BCM2710 (Pi 3 / Pi Zero 2 W) device tree.
  *
- * Phase 0b: peripherals retargeted to the legacy 0x3f000000
- * base (BCM2710's actual map). Mini-UART core clock is 250 MHz
- * here vs 500 MHz on BCM2711 -- VC4 default on Pi Zero 2 W.
+ * Phase 1b.0: GIC node replaced by the proper BCM283x intc pair --
+ *   - brcm,bcm2836-l1-intc at 0x40000000 (per-core timers, mailboxes,
+ *     PMU, and the GPU cascade);
+ *   - brcm,bcm2835-armctrl-ic at 0x3f00b200 (peripheral aggregator
+ *     hanging off the GPU IRQ of the L1 controller).
  *
- * Still wrong (Phase 1 will fix): the GIC node + the
- * interrupt-parent reference. BCM2710 has no GIC; interrupt
- * routing on real hardware goes through the BCM2835 ARMC +
- * BCM2836 ARM-local intc pair. Left in for now so the build
- * stays green while the intc driver is being written.
+ * The arch layer uses CONFIG_ARM_CUSTOM_INTERRUPT_CONTROLLER and the
+ * z_soc_irq_* hooks in soc/brcm/bcm2710/soc_irq.c. Those hooks are
+ * stubs in this commit -- the actual ISR dispatch lands in 1b.1, so
+ * IRQ delivery is silently disabled at runtime for now. The build
+ * is structurally correct.
  */
 
 #include <mem.h>
 #include <freq.h>
 
 #include <arm64/armv8-a.dtsi>
-#include <zephyr/dt-bindings/interrupt-controller/arm-gic.h>
+#include <zephyr/dt-bindings/interrupt-controller/bcm2836-l1.h>
+#include <zephyr/dt-bindings/interrupt-controller/bcm2835-armctrl.h>
 
 / {
 	cpus {
@@ -34,18 +37,21 @@
 		};
 	};
 
-	interrupt-parent = <&gic>;
+	interrupt-parent = <&armctrl_intc>;
 
 	timer {
 		compatible = "arm,armv8-timer";
-		interrupts = <GIC_PPI 13 IRQ_TYPE_LEVEL
-			      IRQ_DEFAULT_PRIORITY>,
-			     <GIC_PPI 14 IRQ_TYPE_LEVEL
-			      IRQ_DEFAULT_PRIORITY>,
-			     <GIC_PPI 11 IRQ_TYPE_LEVEL
-			      IRQ_DEFAULT_PRIORITY>,
-			     <GIC_PPI 10 IRQ_TYPE_LEVEL
-			      IRQ_DEFAULT_PRIORITY>;
+		interrupt-parent = <&local_intc>;
+		/*
+		 * Index order is canonical (matches the arm,armv8-timer
+		 * binding):
+		 *   0 = secure phys, 1 = nonsec phys, 2 = virtual,
+		 *   3 = hypervisor phys.
+		 */
+		interrupts = <BCM2836_LOCAL_IRQ_CNTPSIRQ  IRQ_TYPE_LEVEL 0>,
+			     <BCM2836_LOCAL_IRQ_CNTPNSIRQ IRQ_TYPE_LEVEL 0>,
+			     <BCM2836_LOCAL_IRQ_CNTVIRQ   IRQ_TYPE_LEVEL 0>,
+			     <BCM2836_LOCAL_IRQ_CNTHPIRQ  IRQ_TYPE_LEVEL 0>;
 	};
 
 	clocks {
@@ -63,12 +69,21 @@
 			reg = <0x200000 0x80000>;
 		};
 
-		gic: interrupt-controller@ff841000 {
-			compatible = "arm,gic-v2", "arm,gic";
-			reg = <0xff841000 0x1000>,
-			      <0xff842000 0x2000>;
+		local_intc: interrupt-controller@40000000 {
+			compatible = "brcm,bcm2836-l1-intc";
+			reg = <0x40000000 0x100>;
 			interrupt-controller;
-			#interrupt-cells = <4>;
+			#interrupt-cells = <3>;
+			status = "okay";
+		};
+
+		armctrl_intc: interrupt-controller@3f00b200 {
+			compatible = "brcm,bcm2835-armctrl-ic";
+			reg = <0x3f00b200 0x200>;
+			interrupt-parent = <&local_intc>;
+			interrupts = <BCM2836_LOCAL_IRQ_GPU IRQ_TYPE_LEVEL 0>;
+			interrupt-controller;
+			#interrupt-cells = <3>;
 			status = "okay";
 		};
 
@@ -88,8 +103,7 @@
 			gpio0: gpio@0 {
 				compatible = "brcm,bcm2711-gpio";
 				reg = <0>;
-				interrupts = <GIC_SPI 113 IRQ_TYPE_LEVEL
-					      IRQ_DEFAULT_PRIORITY>;
+				interrupts = <BCM2835_IRQ_GPIO0 IRQ_TYPE_LEVEL 0>;
 				gpio-controller;
 				#gpio-cells = <2>;
 				ngpios = <28>;
@@ -100,8 +114,7 @@
 			gpio1: gpio@1c {
 				compatible = "brcm,bcm2711-gpio";
 				reg = <28>;
-				interrupts = <GIC_SPI 114 IRQ_TYPE_LEVEL
-					      IRQ_DEFAULT_PRIORITY>;
+				interrupts = <BCM2835_IRQ_GPIO1 IRQ_TYPE_LEVEL 0>;
 				gpio-controller;
 				#gpio-cells = <2>;
 				ngpios = <18>;
@@ -112,8 +125,7 @@
 		uart0: uart@3f201000 {
 			compatible = "arm,pl011";
 			reg = <0x3f201000 0x200>;
-			interrupts = <GIC_SPI 121 IRQ_TYPE_LEVEL
-				      IRQ_DEFAULT_PRIORITY>;
+			interrupts = <BCM2835_IRQ_UART IRQ_TYPE_LEVEL 0>;
 			interrupt-names = "uart0";
 			clocks = <&clk_uart>;
 			status = "disabled";
@@ -123,16 +135,14 @@
 			compatible = "brcm,bcm2711-aux-uart";
 			reg = <0x3f215040 0x40>;
 			clock-frequency = <DT_FREQ_M(250)>;
-			interrupts = <GIC_SPI 93 IRQ_TYPE_LEVEL
-				      IRQ_DEFAULT_PRIORITY>;
+			interrupts = <BCM2835_IRQ_AUX IRQ_TYPE_LEVEL 0>;
 			status = "disabled";
 		};
 
 		uart2: uart@3f201400 {
 			compatible = "arm,pl011";
 			reg = <0x3f201400 0x200>;
-			interrupts = <GIC_SPI 121 IRQ_TYPE_LEVEL
-				      IRQ_DEFAULT_PRIORITY>;
+			interrupts = <BCM2835_IRQ_UART IRQ_TYPE_LEVEL 0>;
 			interrupt-names = "uart2";
 			clocks = <&clk_uart>;
 			status = "disabled";
@@ -141,8 +151,7 @@
 		uart3: uart@3f201600 {
 			compatible = "arm,pl011";
 			reg = <0x3f201600 0x200>;
-			interrupts = <GIC_SPI 121 IRQ_TYPE_LEVEL
-				      IRQ_DEFAULT_PRIORITY>;
+			interrupts = <BCM2835_IRQ_UART IRQ_TYPE_LEVEL 0>;
 			interrupt-names = "uart3";
 			clocks = <&clk_uart>;
 			status = "disabled";
@@ -151,8 +160,7 @@
 		uart4: uart@3f201800 {
 			compatible = "arm,pl011";
 			reg = <0x3f201800 0x200>;
-			interrupts = <GIC_SPI 121 IRQ_TYPE_LEVEL
-				      IRQ_DEFAULT_PRIORITY>;
+			interrupts = <BCM2835_IRQ_UART IRQ_TYPE_LEVEL 0>;
 			interrupt-names = "uart4";
 			clocks = <&clk_uart>;
 			status = "disabled";
@@ -161,8 +169,7 @@
 		uart5: uart@3f201a00 {
 			compatible = "arm,pl011";
 			reg = <0x3f201a00 0x200>;
-			interrupts = <GIC_SPI 121 IRQ_TYPE_LEVEL
-				      IRQ_DEFAULT_PRIORITY>;
+			interrupts = <BCM2835_IRQ_UART IRQ_TYPE_LEVEL 0>;
 			interrupt-names = "uart5";
 			clocks = <&clk_uart>;
 			status = "disabled";
