@@ -9,9 +9,8 @@ config NUM_IRQS
 	default 260
 
 config SYS_CLOCK_HW_CYCLES_PER_SEC
-	# TODO: BCM2710 ARM generic timer is 19.2 MHz on Pi 3 / Pi Zero 2 W,
-	# not 54 MHz like BCM2711. Left at 54M for the Phase 0a build-only
-	# scaffold; will be corrected when address retarget lands.
-	default 54000000
+	# BCM2710 ARM generic timer runs at 19.2 MHz, set by the VPU
+	# firmware before kernel handoff. (BCM2711 uses 54 MHz.)
+	default 19200000
 
 endif
