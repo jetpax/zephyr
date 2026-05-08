@@ -63,10 +63,25 @@
 	};
 
 	soc {
+		/*
+		 * DRAM region the Zephyr image is linked into. Base
+		 * 0x200000 (2 MiB) leaves the bottom 2 MiB free; the
+		 * Pi firmware's default kernel8.img load address is
+		 * 0x80000, so a `kernel_address=0x200000` line in
+		 * config.txt is required when flashing to real hardware.
+		 *
+		 * Size 0x10000000 = 256 MiB. Pi Zero 2 W has 512 MiB of
+		 * DRAM total; the VPU firmware reserves ~64 MiB at the
+		 * top (0x1c000000..0x20000000), so 0x80000..0x1c000000
+		 * is the usable ARM-side window. We claim 256 MiB
+		 * starting at 0x200000, which is well within bounds and
+		 * leaves room for VPU communication buffers etc. that
+		 * would normally live just above the kernel.
+		 */
 		sram0: memory@200000 {
 			device_type = "memory";
 			compatible = "mmio-sram";
-			reg = <0x200000 0x80000>;
+			reg = <0x200000 0x10000000>;
 		};
 
 		local_intc: interrupt-controller@40000000 {
