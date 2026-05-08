@@ -218,19 +218,18 @@ void z_soc_irq_priority_set(unsigned int irq, unsigned int prio,
 	ARG_UNUSED(flags);
 }
 
-unsigned int z_soc_irq_get_active(void)
+/*
+ * Identify the firing IRQ. Returns CONFIG_NUM_IRQS for spurious so the
+ * arm64 isr_wrapper's bounds check (`irq > NUM_IRQS - 1 -> spurious`)
+ * dispatches to nothing.
+ */
+static unsigned int decode_active(void)
 {
 	uint32_t l1 = sys_read32(L1_IRQ_SOURCE(CORE_ID));
 
 	if (l1 == 0) {
-		return CONFIG_NUM_IRQS;     /* spurious -- isr_wrapper falls through */
+		return CONFIG_NUM_IRQS;
 	}
-
-	/*
-	 * Locally-routed L1 sources first. Each masked subfield is
-	 * tested in priority order; __builtin_ctz is safe because the
-	 * preceding if-guard ensures the input is non-zero.
-	 */
 	if (l1 & L1_SRC_TIMER_MASK) {
 		return __builtin_ctz(l1 & L1_SRC_TIMER_MASK);    /* 0..3 */
 	}
@@ -242,17 +241,15 @@ unsigned int z_soc_irq_get_active(void)
 	}
 
 	/*
-	 * Only the GPU cascade bit is set. Walk the BCM2835 ARMC pending
-	 * registers using Linux's exact dispatch order (Quirk-1-aware:
-	 * shortcuts come BEFORE bank 1/2 fall-through, since shortcut
-	 * bits suppress the bank-1/2 indicator).
+	 * Only the L1 GPU cascade bit can be set. Walk BCM2835 ARMC,
+	 * mirroring Linux's get_next_armctrl_hwirq exactly: shortcuts
+	 * (Quirk 1) come before the bank-1/2 fall-through.
 	 */
 	uint32_t basic = sys_read32(ARMC_IRQ_BASIC_PENDING) & BANK0_VALID_MASK;
 
 	if (basic == 0) {
 		return CONFIG_NUM_IRQS;
 	}
-
 	if (basic & BANK0_BASIC_MASK) {
 		return ARMC_IRQ_ENC(0, __builtin_ctz(basic & BANK0_BASIC_MASK));
 	}
@@ -279,14 +276,38 @@ unsigned int z_soc_irq_get_active(void)
 	return CONFIG_NUM_IRQS;
 }
 
+unsigned int z_soc_irq_get_active(void)
+{
+	unsigned int irq = decode_active();
+
+	/*
+	 * The arm64 isr_wrapper unmasks IRQs globally (`daifclr`) around
+	 * the ISR call to support nested handlers. With a GIC that's
+	 * fine -- ack-on-read prevents the same source from re-entering
+	 * the handler. The BCM2835/2836 intc pair has no such ack: a
+	 * level-triggered source stays asserted until the peripheral's
+	 * own state machine clears it, so unmasking globally would
+	 * re-fire the same IRQ before its ISR has had a chance to run.
+	 *
+	 * Workaround: mask the source here at the SoC intc, let the ISR
+	 * run, then re-enable in z_soc_irq_eoi. This brackets the ISR
+	 * with a per-source mask the way GIC's running-priority would.
+	 */
+	if (irq < CONFIG_NUM_IRQS) {
+		z_soc_irq_disable(irq);
+	}
+	return irq;
+}
+
 void z_soc_irq_eoi(unsigned int irq)
 {
 	/*
-	 * Both controllers are level-driven by the source peripheral; no
-	 * separate EOI register exists. Each peripheral driver clears
-	 * its own pending state through the device's normal ack path
-	 * (e.g. reading mini-UART RX FIFO clears the RX-data-available
-	 * line).
+	 * Re-enable the source masked by z_soc_irq_get_active. By now
+	 * either the ISR cleared the underlying peripheral and the
+	 * source is no longer asserted (normal case) or we're returning
+	 * from a spurious dispatch and there's nothing to re-fire.
 	 */
-	ARG_UNUSED(irq);
+	if (irq < CONFIG_NUM_IRQS) {
+		z_soc_irq_enable(irq);
+	}
 }
