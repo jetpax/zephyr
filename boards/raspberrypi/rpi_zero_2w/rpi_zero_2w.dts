@@ -1,0 +1,42 @@
+/*
+ * Copyright (c) 2026 jetpax
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/dts-v1/;
+
+#include <broadcom/bcm2710.dtsi>
+#include <broadcom/bcm2711-pinctrl.dtsi>
+#include <zephyr/dt-bindings/gpio/gpio.h>
+
+/ {
+	model = "Raspberry Pi Zero 2 W";
+	compatible = "raspberrypi,model-zero-2-w", "brcm,bcm2710";
+	#address-cells = <1>;
+	#size-cells = <1>;
+
+	chosen {
+		zephyr,console = &uart1;
+		zephyr,shell-uart = &uart1;
+		zephyr,sram = &sram0;
+		zephyr,entropy = &rng;
+	};
+
+	/*
+	 * Pi Zero 2 W has an on-board ACT LED, but it's wired through
+	 * the firmware (not on a fixed GPIO accessible to the ARM cores)
+	 * unlike the Pi 4 -- so no leds node here.
+	 */
+};
+
+&gpio1 {
+	status = "okay";
+};
+
+&uart1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart1_gpio14>;
+	current-speed = <115200>;
+	status = "okay";
+};

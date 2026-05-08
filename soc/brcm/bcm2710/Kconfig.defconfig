@@ -1,0 +1,17 @@
+# Copyright (c) 2026 jetpax
+# SPDX-License-Identifier: Apache-2.0
+
+if SOC_BCM2710
+
+config NUM_IRQS
+	# TODO: revisit once the BCM2835/2836 interrupt controller driver lands;
+	# placeholder copied from BCM2711 (which counts GIC SPIs).
+	default 260
+
+config SYS_CLOCK_HW_CYCLES_PER_SEC
+	# TODO: BCM2710 ARM generic timer is 19.2 MHz on Pi 3 / Pi Zero 2 W,
+	# not 54 MHz like BCM2711. Left at 54M for the Phase 0a build-only
+	# scaffold; will be corrected when address retarget lands.
+	default 54000000
+
+endif
