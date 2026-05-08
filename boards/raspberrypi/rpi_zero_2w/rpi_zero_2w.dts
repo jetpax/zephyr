@@ -30,9 +30,17 @@
 	 */
 };
 
-&gpio1 {
-	status = "okay";
-};
+/*
+ * NOTE: gpio0/gpio1 are deliberately left disabled. The Zephyr
+ * "brcm,bcm2711-gpio" driver pokes the BCM2711-specific
+ * GPIO_PUP_PDN_CNTRL_REG0 (offset 0xe4) on init, which doesn't
+ * exist on the BCM2710 family -- QEMU raspi3b traps it as
+ * "bcm2835_gpio_read: Bad offset e4" and on real hardware the
+ * write is silently misrouted. machine.Pin() won't be available
+ * until a BCM283x-aware GPIO driver lands or the bcm2711 driver
+ * is taught the legacy pull-control sequence (GPPUD/GPPUDCLK
+ * at 0x94/0x98/0x9c).
+ */
 
 &uart1 {
 	pinctrl-names = "default";
