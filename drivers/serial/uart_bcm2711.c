@@ -160,13 +160,19 @@ static int uart_bcm2711_poll_in(const struct device *dev, unsigned char *c)
 {
 	struct bcm2711_uart_data *uart_data = dev->data;
 
-	while (!bcm2711_mu_lowlevel_can_getc(uart_data->uart_addr)) {
-		;
+	/*
+	 * Zephyr's poll_in API contract: return 0 when a character was
+	 * read into *c, or a negative value when no character is
+	 * currently available. Callers like Zephyr's console drain
+	 * loop ("while (uart_poll_in(...) == 0) ;") rely on the no-char
+	 * path returning a non-zero value to terminate -- spinning here
+	 * waiting for input would hang forever on an idle UART.
+	 */
+	if (!bcm2711_mu_lowlevel_can_getc(uart_data->uart_addr)) {
+		return -1;
 	}
 
-	/* got a character */
 	*c = sys_read32(uart_data->uart_addr + BCM2711_MU_IO) & 0xFF;
-
 	return 0;
 }
 
@@ -201,18 +207,28 @@ static int uart_bcm2711_fifo_read(const struct device *dev, uint8_t *rx_data,
 	return num_rx;
 }
 
+/*
+ * Mini-UART IER is a read/write register; the *_enable / *_disable
+ * helpers must read-modify-write to set/clear the single bit they
+ * own, otherwise the symmetric *_disable functions would also clear
+ * the OTHER channel's enable bit and disturb upper IER bits (which
+ * include FIFO-clear shortcuts in the BCM2835 mini-UART).
+ */
 static void uart_bcm2711_irq_tx_enable(const struct device *dev)
 {
 	struct bcm2711_uart_data *uart_data = dev->data;
+	uint32_t ier = sys_read32(uart_data->uart_addr + BCM2711_MU_IER);
 
-	sys_write32(BCM2711_MU_IER_TX_INTERRUPT, uart_data->uart_addr + BCM2711_MU_IER);
+	sys_write32(ier | BCM2711_MU_IER_TX_INTERRUPT,
+		    uart_data->uart_addr + BCM2711_MU_IER);
 }
 
 static void uart_bcm2711_irq_tx_disable(const struct device *dev)
 {
 	struct bcm2711_uart_data *uart_data = dev->data;
+	uint32_t ier = sys_read32(uart_data->uart_addr + BCM2711_MU_IER);
 
-	sys_write32((uint32_t)(~BCM2711_MU_IER_TX_INTERRUPT),
+	sys_write32(ier & ~BCM2711_MU_IER_TX_INTERRUPT,
 		    uart_data->uart_addr + BCM2711_MU_IER);
 }
 
@@ -226,15 +242,18 @@ static int uart_bcm2711_irq_tx_ready(const struct device *dev)
 static void uart_bcm2711_irq_rx_enable(const struct device *dev)
 {
 	struct bcm2711_uart_data *uart_data = dev->data;
+	uint32_t ier = sys_read32(uart_data->uart_addr + BCM2711_MU_IER);
 
-	sys_write32(BCM2711_MU_IER_RX_INTERRUPT, uart_data->uart_addr + BCM2711_MU_IER);
+	sys_write32(ier | BCM2711_MU_IER_RX_INTERRUPT,
+		    uart_data->uart_addr + BCM2711_MU_IER);
 }
 
 static void uart_bcm2711_irq_rx_disable(const struct device *dev)
 {
 	struct bcm2711_uart_data *uart_data = dev->data;
+	uint32_t ier = sys_read32(uart_data->uart_addr + BCM2711_MU_IER);
 
-	sys_write32((uint32_t)(~BCM2711_MU_IER_RX_INTERRUPT),
+	sys_write32(ier & ~BCM2711_MU_IER_RX_INTERRUPT,
 		    uart_data->uart_addr + BCM2711_MU_IER);
 }
 
