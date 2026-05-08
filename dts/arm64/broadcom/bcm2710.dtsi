@@ -5,14 +5,15 @@
  *
  * BCM2710 (Pi 3 / Pi Zero 2 W) device tree.
  *
- * Phase 0a scaffold: the addresses and interrupt controller below
- * are copied verbatim from bcm2711.dtsi (which targets Cortex-A72,
- * high-peri base 0xfe000000 and a GIC-400 at 0xff841000). BCM2710
- * actually has neither a GIC nor the high-peri map -- peripherals
- * sit at 0x3f000000 and the interrupt controller is the BCM2835
- * ARMC + BCM2836 ARM-local pair. Those changes land in follow-up
- * commits. The only real BCM2710 fact in this file is the CPU
- * compatible (Cortex-A53).
+ * Phase 0b: peripherals retargeted to the legacy 0x3f000000
+ * base (BCM2710's actual map). Mini-UART core clock is 250 MHz
+ * here vs 500 MHz on BCM2711 -- VC4 default on Pi Zero 2 W.
+ *
+ * Still wrong (Phase 1 will fix): the GIC node + the
+ * interrupt-parent reference. BCM2710 has no GIC; interrupt
+ * routing on real hardware goes through the BCM2835 ARMC +
+ * BCM2836 ARM-local intc pair. Left in for now so the build
+ * stays green while the intc driver is being written.
  */
 
 #include <mem.h>
@@ -71,15 +72,15 @@
 			status = "okay";
 		};
 
-		rng: rng@fe104000 {
+		rng: rng@3f104000 {
 			compatible = "brcm,iproc-rng200";
-			reg = <0xfe104000 0x28>;
+			reg = <0x3f104000 0x28>;
 			status = "okay";
 		};
 
-		pinctrl: pin-controller@fe200000 {
+		pinctrl: pin-controller@3f200000 {
 			compatible = "brcm,bcm2711-pinctrl";
-			reg = <0xfe200000 0xf4>;
+			reg = <0x3f200000 0xf4>;
 			#address-cells = <1>;
 			#size-cells = <0>;
 
@@ -108,9 +109,9 @@
 			};
 		};
 
-		uart0: uart@fe201000 {
+		uart0: uart@3f201000 {
 			compatible = "arm,pl011";
-			reg = <0xfe201000 0x200>;
+			reg = <0x3f201000 0x200>;
 			interrupts = <GIC_SPI 121 IRQ_TYPE_LEVEL
 				      IRQ_DEFAULT_PRIORITY>;
 			interrupt-names = "uart0";
@@ -118,18 +119,18 @@
 			status = "disabled";
 		};
 
-		uart1: uart@fe215040 {
+		uart1: uart@3f215040 {
 			compatible = "brcm,bcm2711-aux-uart";
-			reg = <0xfe215040 0x40>;
-			clock-frequency = <DT_FREQ_M(500)>;
+			reg = <0x3f215040 0x40>;
+			clock-frequency = <DT_FREQ_M(250)>;
 			interrupts = <GIC_SPI 93 IRQ_TYPE_LEVEL
 				      IRQ_DEFAULT_PRIORITY>;
 			status = "disabled";
 		};
 
-		uart2: uart@fe201400 {
+		uart2: uart@3f201400 {
 			compatible = "arm,pl011";
-			reg = <0xfe201400 0x200>;
+			reg = <0x3f201400 0x200>;
 			interrupts = <GIC_SPI 121 IRQ_TYPE_LEVEL
 				      IRQ_DEFAULT_PRIORITY>;
 			interrupt-names = "uart2";
@@ -137,9 +138,9 @@
 			status = "disabled";
 		};
 
-		uart3: uart@fe201600 {
+		uart3: uart@3f201600 {
 			compatible = "arm,pl011";
-			reg = <0xfe201600 0x200>;
+			reg = <0x3f201600 0x200>;
 			interrupts = <GIC_SPI 121 IRQ_TYPE_LEVEL
 				      IRQ_DEFAULT_PRIORITY>;
 			interrupt-names = "uart3";
@@ -147,9 +148,9 @@
 			status = "disabled";
 		};
 
-		uart4: uart@fe201800 {
+		uart4: uart@3f201800 {
 			compatible = "arm,pl011";
-			reg = <0xfe201800 0x200>;
+			reg = <0x3f201800 0x200>;
 			interrupts = <GIC_SPI 121 IRQ_TYPE_LEVEL
 				      IRQ_DEFAULT_PRIORITY>;
 			interrupt-names = "uart4";
@@ -157,9 +158,9 @@
 			status = "disabled";
 		};
 
-		uart5: uart@fe201a00 {
+		uart5: uart@3f201a00 {
 			compatible = "arm,pl011";
-			reg = <0xfe201a00 0x200>;
+			reg = <0x3f201a00 0x200>;
 			interrupts = <GIC_SPI 121 IRQ_TYPE_LEVEL
 				      IRQ_DEFAULT_PRIORITY>;
 			interrupt-names = "uart5";
