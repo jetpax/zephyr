@@ -189,5 +189,22 @@
 			clocks = <&clk_uart>;
 			status = "disabled";
 		};
+
+		/*
+		 * Arasan SDHCI controller (EMMC). On Pi Zero 2 W this is
+		 * wired to the CYW43439 wireless module. Default disabled --
+		 * board overlays opt in. The clock-frequency property
+		 * tracks clk_emmc set by the VPU firmware; see the board
+		 * doc for the config.txt knob (typ. 100 MHz with
+		 * core_freq=250).
+		 */
+		emmc: sdhci@3f300000 {
+			compatible = "brcm,bcm2835-sdhci";
+			reg = <0x3f300000 0x100>;
+			interrupts = <BCM2835_IRQ_ARASAN_SDIO IRQ_TYPE_LEVEL 0>;
+			clock-frequency = <DT_FREQ_M(100)>;
+			bus-width = <4>;
+			status = "disabled";
+		};
 	};
 };

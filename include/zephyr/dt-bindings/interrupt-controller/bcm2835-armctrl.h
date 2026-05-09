@@ -62,6 +62,7 @@
 #define BCM2835_IRQ_SPI             BCM2835_BANK2(22)
 #define BCM2835_IRQ_PCM             BCM2835_BANK2(23)
 #define BCM2835_IRQ_UART            BCM2835_BANK2(25) /* PL011 UART0 */
+#define BCM2835_IRQ_ARASAN_SDIO     BCM2835_BANK2(30) /* Arasan SDHCI / EMMC */
 
 #ifndef IRQ_TYPE_LEVEL
 #define IRQ_TYPE_LEVEL  2
