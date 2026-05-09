@@ -45,3 +45,17 @@ properties:
       Number of data lines wired between the controller and the
       attached card / chip. The Arasan core does not support 8-bit;
       4-bit is required for the CYW43439 wireless module.
+
+  wifi-reg-on-gpios:
+    type: phandle-array
+    description: |
+      GPIO line tied to the on-module wireless chip's reset / regulator
+      enable (CYW43439 WL_REG_ON, active high). When set, the driver
+      asserts this line during init and waits for the chip to power
+      up before any commands are issued. Optional; if absent the
+      driver assumes the chip is already powered (e.g. an external
+      power sequencer drove WL_REG_ON before Zephyr started).
+
+      This belongs structurally on a separate mmc-pwrseq node (Linux's
+      idiom), but for v1 bring-up wiring it directly into the SDHC
+      node is one fewer indirection.

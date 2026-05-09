@@ -5,24 +5,44 @@
  *
  * Broadcom BCM2835 / BCM2710 / BCM2837 Arasan SDHCI host controller.
  *
- * Skeleton -- only the device-instance plumbing and a one-shot probe at
- * init are wired up. All six sdhc.h API methods stub to -ENOTSUP. The
- * register sequencer (command/data PIO) lands in subsequent commits as
- * the SDIO bring-up progresses.
+ * Polled (no IRQ) implementation of the six sdhc.h device-API methods:
+ * reset, set_io (clock + width + power), request (cmd + PIO data),
+ * get_card_present, get_host_props, card_busy. Targets the EMMC port
+ * that's wired to the on-module CYW43439 wireless chip on Pi 3 / Pi
+ * Zero 2 W.
  *
- * Two silicon facts shape the future driver:
+ * Three silicon facts shape this driver:
  *
  *   - 32-bit-only register access. Every read/write must be aligned to
- *     a 32-bit boundary at 32-bit width; the controller silently corrupts
- *     or hangs on sub-word accesses. SDHCI's 8/16-bit registers are
- *     synthesised via RMW on the containing 32-bit word.
+ *     a 32-bit boundary at 32-bit width; the controller silently
+ *     corrupts or hangs on sub-word accesses. We compose the SDHCI
+ *     32-bit aggregates (BLKSIZECNT, CMDTM, CONTROL0, CONTROL1) in our
+ *     own 32-bit values rather than going through an iproc-style
+ *     16-bit-write shadow layer -- the natural form here.
  *
- *   - Capabilities register reads as zero. The driver hardcodes the
- *     real values per the Linux sdhci-iproc bcm2835 variant data:
- *     max-block 1024, 3.3V VDD, high-speed support, driver type A/C.
+ *   - Capabilities register reads as zero. The silicon's CAPABILITIES
+ *     at offset 0x40 doesn't reflect actual capabilities -- we expose
+ *     hardcoded values from get_host_props(): max-block 1024, 3.3V
+ *     VDD, high-speed support, driver type A/C. Mirrors Linux's
+ *     sdhci-iproc.c::bcm2835_data (caps + caps1).
+ *
+ *   - Several SDHCI-spec quirks hold here:
+ *       * BROKEN_CARD_DETECTION  -- no CD line; chip is hardwired-on.
+ *           CARD_INSERT/REMOVE masked out of INT_ENABLE.
+ *       * NO_HISPD_BIT           -- HCTL_HS in CONTROL0 ignored.
+ *           High speed comes from the clock divider only.
+ *       * DATA_TIMEOUT_USES_SDCLK -- DATA_TOUT field counts SD clocks,
+ *           not TMCLK. We program max (0xE).
+ *       * PRESET_VALUE_BROKEN    -- preset registers don't work; we
+ *           configure clock/voltage explicitly.
+ *
+ * IRQ-driven completion (and SDIO async events via CARD_INT) is left
+ * for a future commit; polling is plenty for SDIO control traffic and
+ * keeps bring-up debuggable. R1b / R5b (busy-after-response) are
+ * deferred for the same reason.
  *
  * References (open as you read this file):
- *   - Linux: drivers/mmc/host/sdhci-iproc.c    -- our quirk source
+ *   - Linux: drivers/mmc/host/sdhci-iproc.c    -- the quirk source
  *   - Linux: drivers/mmc/host/sdhci.c          -- protocol core
  *   - BCM2835 ARM Peripherals datasheet, ch. 5 (External Mass Media
  *     Controller). The datasheet hand-waves to the Arasan
@@ -35,6 +55,7 @@
 
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/drivers/sdhc.h>
 #include <zephyr/init.h>
@@ -163,6 +184,7 @@ LOG_MODULE_REGISTER(sdhc_bcm2835, CONFIG_SDHC_LOG_LEVEL);
 struct sdhc_bcm2835_config {
 	DEVICE_MMIO_ROM;
 	const struct pinctrl_dev_config *pincfg;
+	struct gpio_dt_spec wifi_reg_on;	/* CYW43439 WL_REG_ON */
 	uint32_t clock_freq;
 	uint8_t bus_width;
 };
@@ -777,6 +799,27 @@ static int sdhc_bcm2835_init(const struct device *dev)
 		return ret;
 	}
 
+	/* If a WL_REG_ON-style enable line is wired (CYW43439 reset on Pi
+	 * Zero 2 W), drive it high to bring the chip out of reset. The
+	 * Cypress datasheet calls for >= 50 ms after WL_REG_ON before the
+	 * SDIO interface is guaranteed ready. We do this before touching
+	 * the controller so the chip has its full settling window.
+	 */
+	if (cfg->wifi_reg_on.port != NULL) {
+		if (!gpio_is_ready_dt(&cfg->wifi_reg_on)) {
+			LOG_ERR("%s wifi_reg_on GPIO not ready", dev->name);
+			return -ENODEV;
+		}
+		ret = gpio_pin_configure_dt(&cfg->wifi_reg_on,
+					    GPIO_OUTPUT_ACTIVE);
+		if (ret != 0) {
+			LOG_ERR("%s wifi_reg_on configure failed: %d",
+				dev->name, ret);
+			return ret;
+		}
+		k_msleep(50);
+	}
+
 	uintptr_t base = DEVICE_MMIO_GET(dev);
 	uint32_t slot_isr_ver = sys_read32(base + SDHCI_SLOT_INT_STATUS_VERSION);
 	uint16_t version = (uint16_t)(slot_isr_ver >> 16);
@@ -839,18 +882,34 @@ static int sdhc_bcm2835_init(const struct device *dev)
 		.arg = 0,
 		.response_type = SD_RSP_TYPE_NONE,
 	};
-	ret = sdhc_bcm2835_request(dev, &cmd0, NULL);
-	uint32_t int_after = sys_read32(base + SDHCI_INT_STATUS);
+	int ret_cmd0 = sdhc_bcm2835_request(dev, &cmd0, NULL);
 
-	printk("sdhc_bcm2835: %s @ 0x%lx, ver 0x%04x, clk_emmc %u Hz, %u-bit dts, "
-	       "CONTROL0=0x%08x CONTROL1=0x%08x, CMD0 ret=%d INT_STATUS=0x%08x\n",
-	       dev->name, (unsigned long)base, version,
-	       cfg->clock_freq, cfg->bus_width, ctrl0, ctrl1, ret, int_after);
+	/* Scaffold self-test #3: CMD52 (IO_RW_DIRECT) read of CCCR_REVISION
+	 * at function 0, register 0x00. This is the smallest meaningful
+	 * "is the chip on the bus alive" test. Argument 0 = read, function 0,
+	 * register address 0, no RAW. Response is R5: low 16 bits = R5 flags,
+	 * bits 23:16 = the data byte. CCCR_REVISION returns 0x43 for a card
+	 * implementing CCCR v3.0 / SDIO v3.0 (high nibble = SDIO spec, low
+	 * nibble = CCCR layout). 0x44 = SDIO v4.0; the CYW43439 reports 0x43.
+	 */
+	struct sdhc_command cmd52 = {
+		.opcode = SDIO_RW_DIRECT,
+		.arg = 0,
+		.response_type = SD_RSP_TYPE_R5,
+	};
+	int ret_cmd52 = sdhc_bcm2835_request(dev, &cmd52, NULL);
 
-	LOG_INF("%s @ 0x%lx, ver 0x%04x, clk_emmc %u Hz, %u-bit dts, "
-		"CONTROL0=0x%08x CONTROL1=0x%08x, CMD0 ret=%d INT_STATUS=0x%08x",
-		dev->name, (unsigned long)base, version,
-		cfg->clock_freq, cfg->bus_width, ctrl0, ctrl1, ret, int_after);
+	printk("sdhc_bcm2835: %s ver 0x%04x clk %u, post-init "
+	       "CONTROL0=0x%08x CONTROL1=0x%08x, "
+	       "CMD0 ret=%d, CMD52 ret=%d resp=0x%08x\n",
+	       dev->name, version, cfg->clock_freq, ctrl0, ctrl1,
+	       ret_cmd0, ret_cmd52, cmd52.response[0]);
+
+	LOG_INF("%s ver 0x%04x clk %u, post-init "
+		"CONTROL0=0x%08x CONTROL1=0x%08x, "
+		"CMD0 ret=%d, CMD52 ret=%d resp=0x%08x",
+		dev->name, version, cfg->clock_freq, ctrl0, ctrl1,
+		ret_cmd0, ret_cmd52, cmd52.response[0]);
 
 	return 0;
 }
@@ -869,6 +928,8 @@ static DEVICE_API(sdhc, sdhc_bcm2835_api) = {
 	static const struct sdhc_bcm2835_config sdhc_bcm2835_cfg_##inst = {	\
 		DEVICE_MMIO_ROM_INIT(DT_DRV_INST(inst)),			\
 		.pincfg = PINCTRL_DT_INST_DEV_CONFIG_GET(inst),			\
+		.wifi_reg_on = GPIO_DT_SPEC_INST_GET_OR(inst,			\
+				wifi_reg_on_gpios, {0}),			\
 		.clock_freq = DT_INST_PROP(inst, clock_frequency),		\
 		.bus_width  = DT_INST_PROP(inst, bus_width),			\
 	};									\

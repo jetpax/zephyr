@@ -41,11 +41,14 @@
  * The Arasan SDHCI controller is wired to the on-module CYW43439
  * wireless chip on this board. The pinctrl groups route GPIO 34..39
  * to ALT3 (SD1_CLK / SD1_CMD / SD1_DAT0..3) and GPIO 43 to ALT0
- * (GPCLK2 -- the wireless-module reference clock). Mirrors Linux's
- * bcm2837-rpi-zero-2-w.dts &sdhci block.
+ * (GPCLK2 -- the wireless-module reference clock). GPIO 41 ("WL_ON"
+ * in the line-naming on Pi OS) is the chip's reset / regulator enable
+ * (active high); the driver asserts it at init. Mirrors Linux's
+ * bcm2837-rpi-zero-2-w.dts &sdhci + &wifi_pwrseq blocks.
  */
 &emmc {
 	pinctrl-names = "default";
 	pinctrl-0 = <&emmc_gpio34 &gpclk2_gpio43>;
+	wifi-reg-on-gpios = <&gpio1 13 GPIO_ACTIVE_HIGH>;
 	status = "okay";
 };
