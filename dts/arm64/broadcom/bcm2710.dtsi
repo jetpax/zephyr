@@ -114,7 +114,11 @@
 			#address-cells = <1>;
 			#size-cells = <0>;
 
-			/* GPIO 0 ~ 27 */
+			/* GPIO 0 ~ 27. legacy-pull-control selects the
+			 * BCM2835-family GPPUD/GPPUDCLK pull sequence; the
+			 * default BCM2711 PUP_PDN_CNTRL_REG at 0xE4 is
+			 * reserved on this silicon.
+			 */
 			gpio0: gpio@0 {
 				compatible = "brcm,bcm2711-gpio";
 				reg = <0>;
@@ -122,7 +126,8 @@
 				gpio-controller;
 				#gpio-cells = <2>;
 				ngpios = <28>;
-				status = "disabled";
+				legacy-pull-control;
+				status = "okay";
 			};
 
 			/* GPIO 28 ~ 45 */
@@ -133,7 +138,8 @@
 				gpio-controller;
 				#gpio-cells = <2>;
 				ngpios = <18>;
-				status = "disabled";
+				legacy-pull-control;
+				status = "okay";
 			};
 		};
 
