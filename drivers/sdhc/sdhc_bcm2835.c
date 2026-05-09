@@ -50,19 +50,46 @@ LOG_MODULE_REGISTER(sdhc_bcm2835, CONFIG_SDHC_LOG_LEVEL);
  * = CLOCK_CONTROL + TIMEOUT + SOFTWARE_RESET); we always touch the
  * containing 32-bit word.
  */
-#define SDHCI_CLOCK_CONTROL		0x2C	/* low 32 of CONTROL1 word */
+#define SDHCI_HOST_CONTROL		0x28	/* CONTROL0 word: HCTL+POWER+... */
+#define SDHCI_CLOCK_CONTROL		0x2C	/* CONTROL1 word: CLK+TOUT+RESET */
 #define SDHCI_SLOT_INT_STATUS_VERSION	0xFC
 
+/* CONTROL0 (32-bit at 0x28) -- HCTL[7:0] + POWER[15:8] + BLOCK_GAP[23:16]
+ * + WAKEUP[31:24]. We touch HCTL bits and the POWER subregister.
+ */
+#define SDHCI_CTRL0_HCTL_DWIDTH		BIT(1)	/* 4-bit data bus */
+#define SDHCI_CTRL0_HCTL_HS		BIT(2)	/* high-speed mode (NO_HISPD_BIT
+						 * quirk: silicon ignores this --
+						 * speed is set via clock divider) */
+#define SDHCI_CTRL0_HCTL_8BIT		BIT(5)	/* not supported on this silicon */
+#define SDHCI_CTRL0_POWER_ON		BIT(8)	/* SD bus power enable */
+#define SDHCI_CTRL0_VOLT_SHIFT		9
+#define SDHCI_CTRL0_VOLT_MASK		(0x7 << SDHCI_CTRL0_VOLT_SHIFT)
+#define SDHCI_CTRL0_VOLT_330		(0x7 << SDHCI_CTRL0_VOLT_SHIFT)
+
 /* CONTROL1 (32-bit at 0x2C) -- standard SDHCI clock + timeout + reset */
+#define SDHCI_CTRL1_CLK_INTLEN		BIT(0)	/* internal clock enable */
+#define SDHCI_CTRL1_CLK_STABLE		BIT(1)	/* internal clock stable (RO) */
+#define SDHCI_CTRL1_CLK_EN		BIT(2)	/* SD bus clock enable */
+#define SDHCI_CTRL1_CLK_GENSEL		BIT(5)	/* 0 = divided clock mode */
+#define SDHCI_CTRL1_CLK_FREQ_MS_SHIFT	6	/* upper 2 bits of 10-bit div */
+#define SDHCI_CTRL1_CLK_FREQ_MS_MASK	(0x3 << SDHCI_CTRL1_CLK_FREQ_MS_SHIFT)
+#define SDHCI_CTRL1_CLK_FREQ_LO_SHIFT	8	/* lower 8 bits of 10-bit div */
+#define SDHCI_CTRL1_CLK_FREQ_LO_MASK	(0xFF << SDHCI_CTRL1_CLK_FREQ_LO_SHIFT)
+#define SDHCI_CTRL1_CLK_FREQ_MASK	(SDHCI_CTRL1_CLK_FREQ_MS_MASK | \
+					 SDHCI_CTRL1_CLK_FREQ_LO_MASK)
+#define SDHCI_CTRL1_DATA_TOUT_SHIFT	16	/* timeout exponent */
+#define SDHCI_CTRL1_DATA_TOUT_MASK	(0xF << SDHCI_CTRL1_DATA_TOUT_SHIFT)
 #define SDHCI_CTRL1_RESET_ALL		BIT(24)	/* SRST_HC: reset whole HC */
 #define SDHCI_CTRL1_RESET_CMD		BIT(25)	/* SRST_CMD: cmd line reset */
 #define SDHCI_CTRL1_RESET_DATA		BIT(26)	/* SRST_DATA: data line reset */
 
 /* Software reset timeout. Linux's sdhci.c defaults to 100 ms here and
  * that's plenty for any sane controller -- the bit self-clears in
- * microseconds on healthy silicon.
+ * microseconds on healthy silicon. Same ceiling for clock-stable.
  */
 #define BCM2835_SDHCI_RESET_TIMEOUT_MS	100
+#define BCM2835_SDHCI_CLK_STABLE_MS	100
 
 /* Hardcoded host capabilities -- see sdhci-iproc.c::bcm2835_data.
  * The silicon's CAPABILITIES register at 0x40 reads as zero on this
@@ -93,11 +120,144 @@ static int sdhc_bcm2835_request(const struct device *dev,
 	return -ENOTSUP;
 }
 
+/* Compute the 10-bit "divided clock mode" divider that yields the
+ * largest SD bus clock <= target_hz, given clk_emmc as the input. The
+ * SDHCI v3 spec defines the divisor as 2 * V where V is the 10-bit
+ * value programmed into CLK_FREQ; V=0 means 1:1 (max base clock).
+ *
+ * V = ceil(clk_emmc / (2 * target_hz))
+ *
+ * Linux's sdhci.c does the same calculation (see __sdhci_calc_clock).
+ * We ceil-divide so we never run the bus *above* target_hz.
+ */
+static uint32_t sdhc_bcm2835_calc_clk_div(uint32_t clk_in, uint32_t target_hz)
+{
+	uint32_t div;
+
+	if (target_hz == 0 || target_hz >= clk_in) {
+		return 0;	/* V=0 => bus = clk_in */
+	}
+
+	div = (clk_in + (target_hz * 2) - 1) / (target_hz * 2);
+	if (div > 0x3FF) {
+		div = 0x3FF;	/* clamp to 10-bit */
+	}
+	return div;
+}
+
+static int sdhc_bcm2835_set_clock(const struct device *dev, uint32_t target_hz)
+{
+	uintptr_t base = DEVICE_MMIO_GET(dev);
+	const struct sdhc_bcm2835_config *cfg = dev->config;
+	uint32_t ctrl1;
+	uint32_t div;
+	int64_t deadline;
+
+	/* Tear down the current bus clock + internal clock so we can
+	 * reprogram the divider. SDHCI spec requires SDCE=0 before changing
+	 * the divider; we also drop ICE so the controller observes the new
+	 * value cleanly.
+	 */
+	ctrl1 = sys_read32(base + SDHCI_CLOCK_CONTROL);
+	ctrl1 &= ~(SDHCI_CTRL1_CLK_EN | SDHCI_CTRL1_CLK_INTLEN |
+		   SDHCI_CTRL1_CLK_FREQ_MASK | SDHCI_CTRL1_CLK_GENSEL |
+		   SDHCI_CTRL1_DATA_TOUT_MASK);
+	sys_write32(ctrl1, base + SDHCI_CLOCK_CONTROL);
+
+	if (target_hz == 0) {
+		return 0;	/* caller wants the clock gated */
+	}
+
+	/* Program the 10-bit divider in divided-clock mode (CLK_GENSEL=0).
+	 * Set DATA_TOUT to the maximum exponent so card-side data timeouts
+	 * don't trip during card identification. NO_HISPD_BIT quirk: we
+	 * don't touch HCTL_HS in CONTROL0 -- the silicon ignores it; speed
+	 * comes from the divider alone.
+	 */
+	div = sdhc_bcm2835_calc_clk_div(cfg->clock_freq, target_hz);
+	ctrl1 |= ((div >> 8) & 0x3) << SDHCI_CTRL1_CLK_FREQ_MS_SHIFT;
+	ctrl1 |= (div & 0xFF) << SDHCI_CTRL1_CLK_FREQ_LO_SHIFT;
+	ctrl1 |= 0xE << SDHCI_CTRL1_DATA_TOUT_SHIFT;	/* TMCLK * 2^(14+13) */
+	ctrl1 |= SDHCI_CTRL1_CLK_INTLEN;
+	sys_write32(ctrl1, base + SDHCI_CLOCK_CONTROL);
+
+	/* Wait for the internal clock to stabilise. */
+	deadline = k_uptime_get() + BCM2835_SDHCI_CLK_STABLE_MS;
+	while (!(sys_read32(base + SDHCI_CLOCK_CONTROL) & SDHCI_CTRL1_CLK_STABLE)) {
+		if (k_uptime_get() > deadline) {
+			return -ETIMEDOUT;
+		}
+		k_busy_wait(10);
+	}
+
+	/* Internal clock is stable; now enable the SD bus clock. */
+	ctrl1 = sys_read32(base + SDHCI_CLOCK_CONTROL);
+	ctrl1 |= SDHCI_CTRL1_CLK_EN;
+	sys_write32(ctrl1, base + SDHCI_CLOCK_CONTROL);
+
+	return 0;
+}
+
+static void sdhc_bcm2835_set_bus_width(const struct device *dev,
+				       enum sdhc_bus_width width)
+{
+	uintptr_t base = DEVICE_MMIO_GET(dev);
+	uint32_t ctrl0 = sys_read32(base + SDHCI_HOST_CONTROL);
+
+	/* 8-bit bus is unreachable on this silicon (caps say so + we don't
+	 * advertise it); a future caller asking for it is a Zephyr SD core
+	 * bug, not something we'd silently expand to. Treat 1-bit as the
+	 * fallback for any non-4-bit value.
+	 */
+	ctrl0 &= ~(SDHCI_CTRL0_HCTL_DWIDTH | SDHCI_CTRL0_HCTL_8BIT);
+	if (width == SDHC_BUS_WIDTH4BIT) {
+		ctrl0 |= SDHCI_CTRL0_HCTL_DWIDTH;
+	}
+
+	sys_write32(ctrl0, base + SDHCI_HOST_CONTROL);
+}
+
+static void sdhc_bcm2835_set_power(const struct device *dev,
+				   enum sdhc_power power_mode)
+{
+	uintptr_t base = DEVICE_MMIO_GET(dev);
+	uint32_t ctrl0 = sys_read32(base + SDHCI_HOST_CONTROL);
+
+	ctrl0 &= ~(SDHCI_CTRL0_POWER_ON | SDHCI_CTRL0_VOLT_MASK);
+
+	if (power_mode == SDHC_POWER_ON) {
+		/* This silicon is 3.3V-only; there's no actual voltage
+		 * switching to do, but the controller's state machine still
+		 * wants the voltage select bits programmed alongside POWER.
+		 */
+		ctrl0 |= SDHCI_CTRL0_VOLT_330 | SDHCI_CTRL0_POWER_ON;
+	}
+
+	sys_write32(ctrl0, base + SDHCI_HOST_CONTROL);
+}
+
 static int sdhc_bcm2835_set_io(const struct device *dev, struct sdhc_io *ios)
 {
-	ARG_UNUSED(dev);
-	ARG_UNUSED(ios);
-	return -ENOTSUP;
+	struct sdhc_bcm2835_data *data = dev->data;
+	int ret;
+
+	/* The Zephyr SD core calls set_io for every state change (clock,
+	 * width, power, voltage, timing). We always reprogram unconditionally
+	 * rather than diffing against the cached host_io -- it's a few extra
+	 * register writes during init and saves any state-tracking bug
+	 * masking real hardware issues. The cached host_io stays for future
+	 * read-only consumers (e.g. timeout calculation in request()).
+	 */
+	sdhc_bcm2835_set_power(dev, ios->power_mode);
+	sdhc_bcm2835_set_bus_width(dev, ios->bus_width);
+
+	ret = sdhc_bcm2835_set_clock(dev, ios->clock);
+	if (ret != 0) {
+		return ret;
+	}
+
+	data->host_io = *ios;
+	return 0;
 }
 
 static int sdhc_bcm2835_get_card_present(const struct device *dev)
@@ -191,14 +351,38 @@ static int sdhc_bcm2835_init(const struct device *dev)
 		return ret;
 	}
 
-	/* Temporary printk so the bring-up's "I'm here" line is visible in
-	 * MP-style images that build without CONFIG_LOG. Drop once the real
-	 * driver has its own LOG_* output worth seeing. */
-	printk("sdhc_bcm2835: %s @ 0x%lx, host version 0x%04x, clk_emmc %u Hz, %u-bit, reset OK\n",
-	       dev->name, (unsigned long)base, version, cfg->clock_freq, cfg->bus_width);
+	/* Scaffold self-test: exercise set_io with the canonical SD card
+	 * identification config (400 kHz, 1-bit, 3.3V, power on). Validates
+	 * the divider math + clock-stable handshake without needing
+	 * subsys/sd to drive us. Drop along with the rest of the bring-up
+	 * scaffolding when real traffic exercises set_io for free.
+	 */
+	struct sdhc_io ios = {
+		.clock = SDMMC_CLOCK_400KHZ,
+		.bus_width = SDHC_BUS_WIDTH1BIT,
+		.power_mode = SDHC_POWER_ON,
+		.signal_voltage = SD_VOL_3_3_V,
+	};
+	ret = sdhc_bcm2835_set_io(dev, &ios);
+	if (ret != 0) {
+		printk("sdhc_bcm2835: %s set_io self-test failed: %d\n",
+		       dev->name, ret);
+		LOG_ERR("%s set_io self-test failed: %d", dev->name, ret);
+		return ret;
+	}
 
-	LOG_INF("%s @ 0x%lx, host version 0x%04x, clk_emmc %u Hz, %u-bit, reset OK",
-		dev->name, (unsigned long)base, version, cfg->clock_freq, cfg->bus_width);
+	uint32_t ctrl0 = sys_read32(base + SDHCI_HOST_CONTROL);
+	uint32_t ctrl1 = sys_read32(base + SDHCI_CLOCK_CONTROL);
+
+	printk("sdhc_bcm2835: %s @ 0x%lx, ver 0x%04x, clk_emmc %u Hz, %u-bit dts, "
+	       "post-init CONTROL0=0x%08x CONTROL1=0x%08x\n",
+	       dev->name, (unsigned long)base, version,
+	       cfg->clock_freq, cfg->bus_width, ctrl0, ctrl1);
+
+	LOG_INF("%s @ 0x%lx, ver 0x%04x, clk_emmc %u Hz, %u-bit dts, "
+		"post-init CONTROL0=0x%08x CONTROL1=0x%08x",
+		dev->name, (unsigned long)base, version,
+		cfg->clock_freq, cfg->bus_width, ctrl0, ctrl1);
 
 	return 0;
 }
