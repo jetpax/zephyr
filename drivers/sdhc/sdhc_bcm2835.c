@@ -89,6 +89,8 @@ LOG_MODULE_REGISTER(sdhc_bcm2835, CONFIG_SDHC_LOG_LEVEL);
 #define SDHCI_INT_DATA_END		BIT(1)
 #define SDHCI_INT_BUF_WRITE_READY	BIT(4)
 #define SDHCI_INT_BUF_READ_READY	BIT(5)
+#define SDHCI_INT_CARD_INSERT		BIT(6)
+#define SDHCI_INT_CARD_REMOVE		BIT(7)
 #define SDHCI_INT_CARD_INT		BIT(8)	/* SDIO async event */
 #define SDHCI_INT_ERROR			BIT(15)
 #define SDHCI_INT_CMD_TIMEOUT		BIT(16)
@@ -582,11 +584,16 @@ static int sdhc_bcm2835_init(const struct device *dev)
 	/* Reset clears INT_ENABLE to all-zero, which gates every status
 	 * bit -- without this, INT_STATUS stays 0 forever even when the
 	 * controller fires CMD_COMPLETE / DATA_END / errors internally.
-	 * Enable everything we poll for. SIGNAL_ENABLE stays 0 (polled
-	 * mode); we'll flip CARD_INT on later when we add ISR support
-	 * for SDIO async-event delivery from the wireless chip.
+	 * Enable everything we poll for. CARD_INSERT / CARD_REMOVE stay
+	 * masked because BCM2835 has the BROKEN_CARD_DETECTION quirk
+	 * (no card-detect line on this Arasan integration; the wireless
+	 * chip is hardwired-on). SIGNAL_ENABLE stays 0 (polled mode);
+	 * we'll flip CARD_INT on later when we add ISR support for SDIO
+	 * async-event delivery from the wireless chip.
 	 */
-	sys_write32(SDHCI_INT_ALL_W1C, base + SDHCI_INT_ENABLE);
+	sys_write32(SDHCI_INT_ALL_W1C &
+		    ~(SDHCI_INT_CARD_INSERT | SDHCI_INT_CARD_REMOVE),
+		    base + SDHCI_INT_ENABLE);
 	sys_write32(0, base + SDHCI_SIGNAL_ENABLE);
 
 	/* Scaffold self-test: exercise set_io with the canonical SD card
