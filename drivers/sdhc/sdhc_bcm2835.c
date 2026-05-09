@@ -50,9 +50,65 @@ LOG_MODULE_REGISTER(sdhc_bcm2835, CONFIG_SDHC_LOG_LEVEL);
  * = CLOCK_CONTROL + TIMEOUT + SOFTWARE_RESET); we always touch the
  * containing 32-bit word.
  */
+#define SDHCI_ARG1			0x08	/* command argument (32-bit) */
+#define SDHCI_CMDTM			0x0C	/* TRANSFER_MODE | COMMAND<<16 */
+#define SDHCI_RESPONSE			0x10	/* RESP0..RESP3 (4x 32-bit) */
+#define SDHCI_PRESENT_STATE		0x24	/* "STATUS" in BCM doc */
 #define SDHCI_HOST_CONTROL		0x28	/* CONTROL0 word: HCTL+POWER+... */
 #define SDHCI_CLOCK_CONTROL		0x2C	/* CONTROL1 word: CLK+TOUT+RESET */
+#define SDHCI_INT_STATUS		0x30	/* INTERRUPT (W1C) */
+#define SDHCI_INT_ENABLE		0x34	/* IRPT_MASK */
+#define SDHCI_SIGNAL_ENABLE		0x38	/* IRPT_EN */
 #define SDHCI_SLOT_INT_STATUS_VERSION	0xFC
+
+/* PRESENT_STATE bits (we only need the inhibit flags) */
+#define SDHCI_PSTATE_CMD_INHIBIT	BIT(0)	/* CMD line busy */
+#define SDHCI_PSTATE_DATA_INHIBIT	BIT(1)	/* DAT lines busy */
+
+/* CMDTM (32-bit at 0x0C). The low 16 bits are TRANSFER_MODE, high 16 bits
+ * are COMMAND. Per spec, writing the COMMAND half (= writing the 32-bit
+ * word) is what fires the command on the CMD line.
+ */
+#define SDHCI_CMDTM_TM_BLKCNT_EN	BIT(1)	/* enable block count for data */
+#define SDHCI_CMDTM_TM_AUTO_CMD12	BIT(2)
+#define SDHCI_CMDTM_TM_AUTO_CMD23	BIT(3)
+#define SDHCI_CMDTM_TM_DAT_DIR_READ	BIT(4)	/* 1 = card->host */
+#define SDHCI_CMDTM_TM_MULTI_BLOCK	BIT(5)
+#define SDHCI_CMDTM_RSP_NONE		(0 << 16)
+#define SDHCI_CMDTM_RSP_136		(1 << 16)	/* long, R2 */
+#define SDHCI_CMDTM_RSP_48		(2 << 16)	/* short, R1/R3/R5/R6/R7 */
+#define SDHCI_CMDTM_RSP_48_BUSY		(3 << 16)	/* short with busy, R1b */
+#define SDHCI_CMDTM_CRC_CHECK		BIT(16 + 3)	/* check response CRC */
+#define SDHCI_CMDTM_INDEX_CHECK		BIT(16 + 4)	/* check response index */
+#define SDHCI_CMDTM_DATA_PRESENT	BIT(16 + 5)	/* command has data phase */
+#define SDHCI_CMDTM_TYPE_ABORT		(3 << (16 + 6))
+#define SDHCI_CMDTM_INDEX_SHIFT		(16 + 8)
+
+/* INTERRUPT (32-bit at 0x30): low 16 = NORMAL, high 16 = ERROR. W1C. */
+#define SDHCI_INT_CMD_COMPLETE		BIT(0)
+#define SDHCI_INT_DATA_END		BIT(1)
+#define SDHCI_INT_BUF_WRITE_READY	BIT(4)
+#define SDHCI_INT_BUF_READ_READY	BIT(5)
+#define SDHCI_INT_CARD_INT		BIT(8)	/* SDIO async event */
+#define SDHCI_INT_ERROR			BIT(15)
+#define SDHCI_INT_CMD_TIMEOUT		BIT(16)
+#define SDHCI_INT_CMD_CRC		BIT(17)
+#define SDHCI_INT_CMD_END_BIT		BIT(18)
+#define SDHCI_INT_CMD_INDEX		BIT(19)
+#define SDHCI_INT_DATA_TIMEOUT		BIT(20)
+#define SDHCI_INT_DATA_CRC		BIT(21)
+#define SDHCI_INT_DATA_END_BIT		BIT(22)
+
+#define SDHCI_INT_CMD_ERROR_MASK	(SDHCI_INT_CMD_TIMEOUT | \
+					 SDHCI_INT_CMD_CRC     | \
+					 SDHCI_INT_CMD_END_BIT | \
+					 SDHCI_INT_CMD_INDEX)
+#define SDHCI_INT_DATA_ERROR_MASK	(SDHCI_INT_DATA_TIMEOUT | \
+					 SDHCI_INT_DATA_CRC     | \
+					 SDHCI_INT_DATA_END_BIT)
+#define SDHCI_INT_ALL_NORMAL		0x0000FFFFU
+#define SDHCI_INT_ALL_ERROR		0xFFFF0000U
+#define SDHCI_INT_ALL_W1C		(SDHCI_INT_ALL_NORMAL | SDHCI_INT_ALL_ERROR)
 
 /* CONTROL0 (32-bit at 0x28) -- HCTL[7:0] + POWER[15:8] + BLOCK_GAP[23:16]
  * + WAKEUP[31:24]. We touch HCTL bits and the POWER subregister.
@@ -110,14 +166,186 @@ struct sdhc_bcm2835_data {
 	struct sdhc_io host_io;
 };
 
+/* Forward decl: error recovery in request() needs to reset the cmd line. */
+static int sdhc_bcm2835_soft_reset(const struct device *dev, uint32_t mask);
+
+/* Default command timeout when the caller leaves cmd->timeout_ms zero.
+ * Linux uses 10s for non-data commands, but for SDIO control we expect
+ * sub-millisecond turnarounds; 1s is plenty and short enough to surface
+ * a hung controller during bring-up.
+ */
+#define BCM2835_SDHCI_CMD_TIMEOUT_MS	1000
+
+/* Spin until the requested PRESENT_STATE.*_INHIBIT bits clear, with a
+ * timeout. The card / controller has to actually finish whatever it was
+ * doing before we can issue a new command.
+ */
+static int sdhc_bcm2835_wait_inhibit(const struct device *dev, uint32_t mask,
+				     int timeout_ms)
+{
+	uintptr_t base = DEVICE_MMIO_GET(dev);
+	int64_t deadline = k_uptime_get() + timeout_ms;
+
+	while (sys_read32(base + SDHCI_PRESENT_STATE) & mask) {
+		if (k_uptime_get() > deadline) {
+			return -ETIMEDOUT;
+		}
+		k_busy_wait(10);
+	}
+	return 0;
+}
+
+/* Spin until INT_STATUS has either a success bit or an error bit set,
+ * or we time out. Returns the raw int-status value (caller decides).
+ * Does not ack -- the caller W1Cs the bits it actually consumed so a
+ * pending unrelated interrupt isn't dropped on the floor.
+ */
+static uint32_t sdhc_bcm2835_wait_int(const struct device *dev,
+				      uint32_t success_mask, uint32_t error_mask,
+				      int timeout_ms)
+{
+	uintptr_t base = DEVICE_MMIO_GET(dev);
+	int64_t deadline = k_uptime_get() + timeout_ms;
+	uint32_t status;
+
+	while (true) {
+		status = sys_read32(base + SDHCI_INT_STATUS);
+		if (status & (success_mask | error_mask)) {
+			return status;
+		}
+		if (k_uptime_get() > deadline) {
+			return 0;	/* caller treats 0 as timeout */
+		}
+		k_busy_wait(10);
+	}
+}
+
+/* Build the upper 16 bits of CMDTM (the COMMAND half) from a Zephyr
+ * sdhc_command. Lower 16 (TRANSFER_MODE) is set elsewhere when data is
+ * involved; for cmd-only requests it stays zero.
+ *
+ * We deliberately don't support R1b yet: the controller waits for DAT0
+ * to clear after a busy response, which can hang indefinitely if the
+ * card never deasserts busy. Once data-phase + interrupt-driven
+ * completion are in, R1b becomes a small extension.
+ */
+static int sdhc_bcm2835_build_cmd(const struct sdhc_command *cmd, uint32_t *cmdtm)
+{
+	uint32_t flags = (uint32_t)cmd->opcode << SDHCI_CMDTM_INDEX_SHIFT;
+	uint32_t rsp = cmd->response_type & SDHC_NATIVE_RESPONSE_MASK;
+
+	switch (rsp) {
+	case SD_RSP_TYPE_NONE:
+		flags |= SDHCI_CMDTM_RSP_NONE;
+		break;
+	case SD_RSP_TYPE_R2:
+		flags |= SDHCI_CMDTM_RSP_136 | SDHCI_CMDTM_CRC_CHECK;
+		break;
+	case SD_RSP_TYPE_R3:
+	case SD_RSP_TYPE_R4:
+		/* OCR / IO_SEND_OP_COND -- no CRC check, no index check */
+		flags |= SDHCI_CMDTM_RSP_48;
+		break;
+	case SD_RSP_TYPE_R1:
+	case SD_RSP_TYPE_R5:
+	case SD_RSP_TYPE_R6:
+	case SD_RSP_TYPE_R7:
+		flags |= SDHCI_CMDTM_RSP_48 | SDHCI_CMDTM_CRC_CHECK |
+			 SDHCI_CMDTM_INDEX_CHECK;
+		break;
+	case SD_RSP_TYPE_R1b:
+	case SD_RSP_TYPE_R5b:
+		/* TODO: R1b/R5b need busy-wait on DAT0; not handled yet. */
+		return -ENOTSUP;
+	default:
+		return -EINVAL;
+	}
+
+	*cmdtm = flags;
+	return 0;
+}
+
+/* Copy the response register(s) into cmd->response[]. R2 (long form,
+ * 136-bit CID/CSD) populates RESP0..RESP3 with the CRC/start bits
+ * stripped; everyone else uses RESP0 alone.
+ */
+static void sdhc_bcm2835_read_response(const struct device *dev,
+				       struct sdhc_command *cmd)
+{
+	uintptr_t base = DEVICE_MMIO_GET(dev);
+	uint32_t rsp = cmd->response_type & SDHC_NATIVE_RESPONSE_MASK;
+
+	cmd->response[0] = sys_read32(base + SDHCI_RESPONSE + 0);
+	if (rsp == SD_RSP_TYPE_R2) {
+		cmd->response[1] = sys_read32(base + SDHCI_RESPONSE + 4);
+		cmd->response[2] = sys_read32(base + SDHCI_RESPONSE + 8);
+		cmd->response[3] = sys_read32(base + SDHCI_RESPONSE + 12);
+	}
+}
+
 static int sdhc_bcm2835_request(const struct device *dev,
 				struct sdhc_command *cmd,
 				struct sdhc_data *data)
 {
-	ARG_UNUSED(dev);
-	ARG_UNUSED(cmd);
-	ARG_UNUSED(data);
-	return -ENOTSUP;
+	uintptr_t base = DEVICE_MMIO_GET(dev);
+	uint32_t cmdtm;
+	uint32_t int_status;
+	int timeout_ms;
+	int ret;
+
+	if (cmd == NULL) {
+		return -EINVAL;
+	}
+	if (data != NULL) {
+		/* Data phase lands in a follow-up commit. */
+		return -ENOTSUP;
+	}
+
+	ret = sdhc_bcm2835_build_cmd(cmd, &cmdtm);
+	if (ret != 0) {
+		return ret;
+	}
+
+	timeout_ms = cmd->timeout_ms ? cmd->timeout_ms : BCM2835_SDHCI_CMD_TIMEOUT_MS;
+
+	ret = sdhc_bcm2835_wait_inhibit(dev, SDHCI_PSTATE_CMD_INHIBIT, timeout_ms);
+	if (ret != 0) {
+		return ret;
+	}
+
+	/* Clear any stale CMD-side interrupt bits so wait_int doesn't latch
+	 * onto a previous command's completion.
+	 */
+	sys_write32(SDHCI_INT_CMD_COMPLETE | SDHCI_INT_CMD_ERROR_MASK,
+		    base + SDHCI_INT_STATUS);
+
+	sys_write32(cmd->arg, base + SDHCI_ARG1);
+	sys_write32(cmdtm, base + SDHCI_CMDTM);	/* fires command */
+
+	int_status = sdhc_bcm2835_wait_int(dev, SDHCI_INT_CMD_COMPLETE,
+					   SDHCI_INT_CMD_ERROR_MASK, timeout_ms);
+
+	if (int_status == 0) {
+		return -ETIMEDOUT;
+	}
+
+	if (int_status & SDHCI_INT_CMD_ERROR_MASK) {
+		/* Ack the error bits we observed; soft-reset the cmd line so
+		 * the controller is ready for the next attempt.
+		 */
+		sys_write32(int_status & SDHCI_INT_CMD_ERROR_MASK,
+			    base + SDHCI_INT_STATUS);
+		(void)sdhc_bcm2835_soft_reset(dev, SDHCI_CTRL1_RESET_CMD);
+		if (int_status & SDHCI_INT_CMD_TIMEOUT) {
+			return -ETIMEDOUT;
+		}
+		return -EIO;
+	}
+
+	sdhc_bcm2835_read_response(dev, cmd);
+	sys_write32(SDHCI_INT_CMD_COMPLETE, base + SDHCI_INT_STATUS);
+
+	return 0;
 }
 
 /* Compute the 10-bit "divided clock mode" divider that yields the
@@ -374,15 +602,31 @@ static int sdhc_bcm2835_init(const struct device *dev)
 	uint32_t ctrl0 = sys_read32(base + SDHCI_HOST_CONTROL);
 	uint32_t ctrl1 = sys_read32(base + SDHCI_CLOCK_CONTROL);
 
+	/* Scaffold self-test #2: issue CMD0 (GO_IDLE_STATE, no response,
+	 * no data) via the request() path. CMD_COMPLETE depends only on
+	 * the controller's internal state machine for no-response cmds,
+	 * so this works without any card actually responding -- proves
+	 * that ARG1 + CMDTM writes light up the CMD line and the
+	 * INT_STATUS poll sees the completion. Drop with the rest of the
+	 * scaffolding when subsys/sd traffic exercises request() for free.
+	 */
+	struct sdhc_command cmd0 = {
+		.opcode = 0,
+		.arg = 0,
+		.response_type = SD_RSP_TYPE_NONE,
+	};
+	ret = sdhc_bcm2835_request(dev, &cmd0, NULL);
+	uint32_t int_after = sys_read32(base + SDHCI_INT_STATUS);
+
 	printk("sdhc_bcm2835: %s @ 0x%lx, ver 0x%04x, clk_emmc %u Hz, %u-bit dts, "
-	       "post-init CONTROL0=0x%08x CONTROL1=0x%08x\n",
+	       "CONTROL0=0x%08x CONTROL1=0x%08x, CMD0 ret=%d INT_STATUS=0x%08x\n",
 	       dev->name, (unsigned long)base, version,
-	       cfg->clock_freq, cfg->bus_width, ctrl0, ctrl1);
+	       cfg->clock_freq, cfg->bus_width, ctrl0, ctrl1, ret, int_after);
 
 	LOG_INF("%s @ 0x%lx, ver 0x%04x, clk_emmc %u Hz, %u-bit dts, "
-		"post-init CONTROL0=0x%08x CONTROL1=0x%08x",
+		"CONTROL0=0x%08x CONTROL1=0x%08x, CMD0 ret=%d INT_STATUS=0x%08x",
 		dev->name, (unsigned long)base, version,
-		cfg->clock_freq, cfg->bus_width, ctrl0, ctrl1);
+		cfg->clock_freq, cfg->bus_width, ctrl0, ctrl1, ret, int_after);
 
 	return 0;
 }
