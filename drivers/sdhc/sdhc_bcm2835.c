@@ -579,6 +579,16 @@ static int sdhc_bcm2835_init(const struct device *dev)
 		return ret;
 	}
 
+	/* Reset clears INT_ENABLE to all-zero, which gates every status
+	 * bit -- without this, INT_STATUS stays 0 forever even when the
+	 * controller fires CMD_COMPLETE / DATA_END / errors internally.
+	 * Enable everything we poll for. SIGNAL_ENABLE stays 0 (polled
+	 * mode); we'll flip CARD_INT on later when we add ISR support
+	 * for SDIO async-event delivery from the wireless chip.
+	 */
+	sys_write32(SDHCI_INT_ALL_W1C, base + SDHCI_INT_ENABLE);
+	sys_write32(0, base + SDHCI_SIGNAL_ENABLE);
+
 	/* Scaffold self-test: exercise set_io with the canonical SD card
 	 * identification config (400 kHz, 1-bit, 3.3V, power on). Validates
 	 * the divider math + clock-stable handshake without needing
