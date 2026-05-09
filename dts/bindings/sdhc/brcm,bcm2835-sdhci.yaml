@@ -1,0 +1,47 @@
+# Copyright (c) 2026 jetpax
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Broadcom BCM2835 / BCM2710 / BCM2837 Arasan SD3.0 host controller
+  (EMMC). Standard SDHCI register layout but with two silicon quirks
+  worth knowing about:
+
+    - all register accesses must be 32-bit aligned 32-bit wide;
+      the driver synthesises 8/16-bit accesses via RMW.
+    - the SDHCI CAPABILITIES register reads as zero on this silicon;
+      capability values are hardcoded by the driver.
+
+  On Pi 3 / Pi Zero 2 W this is the SDIO port wired to the CYW43439
+  wireless chip. The legacy SDHOST controller (brcm,bcm2835-sdhost,
+  not yet supported) drives the SD card on those boards.
+
+compatible: "brcm,bcm2835-sdhci"
+
+include: sdhc.yaml
+
+properties:
+  reg:
+    required: true
+
+  interrupts:
+    required: true
+
+  clock-frequency:
+    type: int
+    required: true
+    description: |
+      Frequency in Hz of clk_emmc, the input clock provided by the
+      BCM2835 clock manager. The SDHCI clock divider scales this
+      down to the bus SD clock. Typical 100 MHz with core_freq=250
+      in config.txt; consult the board doc.
+
+  bus-width:
+    type: int
+    default: 4
+    enum:
+      - 1
+      - 4
+    description: |
+      Number of data lines wired between the controller and the
+      attached card / chip. The Arasan core does not support 8-bit;
+      4-bit is required for the CYW43439 wireless module.

@@ -1,0 +1,13 @@
+# Copyright (c) 2026 jetpax
+# SPDX-License-Identifier: Apache-2.0
+
+config BCM2835_SDHC
+	bool "BCM2835 / BCM2710 / BCM2837 Arasan SDHCI host controller"
+	default y
+	depends on DT_HAS_BRCM_BCM2835_SDHCI_ENABLED
+	select SDHC_SUPPORTS_NATIVE_MODE
+	help
+	  Enable the Broadcom BCM2835-family Arasan SDHCI host controller
+	  driver. Drives the EMMC port that's wired to the CYW43439 wireless
+	  chip on Pi 3 / Pi Zero 2 W. Skeleton today (methods stub out as
+	  -ENOTSUP); will fill in over the SDIO bring-up.
