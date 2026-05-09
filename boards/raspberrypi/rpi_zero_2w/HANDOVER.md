@@ -250,6 +250,34 @@ trivially small.
    commands.** Annoying for testing, harmless on real hardware via
    tio.
 
+## SDIO bring-up status (in flight as of 2026-05-09)
+
+Significant progress since the original handover -- a polled
+SDHCI driver, GPIO + pinctrl wiring, board-DTS hookup, and CMD0
+working end-to-end on real silicon. **But the chip stays silent
+on every SDIO command we've tried** (CMD52 read CCCR, CMD52
+IO_RESET, CMD5 inquiry). The controller transmits, eventually
+fires CMD_TIMEOUT, but the chip itself never sends a response.
+
+**Strongest remaining hypothesis:** GPCLK2 (LPO input on GPIO 43)
+isn't actually generating 32.768 kHz. We pinctrl-route the pin to
+ALT0, but Zephyr has no BCM2835 clock-manager driver to program
+`CM_GP2CTL` / `CM_GP2DIV` -- so the pin is outputting whatever the
+Pi VPU firmware left, which may not be a clean LPO. The CYW43439's
+PMU likely needs LPO to advance from cold-boot to "ready for SDIO".
+
+**Next move:** add a minimal CM_GP2 setup before WL_REG_ON-high.
+CM base 0x3F101000, CM_GP2CTL at 0x80, CM_GP2DIV at 0x84, every
+write needs PASSWD = 0x5A in bits 31:24. With 19.2 MHz oscillator
+divided by 586 we get 32764 Hz -- close enough. ~30 lines of
+direct register pokes; can be a small SoC helper or inline in
+`sdhc_bcm2835_init`.
+
+The full debug log -- what worked, what didn't, scaffolding
+diagnostics still in tree, secondary hypotheses -- is captured
+in the auto-memory at
+`~/.claude/projects/-Users-jep-github-SS/memory/project_rpi_zero_2w_sdio_debug.md`.
+
 ## Open work, ranked
 
 ### Easy and useful
