@@ -50,7 +50,9 @@ LOG_MODULE_REGISTER(sdhc_bcm2835, CONFIG_SDHC_LOG_LEVEL);
  * = CLOCK_CONTROL + TIMEOUT + SOFTWARE_RESET); we always touch the
  * containing 32-bit word.
  */
+#define SDHCI_BLKSIZECNT		0x04	/* BLOCK_SIZE | BLOCK_COUNT<<16 */
 #define SDHCI_ARG1			0x08	/* command argument (32-bit) */
+#define SDHCI_BUFFER			0x20	/* PIO buffer data port (32-bit) */
 #define SDHCI_CMDTM			0x0C	/* TRANSFER_MODE | COMMAND<<16 */
 #define SDHCI_RESPONSE			0x10	/* RESP0..RESP3 (4x 32-bit) */
 #define SDHCI_PRESENT_STATE		0x24	/* "STATUS" in BCM doc */
@@ -222,19 +224,64 @@ static uint32_t sdhc_bcm2835_wait_int(const struct device *dev,
 	}
 }
 
-/* Build the upper 16 bits of CMDTM (the COMMAND half) from a Zephyr
- * sdhc_command. Lower 16 (TRANSFER_MODE) is set elsewhere when data is
- * involved; for cmd-only requests it stays zero.
+/* Build the full 32-bit CMDTM word -- TRANSFER_MODE in the low 16 bits,
+ * COMMAND in the high 16. Writing this 32-bit word fires the command;
+ * the BCM 32-bit-only access requirement makes the natural composition
+ * here (write the whole word in one go) the right thing.
  *
  * We deliberately don't support R1b yet: the controller waits for DAT0
  * to clear after a busy response, which can hang indefinitely if the
- * card never deasserts busy. Once data-phase + interrupt-driven
- * completion are in, R1b becomes a small extension.
+ * card never deasserts busy. R1b becomes a small extension once we
+ * have IRQ-driven completion; for now polled R1 is enough for SDIO
+ * control traffic.
  */
-static int sdhc_bcm2835_build_cmd(const struct sdhc_command *cmd, uint32_t *cmdtm)
+static int sdhc_bcm2835_build_cmd(const struct sdhc_command *cmd,
+				  const struct sdhc_data *data, uint32_t *cmdtm)
 {
 	uint32_t flags = (uint32_t)cmd->opcode << SDHCI_CMDTM_INDEX_SHIFT;
 	uint32_t rsp = cmd->response_type & SDHC_NATIVE_RESPONSE_MASK;
+
+	if (data != NULL) {
+		flags |= SDHCI_CMDTM_DATA_PRESENT;
+		/* TRANSFER_MODE bits (low 16): block-count enable, direction,
+		 * multi-block if blocks > 1. AUTO_CMD12 / AUTO_CMD23 are not
+		 * used -- SDIO CMD53 carries its own byte/block count and the
+		 * card terminates without needing CMD12.
+		 *
+		 * Direction inference: Zephyr's sdhc_data has no explicit
+		 * direction field. For canonical SD opcodes the direction is
+		 * baked into the opcode; for SDIO CMD53 it's in arg bit 31
+		 * per the SDIO spec (1=write, 0=read).
+		 */
+		bool is_read;
+
+		switch (cmd->opcode) {
+		case SDIO_RW_EXTENDED:
+			is_read = !(cmd->arg & BIT(SDIO_CMD_ARG_RW_SHIFT));
+			break;
+		case SD_READ_SINGLE_BLOCK:
+		case SD_READ_MULTIPLE_BLOCK:
+		case SD_APP_SEND_SCR:
+			is_read = true;
+			break;
+		case SD_WRITE_SINGLE_BLOCK:
+		case SD_WRITE_MULTIPLE_BLOCK:
+			is_read = false;
+			break;
+		default:
+			/* Other opcodes shouldn't carry a data phase. Refuse
+			 * rather than silently picking a direction. */
+			return -EINVAL;
+		}
+
+		flags |= SDHCI_CMDTM_TM_BLKCNT_EN;
+		if (is_read) {
+			flags |= SDHCI_CMDTM_TM_DAT_DIR_READ;
+		}
+		if (data->blocks > 1) {
+			flags |= SDHCI_CMDTM_TM_MULTI_BLOCK;
+		}
+	}
 
 	switch (rsp) {
 	case SD_RSP_TYPE_NONE:
@@ -267,6 +314,122 @@ static int sdhc_bcm2835_build_cmd(const struct sdhc_command *cmd, uint32_t *cmdt
 	return 0;
 }
 
+/* Per-block PIO transfer. Linux's sdhci_{read,write}_block_pio
+ * collapses to this once you strip the sg_miter scatter-gather:
+ * read 1 word from BUFFER (or write 1 word to BUFFER), assembling
+ * bytes into / from the caller's buffer. Tail bytes < 4 share the
+ * same scratch word -- a partial-word read still costs one full
+ * BUFFER read, the controller delivers the FIFO contents word-aligned.
+ *
+ * Loop invariant: when this returns, exactly one block has moved.
+ * The caller polls INT_STATUS for BUFFER_*_READY between blocks
+ * (and DATA_END after the last one).
+ */
+static void sdhc_bcm2835_pio_xfer_one_block(uintptr_t base, uint8_t **bufp,
+					    size_t blksize, bool is_read)
+{
+	uint8_t *buf = *bufp;
+	uint32_t scratch;
+
+	while (blksize >= 4) {
+		if (is_read) {
+			scratch = sys_read32(base + SDHCI_BUFFER);
+			buf[0] = scratch & 0xFF;
+			buf[1] = (scratch >> 8) & 0xFF;
+			buf[2] = (scratch >> 16) & 0xFF;
+			buf[3] = (scratch >> 24) & 0xFF;
+		} else {
+			scratch = (uint32_t)buf[0] |
+				  ((uint32_t)buf[1] << 8) |
+				  ((uint32_t)buf[2] << 16) |
+				  ((uint32_t)buf[3] << 24);
+			sys_write32(scratch, base + SDHCI_BUFFER);
+		}
+		buf += 4;
+		blksize -= 4;
+	}
+
+	if (blksize > 0) {
+		if (is_read) {
+			scratch = sys_read32(base + SDHCI_BUFFER);
+			while (blksize > 0) {
+				*buf++ = scratch & 0xFF;
+				scratch >>= 8;
+				blksize--;
+			}
+		} else {
+			scratch = 0;
+			unsigned int shift = 0;
+
+			while (blksize > 0) {
+				scratch |= (uint32_t)*buf << shift;
+				shift += 8;
+				buf++;
+				blksize--;
+			}
+			sys_write32(scratch, base + SDHCI_BUFFER);
+		}
+	}
+
+	*bufp = buf;
+}
+
+/* Drive the data phase to completion: poll for BUFFER_*_READY, transfer
+ * one block, ack, repeat. After the last block the controller asserts
+ * DATA_END; we ack and return.
+ */
+static int sdhc_bcm2835_transfer_data(const struct device *dev,
+				      struct sdhc_data *data, bool is_read,
+				      int timeout_ms)
+{
+	uintptr_t base = DEVICE_MMIO_GET(dev);
+	uint8_t *buf = (uint8_t *)data->data;
+	uint32_t blocks_left = data->blocks;
+	uint32_t ready_bit = is_read ? SDHCI_INT_BUF_READ_READY
+				     : SDHCI_INT_BUF_WRITE_READY;
+	uint32_t int_status;
+
+	while (blocks_left > 0) {
+		int_status = sdhc_bcm2835_wait_int(dev, ready_bit,
+						   SDHCI_INT_DATA_ERROR_MASK,
+						   timeout_ms);
+		if (int_status == 0) {
+			return -ETIMEDOUT;
+		}
+		if (int_status & SDHCI_INT_DATA_ERROR_MASK) {
+			sys_write32(int_status & SDHCI_INT_DATA_ERROR_MASK,
+				    base + SDHCI_INT_STATUS);
+			(void)sdhc_bcm2835_soft_reset(dev,
+						      SDHCI_CTRL1_RESET_DATA);
+			if (int_status & SDHCI_INT_DATA_TIMEOUT) {
+				return -ETIMEDOUT;
+			}
+			return -EIO;
+		}
+
+		sdhc_bcm2835_pio_xfer_one_block(base, &buf, data->block_size,
+						is_read);
+		sys_write32(ready_bit, base + SDHCI_INT_STATUS);
+		blocks_left--;
+	}
+
+	int_status = sdhc_bcm2835_wait_int(dev, SDHCI_INT_DATA_END,
+					   SDHCI_INT_DATA_ERROR_MASK,
+					   timeout_ms);
+	if (int_status == 0) {
+		return -ETIMEDOUT;
+	}
+	if (int_status & SDHCI_INT_DATA_ERROR_MASK) {
+		sys_write32(int_status & SDHCI_INT_DATA_ERROR_MASK,
+			    base + SDHCI_INT_STATUS);
+		(void)sdhc_bcm2835_soft_reset(dev, SDHCI_CTRL1_RESET_DATA);
+		return -EIO;
+	}
+	sys_write32(SDHCI_INT_DATA_END, base + SDHCI_INT_STATUS);
+	data->bytes_xfered = data->blocks * data->block_size;
+	return 0;
+}
+
 /* Copy the response register(s) into cmd->response[]. R2 (long form,
  * 136-bit CID/CSD) populates RESP0..RESP3 with the CRC/start bits
  * stripped; everyone else uses RESP0 alone.
@@ -292,49 +455,69 @@ static int sdhc_bcm2835_request(const struct device *dev,
 	uintptr_t base = DEVICE_MMIO_GET(dev);
 	uint32_t cmdtm;
 	uint32_t int_status;
-	int timeout_ms;
+	uint32_t inhibit_mask;
+	int cmd_timeout_ms;
+	int data_timeout_ms;
+	bool is_read;
 	int ret;
 
 	if (cmd == NULL) {
 		return -EINVAL;
 	}
 	if (data != NULL) {
-		/* Data phase lands in a follow-up commit. */
-		return -ENOTSUP;
+		if (data->data == NULL || data->blocks == 0 ||
+		    data->block_size == 0 ||
+		    data->block_size > BCM2835_MAX_BLOCK_BYTES) {
+			return -EINVAL;
+		}
 	}
 
-	ret = sdhc_bcm2835_build_cmd(cmd, &cmdtm);
+	ret = sdhc_bcm2835_build_cmd(cmd, data, &cmdtm);
 	if (ret != 0) {
 		return ret;
 	}
 
-	timeout_ms = cmd->timeout_ms ? cmd->timeout_ms : BCM2835_SDHCI_CMD_TIMEOUT_MS;
+	is_read = (cmdtm & SDHCI_CMDTM_TM_DAT_DIR_READ) != 0;
+	cmd_timeout_ms = cmd->timeout_ms ? cmd->timeout_ms
+					 : BCM2835_SDHCI_CMD_TIMEOUT_MS;
+	data_timeout_ms = (data && data->timeout_ms) ? data->timeout_ms
+						     : cmd_timeout_ms;
 
-	ret = sdhc_bcm2835_wait_inhibit(dev, SDHCI_PSTATE_CMD_INHIBIT, timeout_ms);
+	inhibit_mask = SDHCI_PSTATE_CMD_INHIBIT;
+	if (data != NULL) {
+		inhibit_mask |= SDHCI_PSTATE_DATA_INHIBIT;
+	}
+	ret = sdhc_bcm2835_wait_inhibit(dev, inhibit_mask, cmd_timeout_ms);
 	if (ret != 0) {
 		return ret;
 	}
 
-	/* Clear any stale CMD-side interrupt bits so wait_int doesn't latch
-	 * onto a previous command's completion.
+	/* Clear any stale CMD/DATA-side interrupt bits so wait_int doesn't
+	 * latch onto a previous request's completion.
 	 */
-	sys_write32(SDHCI_INT_CMD_COMPLETE | SDHCI_INT_CMD_ERROR_MASK,
+	sys_write32(SDHCI_INT_CMD_COMPLETE | SDHCI_INT_CMD_ERROR_MASK |
+		    SDHCI_INT_BUF_WRITE_READY | SDHCI_INT_BUF_READ_READY |
+		    SDHCI_INT_DATA_END | SDHCI_INT_DATA_ERROR_MASK,
 		    base + SDHCI_INT_STATUS);
+
+	if (data != NULL) {
+		uint32_t blksizecnt = (data->block_size & 0x3FF) |
+				      ((uint32_t)data->blocks << 16);
+		sys_write32(blksizecnt, base + SDHCI_BLKSIZECNT);
+	}
 
 	sys_write32(cmd->arg, base + SDHCI_ARG1);
 	sys_write32(cmdtm, base + SDHCI_CMDTM);	/* fires command */
 
 	int_status = sdhc_bcm2835_wait_int(dev, SDHCI_INT_CMD_COMPLETE,
-					   SDHCI_INT_CMD_ERROR_MASK, timeout_ms);
+					   SDHCI_INT_CMD_ERROR_MASK,
+					   cmd_timeout_ms);
 
 	if (int_status == 0) {
 		return -ETIMEDOUT;
 	}
 
 	if (int_status & SDHCI_INT_CMD_ERROR_MASK) {
-		/* Ack the error bits we observed; soft-reset the cmd line so
-		 * the controller is ready for the next attempt.
-		 */
 		sys_write32(int_status & SDHCI_INT_CMD_ERROR_MASK,
 			    base + SDHCI_INT_STATUS);
 		(void)sdhc_bcm2835_soft_reset(dev, SDHCI_CTRL1_RESET_CMD);
@@ -346,6 +529,14 @@ static int sdhc_bcm2835_request(const struct device *dev,
 
 	sdhc_bcm2835_read_response(dev, cmd);
 	sys_write32(SDHCI_INT_CMD_COMPLETE, base + SDHCI_INT_STATUS);
+
+	if (data != NULL) {
+		ret = sdhc_bcm2835_transfer_data(dev, data, is_read,
+						 data_timeout_ms);
+		if (ret != 0) {
+			return ret;
+		}
+	}
 
 	return 0;
 }
