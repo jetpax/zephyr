@@ -48,3 +48,13 @@
 	current-speed = <115200>;
 	status = "okay";
 };
+
+/*
+ * The Arasan SDHCI controller is wired to the on-module CYW43439
+ * wireless chip on this board. Driver is a skeleton today (methods
+ * stub to -ENOTSUP); enabling lets the device probe so the boot log
+ * confirms the DT path is right while the sequencer is filled in.
+ */
+&emmc {
+	status = "okay";
+};
