@@ -148,4 +148,25 @@
 #define I2C6_SDA_GPIO22   BCM2711_PINMUX(22, BCM2711_FSEL_ALT5)
 #define I2C6_SCL_GPIO23   BCM2711_PINMUX(23, BCM2711_FSEL_ALT5)
 
+/* EMMC / SDHCI pinmux. The Arasan SDHCI controller (sdhci@7e300000)
+ * routes to GPIO 34..39 via ALT3 on the BCM2710/2711/2837 family --
+ * SD1_CLK / SD1_CMD / SD1_DAT0..3. On Pi 3 / Pi Zero 2 W this is the
+ * port wired to the on-module CYW43439 wireless chip. The 2012 BCM2835
+ * ARM Peripherals datasheet predates this routing and lists ALT3 as
+ * <reserved> for these pins; Linux's bcm2835.dtsi (emmc_gpio34 group)
+ * is the working reference.
+ */
+#define EMMC_CLK_GPIO34   BCM2711_PINMUX(34, BCM2711_FSEL_ALT3)
+#define EMMC_CMD_GPIO35   BCM2711_PINMUX(35, BCM2711_FSEL_ALT3)
+#define EMMC_DAT0_GPIO36  BCM2711_PINMUX(36, BCM2711_FSEL_ALT3)
+#define EMMC_DAT1_GPIO37  BCM2711_PINMUX(37, BCM2711_FSEL_ALT3)
+#define EMMC_DAT2_GPIO38  BCM2711_PINMUX(38, BCM2711_FSEL_ALT3)
+#define EMMC_DAT3_GPIO39  BCM2711_PINMUX(39, BCM2711_FSEL_ALT3)
+
+/* GPCLK2 on GPIO 43 (ALT0) -- supplies the 32.768 kHz reference clock
+ * to the wireless module's PCM/Bluetooth path. Wi-Fi-only operation
+ * works without it but the canonical Pi Zero 2 W config includes it.
+ */
+#define GPCLK2_GPIO43     BCM2711_PINMUX(43, BCM2711_FSEL_ALT0)
+
 #endif /* ZEPHYR_INCLUDE_DT_BINDINGS_PINCTRL_BCM2711_PINCTRL_H_ */

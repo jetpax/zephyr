@@ -35,6 +35,7 @@
 
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
+#include <zephyr/drivers/pinctrl.h>
 #include <zephyr/drivers/sdhc.h>
 #include <zephyr/init.h>
 #include <zephyr/kernel.h>
@@ -161,6 +162,7 @@ LOG_MODULE_REGISTER(sdhc_bcm2835, CONFIG_SDHC_LOG_LEVEL);
 
 struct sdhc_bcm2835_config {
 	DEVICE_MMIO_ROM;
+	const struct pinctrl_dev_config *pincfg;
 	uint32_t clock_freq;
 	uint8_t bus_width;
 };
@@ -761,6 +763,20 @@ static int sdhc_bcm2835_init(const struct device *dev)
 
 	DEVICE_MMIO_MAP(dev, K_MEM_CACHE_NONE);
 
+	/* Route GPIO 34..39 to ALT3 (SD1_CLK / SD1_CMD / SD1_DAT0..3) and
+	 * GPIO 43 to ALT0 (GPCLK2). Without this the controller's internal
+	 * state machine still runs and CMD_COMPLETE asserts (it depends on
+	 * timing alone, not pad activity), but no signalling reaches the
+	 * external chip -- so any command expecting a response would
+	 * timeout. Apply before reset so the lines are in alt mode by the
+	 * time the controller starts driving them.
+	 */
+	ret = pinctrl_apply_state(cfg->pincfg, PINCTRL_STATE_DEFAULT);
+	if (ret != 0) {
+		LOG_ERR("%s pinctrl apply failed: %d", dev->name, ret);
+		return ret;
+	}
+
 	uintptr_t base = DEVICE_MMIO_GET(dev);
 	uint32_t slot_isr_ver = sys_read32(base + SDHCI_SLOT_INT_STATUS_VERSION);
 	uint16_t version = (uint16_t)(slot_isr_ver >> 16);
@@ -849,8 +865,10 @@ static DEVICE_API(sdhc, sdhc_bcm2835_api) = {
 };
 
 #define SDHC_BCM2835_INIT(inst)							\
+	PINCTRL_DT_INST_DEFINE(inst);						\
 	static const struct sdhc_bcm2835_config sdhc_bcm2835_cfg_##inst = {	\
 		DEVICE_MMIO_ROM_INIT(DT_DRV_INST(inst)),			\
+		.pincfg = PINCTRL_DT_INST_DEV_CONFIG_GET(inst),			\
 		.clock_freq = DT_INST_PROP(inst, clock_frequency),		\
 		.bus_width  = DT_INST_PROP(inst, bus_width),			\
 	};									\

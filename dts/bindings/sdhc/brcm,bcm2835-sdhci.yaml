@@ -17,7 +17,7 @@ description: |
 
 compatible: "brcm,bcm2835-sdhci"
 
-include: sdhc.yaml
+include: [sdhc.yaml, pinctrl-device.yaml]
 
 properties:
   reg:

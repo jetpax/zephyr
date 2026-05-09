@@ -51,10 +51,13 @@
 
 /*
  * The Arasan SDHCI controller is wired to the on-module CYW43439
- * wireless chip on this board. Driver is a skeleton today (methods
- * stub to -ENOTSUP); enabling lets the device probe so the boot log
- * confirms the DT path is right while the sequencer is filled in.
+ * wireless chip on this board. The pinctrl groups route GPIO 34..39
+ * to ALT3 (SD1_CLK / SD1_CMD / SD1_DAT0..3) and GPIO 43 to ALT0
+ * (GPCLK2 -- the wireless-module reference clock). Mirrors Linux's
+ * bcm2837-rpi-zero-2-w.dts &sdhci block.
  */
 &emmc {
+	pinctrl-names = "default";
+	pinctrl-0 = <&emmc_gpio34 &gpclk2_gpio43>;
 	status = "okay";
 };
