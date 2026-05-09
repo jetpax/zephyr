@@ -71,7 +71,12 @@
 		};
 	};
 
-	/* Arasan SDHCI on GPIO 34..39 (ALT3). Used on Pi 3 / Pi Zero 2 W
+	/* Arasan SDHCI on GPIO 34..39 (ALT3) plus GPCLK2 on GPIO 43
+	 * (ALT0 -- the wireless-module reference clock). Linux's
+	 * bcm283x.dtsi separates these into emmc_gpio34 and
+	 * gpclk2_gpio43, but Zephyr's Z_PINCTRL_STATE_PINS_INIT only
+	 * walks the first phandle in pinctrl-0, so we collect both pin
+	 * groups under one phandle here. Used on Pi 3 / Pi Zero 2 W
 	 * for the on-module CYW43439 wireless chip.
 	 */
 	emmc_gpio34: emmc-gpio34 {
@@ -81,14 +86,8 @@
 				 <EMMC_DAT0_GPIO36>,
 				 <EMMC_DAT1_GPIO37>,
 				 <EMMC_DAT2_GPIO38>,
-				 <EMMC_DAT3_GPIO39>;
-		};
-	};
-
-	/* GPCLK2 on GPIO 43 -- wireless-module reference clock. */
-	gpclk2_gpio43: gpclk2-gpio43 {
-		group1 {
-			pinmux = <GPCLK2_GPIO43>;
+				 <EMMC_DAT3_GPIO39>,
+				 <GPCLK2_GPIO43>;
 		};
 	};
 };

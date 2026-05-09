@@ -59,6 +59,13 @@ typedef struct bcm2710_pinctrl_soc_pin {
  *
  * @param node_id Node identifier (the pinctrl state node, e.g., uart0_default).
  * @param prop Property name describing state pins (should be "pinctrl-0").
+ *
+ * Walks one phandle's children. Zephyr's pinctrl convention is "one
+ * phandle per state": pinctrl-0 = <&uart0_default> with all pins for
+ * that state collected inside the &uart0_default node's children. This
+ * is the same shape as ESP32's pinctrl_soc.h and the upstream rpi_pico
+ * one. Linux's "<&group_a &group_b>" multi-phandle pattern doesn't
+ * translate; merge those into one group when porting from Linux DTS.
  */
 #define Z_PINCTRL_STATE_PINS_INIT(node_id, prop)                                                   \
 	{DT_FOREACH_CHILD_VARGS(DT_PHANDLE(node_id, prop), DT_FOREACH_PROP_ELEM, pinmux,           \

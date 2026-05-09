@@ -869,6 +869,22 @@ static int sdhc_bcm2835_init(const struct device *dev)
 	uint32_t ctrl0 = sys_read32(base + SDHCI_HOST_CONTROL);
 	uint32_t ctrl1 = sys_read32(base + SDHCI_CLOCK_CONTROL);
 
+	/* Diagnostic: peek at GPIO controller state to confirm pinctrl
+	 * actually applied and WL_REG_ON went high. The pinctrl driver
+	 * has already mapped 0x3f200000+0x100 via device_map, so reads
+	 * from absolute addresses in that range work.
+	 *
+	 *   GPFSEL3 (0x0C): alt-fn for pins 30..39, 3 bits/pin. Pins
+	 *                    34..39 in ALT3 = 0b111 each, so bits
+	 *                    [29:12] = 0x3FFFF.
+	 *   GPFSEL4 (0x10): alt-fn for pins 40..49. Pin 41 = OUTPUT = 1
+	 *                    in bits [5:3]; pin 43 = ALT0 = 4 in [11:9].
+	 *   GPLEV1  (0x38): level read for pins 32..53. Pin 41 -> bit 9.
+	 */
+	uint32_t gpfsel3 = sys_read32(0x3f200000 + 0x0C);
+	uint32_t gpfsel4 = sys_read32(0x3f200000 + 0x10);
+	uint32_t gplev1  = sys_read32(0x3f200000 + 0x38);
+
 	/* Scaffold self-test #2: issue CMD0 (GO_IDLE_STATE, no response,
 	 * no data) via the request() path. CMD_COMPLETE depends only on
 	 * the controller's internal state machine for no-response cmds,
@@ -899,16 +915,19 @@ static int sdhc_bcm2835_init(const struct device *dev)
 	};
 	int ret_cmd52 = sdhc_bcm2835_request(dev, &cmd52, NULL);
 
-	printk("sdhc_bcm2835: %s ver 0x%04x clk %u, post-init "
-	       "CONTROL0=0x%08x CONTROL1=0x%08x, "
-	       "CMD0 ret=%d, CMD52 ret=%d resp=0x%08x\n",
+	printk("sdhc_bcm2835: %s ver 0x%04x clk %u\n"
+	       "  CONTROL0=0x%08x CONTROL1=0x%08x\n"
+	       "  GPFSEL3=0x%08x GPFSEL4=0x%08x GPLEV1=0x%08x\n"
+	       "  CMD0 ret=%d, CMD52 ret=%d resp=0x%08x\n",
 	       dev->name, version, cfg->clock_freq, ctrl0, ctrl1,
+	       gpfsel3, gpfsel4, gplev1,
 	       ret_cmd0, ret_cmd52, cmd52.response[0]);
 
-	LOG_INF("%s ver 0x%04x clk %u, post-init "
-		"CONTROL0=0x%08x CONTROL1=0x%08x, "
-		"CMD0 ret=%d, CMD52 ret=%d resp=0x%08x",
+	LOG_INF("%s ver 0x%04x clk %u CONTROL0=0x%08x CONTROL1=0x%08x "
+		"GPFSEL3=0x%08x GPFSEL4=0x%08x GPLEV1=0x%08x "
+		"CMD0 ret=%d CMD52 ret=%d resp=0x%08x",
 		dev->name, version, cfg->clock_freq, ctrl0, ctrl1,
+		gpfsel3, gpfsel4, gplev1,
 		ret_cmd0, ret_cmd52, cmd52.response[0]);
 
 	return 0;
