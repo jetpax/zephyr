@@ -44,10 +44,25 @@
 
 LOG_MODULE_REGISTER(sdhc_bcm2835, CONFIG_SDHC_LOG_LEVEL);
 
-/* Standard SDHCI register offsets used here; full set lands in _ll.h
- * alongside the sequencer.
+/* Standard SDHCI register offsets we use. Names mirror Linux's
+ * include/linux/mmc/sdhci.h so cross-references read 1:1. The BCM
+ * datasheet packages some of these as 32-bit aggregates (e.g. CONTROL1
+ * = CLOCK_CONTROL + TIMEOUT + SOFTWARE_RESET); we always touch the
+ * containing 32-bit word.
  */
+#define SDHCI_CLOCK_CONTROL		0x2C	/* low 32 of CONTROL1 word */
 #define SDHCI_SLOT_INT_STATUS_VERSION	0xFC
+
+/* CONTROL1 (32-bit at 0x2C) -- standard SDHCI clock + timeout + reset */
+#define SDHCI_CTRL1_RESET_ALL		BIT(24)	/* SRST_HC: reset whole HC */
+#define SDHCI_CTRL1_RESET_CMD		BIT(25)	/* SRST_CMD: cmd line reset */
+#define SDHCI_CTRL1_RESET_DATA		BIT(26)	/* SRST_DATA: data line reset */
+
+/* Software reset timeout. Linux's sdhci.c defaults to 100 ms here and
+ * that's plenty for any sane controller -- the bit self-clears in
+ * microseconds on healthy silicon.
+ */
+#define BCM2835_SDHCI_RESET_TIMEOUT_MS	100
 
 /* Hardcoded host capabilities -- see sdhci-iproc.c::bcm2835_data.
  * The silicon's CAPABILITIES register at 0x40 reads as zero on this
@@ -123,15 +138,45 @@ static int sdhc_bcm2835_get_host_props(const struct device *dev,
 	return 0;
 }
 
+/* Software reset of one or more controller domains. mask is any
+ * combination of SDHCI_CTRL1_RESET_{ALL,CMD,DATA}. Writes the bit(s)
+ * into CONTROL1 and polls until the silicon clears them. The reset
+ * bit is self-clearing per spec; we time out in case the silicon
+ * disagrees rather than spinning forever.
+ *
+ * We always RMW the full 32-bit CONTROL1 word -- per the BCM datasheet
+ * the EMMC accepts only 32-bit aligned 32-bit accesses, and CONTROL1
+ * has clock-control fields below the reset bits that we mustn't
+ * disturb.
+ */
+static int sdhc_bcm2835_soft_reset(const struct device *dev, uint32_t mask)
+{
+	uintptr_t base = DEVICE_MMIO_GET(dev);
+	uint32_t ctrl1;
+	int64_t deadline = k_uptime_get() + BCM2835_SDHCI_RESET_TIMEOUT_MS;
+
+	ctrl1 = sys_read32(base + SDHCI_CLOCK_CONTROL);
+	sys_write32(ctrl1 | mask, base + SDHCI_CLOCK_CONTROL);
+
+	while (sys_read32(base + SDHCI_CLOCK_CONTROL) & mask) {
+		if (k_uptime_get() > deadline) {
+			return -ETIMEDOUT;
+		}
+		k_busy_wait(10);
+	}
+
+	return 0;
+}
+
 static int sdhc_bcm2835_reset(const struct device *dev)
 {
-	ARG_UNUSED(dev);
-	return -ENOTSUP;
+	return sdhc_bcm2835_soft_reset(dev, SDHCI_CTRL1_RESET_ALL);
 }
 
 static int sdhc_bcm2835_init(const struct device *dev)
 {
 	const struct sdhc_bcm2835_config *cfg = dev->config;
+	int ret;
 
 	DEVICE_MMIO_MAP(dev, K_MEM_CACHE_NONE);
 
@@ -139,13 +184,20 @@ static int sdhc_bcm2835_init(const struct device *dev)
 	uint32_t slot_isr_ver = sys_read32(base + SDHCI_SLOT_INT_STATUS_VERSION);
 	uint16_t version = (uint16_t)(slot_isr_ver >> 16);
 
-	/* Temporary: printk so the skeleton's "I'm here" message is visible
-	 * in MP-style images that build without CONFIG_LOG. Drop once the
-	 * real driver has its own LOG_* output worth seeing. */
-	printk("sdhc_bcm2835: %s @ 0x%lx, host version 0x%04x, clk_emmc %u Hz, %u-bit\n",
+	ret = sdhc_bcm2835_soft_reset(dev, SDHCI_CTRL1_RESET_ALL);
+	if (ret != 0) {
+		printk("sdhc_bcm2835: %s reset timeout\n", dev->name);
+		LOG_ERR("%s reset timeout", dev->name);
+		return ret;
+	}
+
+	/* Temporary printk so the bring-up's "I'm here" line is visible in
+	 * MP-style images that build without CONFIG_LOG. Drop once the real
+	 * driver has its own LOG_* output worth seeing. */
+	printk("sdhc_bcm2835: %s @ 0x%lx, host version 0x%04x, clk_emmc %u Hz, %u-bit, reset OK\n",
 	       dev->name, (unsigned long)base, version, cfg->clock_freq, cfg->bus_width);
 
-	LOG_INF("%s @ 0x%lx, host version 0x%04x, clk_emmc %u Hz, %u-bit",
+	LOG_INF("%s @ 0x%lx, host version 0x%04x, clk_emmc %u Hz, %u-bit, reset OK",
 		dev->name, (unsigned long)base, version, cfg->clock_freq, cfg->bus_width);
 
 	return 0;
