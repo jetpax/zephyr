@@ -8,6 +8,23 @@ config BCM2835_SDHC
 	select SDHC_SUPPORTS_NATIVE_MODE
 	help
 	  Enable the Broadcom BCM2835-family Arasan SDHCI host controller
-	  driver. Drives the EMMC port that's wired to the CYW43439 wireless
-	  chip on Pi 3 / Pi Zero 2 W. Skeleton today (methods stub out as
-	  -ENOTSUP); will fill in over the SDIO bring-up.
+	  driver. Drives the EMMC port that's wired to the BCM43430A1
+	  wireless chip on Pi 3 / Pi Zero 2 W. Polled implementation of
+	  the sdhc.h device API; no IRQ support yet, R1b deferred.
+
+if BCM2835_SDHC
+
+config SDHC_BCM2835_SELFTEST
+	bool "Run an SDIO bring-up self-test in driver init"
+	default n
+	help
+	  After the driver has reset the controller and configured the
+	  bus to 400 kHz / 1-bit / 3.3 V, fire CMD0, CMD5 (inquiry +
+	  op_cond), CMD3, CMD7 and a CMD52 CCCR read through the driver's
+	  own request() path. Logs each step; does not fail init on
+	  command errors (the device stays available for later layers).
+	  Used during BCM43430A1 bring-up to verify the request path
+	  end-to-end before wiring up the Zephyr SDIO subsystem. Disable
+	  in production builds.
+
+endif # BCM2835_SDHC

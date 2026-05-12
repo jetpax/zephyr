@@ -803,6 +803,172 @@ static int sdhc_bcm2835_reset(const struct device *dev)
 	return sdhc_bcm2835_soft_reset(dev, SDHCI_CTRL1_RESET_ALL);
 }
 
+#ifdef CONFIG_SDHC_BCM2835_SELFTEST
+/* Bring-up self-test: fires CMD0 + CMD5 (inquiry & op_cond) + CMD3 + CMD7
+ * + a CMD52 CCCR read through the driver's own request() path. Logs each
+ * step; failures log-only so init still returns 0 (the device stays
+ * available for later layers). Drop the Kconfig once Zephyr's SDIO
+ * subsystem is wired up and exercises the same path.
+ *
+ * CMD7 is sent as R1 (not R1b): both Linux's _mmc_select_card and
+ * Zephyr's own subsys/sd/sdio.c choose R1, because the SDIO chip doesn't
+ * drive a meaningful busy on SELECT_CARD. The driver's request() rejects
+ * R1b today and that's fine for this path.
+ */
+static void sdhc_bcm2835_selftest(const struct device *dev)
+{
+	struct sdhc_command cmd;
+	uint32_t ocr;
+	uint16_t rca;
+	int ret;
+	int i;
+
+	LOG_INF("--- SDIO bring-up self-test ---");
+
+	cmd = (struct sdhc_command){
+		.opcode = SD_GO_IDLE_STATE,
+		.response_type = SD_RSP_TYPE_NONE,
+	};
+	ret = sdhc_bcm2835_request(dev, &cmd, NULL);
+	if (ret != 0) {
+		LOG_ERR("CMD0 GO_IDLE failed: %d", ret);
+		return;
+	}
+	LOG_INF("CMD0 GO_IDLE: ok");
+
+	cmd = (struct sdhc_command){
+		.opcode = SDIO_SEND_OP_COND,
+		.response_type = SD_RSP_TYPE_R4,
+	};
+	ret = sdhc_bcm2835_request(dev, &cmd, NULL);
+	if (ret != 0) {
+		LOG_ERR("CMD5 inquiry failed: %d", ret);
+		return;
+	}
+	ocr = cmd.response[0];
+	LOG_INF("CMD5 inquiry: OCR=0x%08x", ocr);
+
+	for (i = 0; i < 100; i++) {
+		cmd = (struct sdhc_command){
+			.opcode = SDIO_SEND_OP_COND,
+			.arg = ocr & 0x00FFFFFF,
+			.response_type = SD_RSP_TYPE_R4,
+		};
+		ret = sdhc_bcm2835_request(dev, &cmd, NULL);
+		if (ret != 0) {
+			LOG_ERR("CMD5 op_cond failed @ iter %d: %d", i, ret);
+			return;
+		}
+		if (cmd.response[0] & SDIO_OCR_IO_READY_FLAG) {
+			break;
+		}
+		k_msleep(10);
+	}
+	if (!(cmd.response[0] & SDIO_OCR_IO_READY_FLAG)) {
+		LOG_ERR("CMD5 op_cond: chip never reported IO_READY "
+			"(last OCR=0x%08x)", cmd.response[0]);
+		return;
+	}
+	LOG_INF("CMD5 op_cond: OCR=0x%08x ready (%u io funcs%s)",
+		cmd.response[0],
+		(uint32_t)((cmd.response[0] & SDIO_OCR_IO_NUMBER) >>
+			   SDIO_OCR_IO_NUMBER_SHIFT),
+		(cmd.response[0] & SDIO_OCR_MEM_PRESENT_FLAG) ?
+			", mem present" : "");
+
+	cmd = (struct sdhc_command){
+		.opcode = SD_SEND_RELATIVE_ADDR,
+		.response_type = SD_RSP_TYPE_R6,
+	};
+	ret = sdhc_bcm2835_request(dev, &cmd, NULL);
+	if (ret != 0) {
+		LOG_ERR("CMD3 SEND_RELATIVE_ADDR failed: %d", ret);
+		return;
+	}
+	rca = cmd.response[0] >> 16;
+	LOG_INF("CMD3 SEND_RELATIVE_ADDR: RCA=0x%04x", rca);
+
+	cmd = (struct sdhc_command){
+		.opcode = SD_SELECT_CARD,
+		.arg = ((uint32_t)rca) << 16,
+		.response_type = SD_RSP_TYPE_R1,
+	};
+	ret = sdhc_bcm2835_request(dev, &cmd, NULL);
+	if (ret != 0) {
+		LOG_ERR("CMD7 SELECT_CARD failed: %d", ret);
+		return;
+	}
+	LOG_INF("CMD7 SELECT_CARD: ok");
+
+	cmd = (struct sdhc_command){
+		.opcode = SDIO_RW_DIRECT,
+		.arg = ((uint32_t)SDIO_CCCR_CCCR <<
+			SDIO_CMD_ARG_REG_ADDR_SHIFT),
+		.response_type = SD_RSP_TYPE_R5,
+	};
+	ret = sdhc_bcm2835_request(dev, &cmd, NULL);
+	if (ret != 0) {
+		LOG_ERR("CMD52 CCCR read failed: %d", ret);
+		return;
+	}
+	LOG_INF("CMD52 CCCR read @ 400kHz/1-bit: resp=0x%08x cccr_rev=%u sdio_rev=%u",
+		cmd.response[0],
+		(uint32_t)(cmd.response[0] & SDIO_CCCR_CCCR_REV_MASK),
+		(uint32_t)((cmd.response[0] >> 4) & 0xF));
+
+	/* CMD52 write to CCCR_BUS_IF (0x07) = 0b10: tell the chip to switch
+	 * to 4-bit. The chip ACKs in R5 and switches on the response edge,
+	 * so the next register touch must be the host-side width change.
+	 */
+	cmd = (struct sdhc_command){
+		.opcode = SDIO_RW_DIRECT,
+		.arg = (1U << SDIO_CMD_ARG_RW_SHIFT) |
+		       ((uint32_t)SDIO_CCCR_BUS_IF <<
+			SDIO_CMD_ARG_REG_ADDR_SHIFT) |
+		       SDIO_CCCR_BUS_IF_WIDTH_4_BIT,
+		.response_type = SD_RSP_TYPE_R5,
+	};
+	ret = sdhc_bcm2835_request(dev, &cmd, NULL);
+	if (ret != 0) {
+		LOG_ERR("CMD52 write CCCR_BUS_IF=4bit failed: %d", ret);
+		return;
+	}
+	LOG_INF("CMD52 write CCCR_BUS_IF=4bit: resp=0x%08x", cmd.response[0]);
+
+	struct sdhc_io ios_fast = {
+		.clock = SD_CLOCK_25MHZ,
+		.bus_width = SDHC_BUS_WIDTH4BIT,
+		.power_mode = SDHC_POWER_ON,
+		.signal_voltage = SD_VOL_3_3_V,
+	};
+	ret = sdhc_bcm2835_set_io(dev, &ios_fast);
+	if (ret != 0) {
+		LOG_ERR("set_io(25MHz/4-bit) failed: %d", ret);
+		return;
+	}
+	LOG_INF("set_io: 25 MHz, 4-bit, 3.3V");
+
+	/* Re-read CCCR rev to confirm both sides survived the switch. */
+	cmd = (struct sdhc_command){
+		.opcode = SDIO_RW_DIRECT,
+		.arg = ((uint32_t)SDIO_CCCR_CCCR <<
+			SDIO_CMD_ARG_REG_ADDR_SHIFT),
+		.response_type = SD_RSP_TYPE_R5,
+	};
+	ret = sdhc_bcm2835_request(dev, &cmd, NULL);
+	if (ret != 0) {
+		LOG_ERR("CMD52 CCCR read @ 25MHz/4-bit failed: %d", ret);
+		return;
+	}
+	LOG_INF("CMD52 CCCR read @ 25MHz/4-bit: resp=0x%08x cccr_rev=%u sdio_rev=%u",
+		cmd.response[0],
+		(uint32_t)(cmd.response[0] & SDIO_CCCR_CCCR_REV_MASK),
+		(uint32_t)((cmd.response[0] >> 4) & 0xF));
+
+	LOG_INF("--- self-test complete ---");
+}
+#endif /* CONFIG_SDHC_BCM2835_SELFTEST */
+
 static int sdhc_bcm2835_init(const struct device *dev)
 {
 	const struct sdhc_bcm2835_config *cfg = dev->config;
@@ -892,6 +1058,10 @@ static int sdhc_bcm2835_init(const struct device *dev)
 		LOG_ERR("%s set_io failed: %d", dev->name, ret);
 		return ret;
 	}
+
+#ifdef CONFIG_SDHC_BCM2835_SELFTEST
+	sdhc_bcm2835_selftest(dev);
+#endif
 
 	return 0;
 }
