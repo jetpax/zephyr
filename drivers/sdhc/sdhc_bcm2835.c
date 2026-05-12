@@ -520,19 +520,31 @@ static int sdhc_bcm2835_request(const struct device *dev,
 
 	/* Clear any stale CMD/DATA-side interrupt bits so wait_int doesn't
 	 * latch onto a previous request's completion.
+	 *
+	 * The BCM Arasan has a documented clock-domain-crossing bug
+	 * (sdhci-iproc.c: "may lose the content of successive writes to
+	 * the same register within two SD-card clock cycles of each
+	 * other"). Linux's bcm2835_mmc_writel wraps every register write
+	 * with `udelay((2*1000000)/max(host->clock, 400000) + 1)` = 6 us
+	 * at 400 kHz. Our k_busy_wait(10) is comfortably > 4 SDCLK cycles
+	 * at the 400 kHz initialisation clock and harmless at higher
+	 * post-init rates.
 	 */
 	sys_write32(SDHCI_INT_CMD_COMPLETE | SDHCI_INT_CMD_ERROR_MASK |
 		    SDHCI_INT_BUF_WRITE_READY | SDHCI_INT_BUF_READ_READY |
 		    SDHCI_INT_DATA_END | SDHCI_INT_DATA_ERROR_MASK,
 		    base + SDHCI_INT_STATUS);
+	k_busy_wait(10);
 
 	if (data != NULL) {
 		uint32_t blksizecnt = (data->block_size & 0x3FF) |
 				      ((uint32_t)data->blocks << 16);
 		sys_write32(blksizecnt, base + SDHCI_BLKSIZECNT);
+		k_busy_wait(10);
 	}
 
 	sys_write32(cmd->arg, base + SDHCI_ARG1);
+	k_busy_wait(10);
 	sys_write32(cmdtm, base + SDHCI_CMDTM);	/* fires command */
 
 	int_status = sdhc_bcm2835_wait_int(dev, SDHCI_INT_CMD_COMPLETE,
@@ -546,7 +558,15 @@ static int sdhc_bcm2835_request(const struct device *dev,
 	if (int_status & SDHCI_INT_CMD_ERROR_MASK) {
 		sys_write32(int_status & SDHCI_INT_CMD_ERROR_MASK,
 			    base + SDHCI_INT_STATUS);
+		/* "The controller needs a reset of internal state machines
+		 * upon error conditions." -- bcm2835-mmc.c
+		 * Linux always pairs RESET_CMD with RESET_DATA in the
+		 * tasklet error path; without RESET_DATA the data-side
+		 * state machine can stay stuck and the next CMD enters
+		 * an undefined state.
+		 */
 		(void)sdhc_bcm2835_soft_reset(dev, SDHCI_CTRL1_RESET_CMD);
+		(void)sdhc_bcm2835_soft_reset(dev, SDHCI_CTRL1_RESET_DATA);
 		if (int_status & SDHCI_INT_CMD_TIMEOUT) {
 			return -ETIMEDOUT;
 		}
@@ -624,17 +644,16 @@ static int sdhc_bcm2835_set_clock(const struct device *dev, uint32_t target_hz)
 	div = sdhc_bcm2835_calc_clk_div(cfg->clock_freq, target_hz);
 	ctrl1 |= ((div >> 8) & 0x3) << SDHCI_CTRL1_CLK_FREQ_MS_SHIFT;
 	ctrl1 |= (div & 0xFF) << SDHCI_CTRL1_CLK_FREQ_LO_SHIFT;
-	/* DATA_TOUNIT controls the SDHCI host data-timeout counter, but on
-	 * BCM2835 Arasan integration it also governs the command-timeout
-	 * counter. With SDHCI_QUIRK_DATA_TIMEOUT_USES_SDCLK (BCM2835 has
-	 * it), the count interval is SDCLK * 2^(field+13). At 0xE that's
-	 * 2^27 SDCLK cycles = ~335 s at 400 kHz -- so a no-response cmd
-	 * timeout takes hundreds of seconds and our wait_int gives up
-	 * first. 0x6 = 2^19 cycles = ~1.3 s at 400 kHz: small enough that
-	 * a 5 s wait_int catches it cleanly, large enough that genuine
-	 * data transfers don't get spuriously timed out.
+	/* DATA_TOUNIT = 0 matches Linux bcm2835-mmc.c, confirmed by the
+	 * 2026-05-11 trace_printk capture: Linux writes CTRL1=0x0000fa07
+	 * at the start of every iter (DATA_TOUNIT bits 19:16 = 0). At 0
+	 * the count interval is 2^13 SDCLK cycles = ~20 ms at 400 kHz,
+	 * which is fast enough for our wait_int (default 5 s) to never
+	 * race the hardware timeout. Previous value 0x6 was an overshoot
+	 * that left the controller's CMD_INHIBIT stuck longer than needed
+	 * after a no-response CMD.
 	 */
-	ctrl1 |= 0x6 << SDHCI_CTRL1_DATA_TOUT_SHIFT;
+	ctrl1 |= 0x0 << SDHCI_CTRL1_DATA_TOUT_SHIFT;
 	ctrl1 |= SDHCI_CTRL1_CLK_INTLEN;
 	sys_write32(ctrl1, base + SDHCI_CLOCK_CONTROL);
 
@@ -863,25 +882,28 @@ static int sdhc_bcm2835_init(const struct device *dev)
 		return ret;
 	}
 
-	/* Reset clears INT_ENABLE to all-zero, which gates every status
-	 * bit -- without this, INT_STATUS stays 0 forever even when the
-	 * controller fires CMD_COMPLETE / DATA_END / errors internally.
-	 * Enable everything we poll for. CARD_INSERT / CARD_REMOVE stay
-	 * masked because BCM2835 has the BROKEN_CARD_DETECTION quirk
-	 * (no card-detect line on this Arasan integration; the wireless
-	 * chip is hardwired-on).
+	/* INT_ENABLE / SIGNAL_ENABLE = 0x00FF0003, matching Linux's
+	 * bcm2835_mmc_init exactly (confirmed by 2026-05-11 trace_printk
+	 * on Pi-downstream 6.12.87: WR 034=00ff0003, WR 038=00ff0003).
 	 *
-	 * SIGNAL_ENABLE gets the same value. Linux's
-	 * sdhci_set_default_irqs writes both registers identically and
-	 * Pi Zero 2 W silicon empirically does not latch INT_STATUS bits
-	 * (CMD_COMPLETE / CMD_TIMEOUT alike) unless SIGNAL_ENABLE has the
-	 * matching bit set -- a non-spec-compliant quirk we'd otherwise
-	 * spend hours rediscovering. We're still polled (no IRQ_CONNECT),
-	 * so the GIC/intc layer won't deliver an actual ARM interrupt;
-	 * SIGNAL_ENABLE just gates the controller's INT_STATUS latch.
+	 * Bits enabled: CMD_COMPLETE (0), DATA_END (1), and all CMD/DATA
+	 * error bits (16..23). Card insert/remove and the wider SDIO/
+	 * tuning bits stay masked because they're irrelevant for an
+	 * always-on wireless chip and enabling them empirically risks
+	 * non-spec behaviour on this silicon.
+	 *
+	 * Pi Zero 2 W silicon does not latch INT_STATUS bits unless the
+	 * matching SIGNAL_ENABLE bit is set, so both registers MUST get
+	 * the same value even though we drive the request path by
+	 * polling (no IRQ_CONNECT). The SoC intc / IRQ delivery layer is
+	 * a separate matter.
 	 */
-	uint32_t int_en = SDHCI_INT_ALL_W1C &
-			  ~(SDHCI_INT_CARD_INSERT | SDHCI_INT_CARD_REMOVE);
+	uint32_t int_en = SDHCI_INT_CMD_COMPLETE | SDHCI_INT_DATA_END |
+			  SDHCI_INT_CMD_TIMEOUT | SDHCI_INT_CMD_CRC |
+			  SDHCI_INT_CMD_END_BIT | SDHCI_INT_CMD_INDEX |
+			  SDHCI_INT_DATA_TIMEOUT | SDHCI_INT_DATA_CRC |
+			  SDHCI_INT_DATA_END_BIT |
+			  BIT(23);	/* BUS_POWER_ERR */
 	sys_write32(int_en, base + SDHCI_INT_ENABLE);
 	sys_write32(int_en, base + SDHCI_SIGNAL_ENABLE);
 
@@ -942,42 +964,51 @@ static int sdhc_bcm2835_init(const struct device *dev)
 		}
 	}
 
-	/* Scaffold self-test #2: CMD52 IO_RESET. This is the canonical
-	 * first command for an SDIO chip per brcmfmac/sdio.c -- write
-	 * 0x08 to function 0 register 0x06 (CCCR_ABORT.RES bit) to
-	 * transition the chip out of SDIO Inactive State. CMD0 is for
-	 * SD memory cards and on an SDIO-only chip just sits there,
-	 * leaving the chip in Inactive (where it ignores other commands).
+	/* Bring-up self-test: replicate the EXACT Linux iter2 SDIO
+	 * enumeration sequence captured via trace_printk on Pi-downstream
+	 * 6.12.87. Linux's iter1 (CMD52 sdio_reset twice) always fails
+	 * with CMD_TIMEOUT; mmc_rescan then waits 1.4 s and iter2 issues
+	 * CMD0 + CMD8 + CMD5 in that order, which succeeds on the live
+	 * Pi. We replicate iter2 directly because the chip's bootrom is
+	 * past its settle window by the time POST_KERNEL inits run.
 	 *
-	 * Argument: bit 31 = 1 (write), function = 0, RAW = 0,
-	 *           reg addr = 0x06, data = 0x08.
-	 * Response type: R5 -- but the chip in Inactive may not respond,
-	 * so we expect either ret=0 (state machine advanced + chip ack'd)
-	 * or ret=-116 with a now-clean post-mortem (controller fired
-	 * CMD_TIMEOUT and our wait_int caught it).
+	 * KNOWN-ISSUE 2026-05-11: CMD5 still times out in this driver
+	 * even though every register write matches Linux byte-for-byte.
+	 * The chip drives a response (verified by PSTATE.CMD_LINE_LEVEL
+	 * + GPLEV1 dual-capture in prior session) but the controller's
+	 * RX state machine doesn't latch it. Linux's /dev/mem userspace
+	 * also fails identically -- something in the kernel-driver
+	 * context (real ISR registered via request_irq, spinlock-held
+	 * MMIO, tasklet-deferred reset) is the un-pinned-down
+	 * differentiator. Documented in board HANDOVER.md.
 	 */
-	struct sdhc_command cmd52_reset = {
-		.opcode = SDIO_RW_DIRECT,
-		.arg = 0x80000C08,
-		.response_type = SD_RSP_TYPE_R5,
+	struct sdhc_command cmd0 = {
+		.opcode = SD_GO_IDLE_STATE,
+		.arg = 0,
+		.response_type = SD_RSP_TYPE_NONE,
 	};
-	int ret_cmd52_reset = sdhc_bcm2835_request(dev, &cmd52_reset, NULL);
+	int ret_cmd0 = sdhc_bcm2835_request(dev, &cmd0, NULL);
 
-	/* Scaffold self-test #3: CMD5 inquiry to see if the chip is now
-	 * willing to talk. arg = 0 (inquiry: don't request a voltage,
-	 * just get the OCR back). Response R4.
-	 */
-	struct sdhc_command cmd5 = {
+	struct sdhc_command cmd8 = {
+		.opcode = SD_SEND_IF_COND,
+		.arg = 0x000001AA,
+		.response_type = SD_RSP_TYPE_R7,
+	};
+	int ret_cmd8 = sdhc_bcm2835_request(dev, &cmd8, NULL);
+
+	struct sdhc_command cmd5_inq = {
 		.opcode = SDIO_SEND_OP_COND,
 		.arg = 0,
 		.response_type = SD_RSP_TYPE_R4,
 	};
-	int ret_cmd5 = sdhc_bcm2835_request(dev, &cmd5, NULL);
+	int ret_cmd5_inq = sdhc_bcm2835_request(dev, &cmd5_inq, NULL);
 
-	/* Track whether the FORCE_IRPT path still works. */
-	sys_write32(SDHCI_INT_CMD_TIMEOUT, base + 0x50);
-	uint32_t int_after_force = sys_read32(base + SDHCI_INT_STATUS);
-	sys_write32(SDHCI_INT_CMD_TIMEOUT, base + SDHCI_INT_STATUS);
+	struct sdhc_command cmd5_ocr = {
+		.opcode = SDIO_SEND_OP_COND,
+		.arg = 0x00300000,	/* 3.0-3.3V window per Linux trace */
+		.response_type = SD_RSP_TYPE_R4,
+	};
+	int ret_cmd5_ocr = sdhc_bcm2835_request(dev, &cmd5_ocr, NULL);
 
 	/* Post-CMD5 register snapshot. */
 	uint32_t pstate_after  = sys_read32(base + SDHCI_PRESENT_STATE);
@@ -988,24 +1019,24 @@ static int sdhc_bcm2835_init(const struct device *dev)
 	       "  CONTROL0=0x%08x CONTROL1=0x%08x\n"
 	       "  GPFSEL3=0x%08x GPFSEL4=0x%08x GPLEV1=0x%08x\n"
 	       "  pin34 CLK toggle: %u high / %u low (in 256 reads)\n"
-	       "  CMD52_IORESET ret=%d resp=0x%08x, CMD5 ret=%d resp=0x%08x\n"
-	       "  FORCE_IRPT INT_STATUS=0x%08x\n"
-	       "  post-CMD5 PRESENT_STATE=0x%08x INT_STATUS=0x%08x INT_ENABLE=0x%08x\n",
+	       "  CMD0      ret=%d\n"
+	       "  CMD8      ret=%d resp=0x%08x (expect -116, SDIO ignores CMD8)\n"
+	       "  CMD5_inq  ret=%d resp=0x%08x (expect 0x20FFFF00 on success)\n"
+	       "  CMD5_OCR  ret=%d resp=0x%08x (expect 0xA0FFFF00 on success)\n"
+	       "  post PRESENT_STATE=0x%08x INT_STATUS=0x%08x INT_ENABLE=0x%08x\n",
 	       dev->name, version, cfg->clock_freq, ctrl0, ctrl1,
 	       gpfsel3, gpfsel4, gplev1, clk_high, clk_low,
-	       ret_cmd52_reset, cmd52_reset.response[0],
-	       ret_cmd5, cmd5.response[0],
-	       int_after_force,
+	       ret_cmd0,
+	       ret_cmd8, cmd8.response[0],
+	       ret_cmd5_inq, cmd5_inq.response[0],
+	       ret_cmd5_ocr, cmd5_ocr.response[0],
 	       pstate_after, int_after, int_en_after);
 
 	LOG_INF("%s ver 0x%04x clk %u CONTROL0=0x%08x CONTROL1=0x%08x "
-		"GPFSEL3=0x%08x GPFSEL4=0x%08x GPLEV1=0x%08x "
-		"clk_high=%u clk_low=%u "
-		"CMD52_IORESET ret=%d resp=0x%08x CMD5 ret=%d resp=0x%08x",
+		"CMD0=%d CMD8=%d CMD5_inq=%d resp=0x%08x CMD5_OCR=%d resp=0x%08x",
 		dev->name, version, cfg->clock_freq, ctrl0, ctrl1,
-		gpfsel3, gpfsel4, gplev1, clk_high, clk_low,
-		ret_cmd52_reset, cmd52_reset.response[0],
-		ret_cmd5, cmd5.response[0]);
+		ret_cmd0, ret_cmd8, ret_cmd5_inq, cmd5_inq.response[0],
+		ret_cmd5_ocr, cmd5_ocr.response[0]);
 
 	return 0;
 }

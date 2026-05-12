@@ -25,6 +25,14 @@
 #define BCM2711_PULL_UP		1
 #define BCM2711_PULL_DOWN	2
 
+/* Sentinel: bias is unspecified at the DT group level. The driver
+ * skips pull-control writes for these pins so firmware-set pulls
+ * (e.g. the mini-UART RX pull-up that keeps the console line idle
+ * high) are preserved. Distinct from BCM2711_PULL_NONE, which is
+ * "explicitly disable bias".
+ */
+#define BCM2711_PULL_KEEP	0xFF
+
 /* BCM2711 pinmux configuration macro */
 #define BCM2711_PINMUX(pin, func) \
 	(((pin) & 0xFF) | (((func) & 0x7) << 8))

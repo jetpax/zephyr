@@ -113,6 +113,11 @@
 			reg = <0x3f200000 0xf4>;
 			#address-cells = <1>;
 			#size-cells = <0>;
+			/* BCM2710 uses the GPPUD/GPPUDCLK pull sequence;
+			 * the modern PUP_PDN_CNTRL_REG at 0xE4 is reserved
+			 * on this silicon. See driver for details.
+			 */
+			legacy-pull-control;
 
 			/* GPIO 0 ~ 27. legacy-pull-control selects the
 			 * BCM2835-family GPPUD/GPPUDCLK pull sequence; the
@@ -208,7 +213,16 @@
 			compatible = "brcm,bcm2835-sdhci";
 			reg = <0x3f300000 0x100>;
 			interrupts = <BCM2835_IRQ_ARASAN_SDIO IRQ_TYPE_LEVEL 0>;
-			clock-frequency = <DT_FREQ_M(100)>;
+			/* Actual clk_emmc rate set by VPU firmware: PLLC_CORE0
+			 * (1 GHz) / DIVI 5 = 200 MHz. Confirmed via Linux's
+			 * /sys/kernel/debug/clk/clk_summary on the same board.
+			 * Earlier this was 100 MHz, which was just wrong --
+			 * it made our calc_clk_div produce divider 125 for a
+			 * 400 kHz target, yielding actual 800 kHz SDCLK and
+			 * exceeding the SD spec's 400 kHz card-identification
+			 * limit. CYW43439 wouldn't ack any commands.
+			 */
+			clock-frequency = <DT_FREQ_M(200)>;
 			bus-width = <4>;
 			status = "disabled";
 		};

@@ -240,43 +240,140 @@ trivially small.
    without it, the mini-UART baud divisor is wrong and you get
    gibberish. Documented in board doc.
 
-6. **GPIO is left disabled.** As above -- the bcm2711-gpio driver
-   pokes BCM2711-only registers. Either fix that driver to fall
-   back to GPPUD/GPPUDCLK on `compatible = "brcm,bcm2710-gpio"`, or
-   write a parallel `bcm2710-gpio.c`. `machine.Pin()` from MP is
-   unavailable until then.
+6. **GPIO is left disabled.** The pinctrl side is fixed (the
+   `legacy-pull-control` DT property selects the BCM2710 GPPUD /
+   GPPUDCLK sequence in `pinctrl_bcm2711.c`), so muxing and pulls
+   work. The bcm2711-gpio output-control side still pokes the
+   modern register layout though; until that's similarly extended,
+   `machine.Pin()` from MP for output-driving is unavailable.
 
 7. **QEMU stdin sometimes eats the first few chars of pasted
    commands.** Annoying for testing, harmless on real hardware via
    tio.
 
-## SDIO bring-up status (in flight as of 2026-05-09)
+## SDIO bring-up status (as of 2026-05-11)
 
-Significant progress since the original handover -- a polled
-SDHCI driver, GPIO + pinctrl wiring, board-DTS hookup, and CMD0
-working end-to-end on real silicon. **But the chip stays silent
-on every SDIO command we've tried** (CMD52 read CCCR, CMD52
-IO_RESET, CMD5 inquiry). The controller transmits, eventually
-fires CMD_TIMEOUT, but the chip itself never sends a response.
+The chip on Pi Zero 2 W is **CYW43436** (BCM43430-family, not
+CYW43439 as the original handover claimed). Confirmed via Linux's
+`brcmfmac` loading firmware `brcmfmac43430-sdio` on the live
+hardware. The on-die SDIO interface is the same.
 
-**Strongest remaining hypothesis:** GPCLK2 (LPO input on GPIO 43)
-isn't actually generating 32.768 kHz. We pinctrl-route the pin to
-ALT0, but Zephyr has no BCM2835 clock-manager driver to program
-`CM_GP2CTL` / `CM_GP2DIV` -- so the pin is outputting whatever the
-Pi VPU firmware left, which may not be a clean LPO. The CYW43439's
-PMU likely needs LPO to advance from cold-boot to "ready for SDIO".
+### What's verified working
 
-**Next move:** add a minimal CM_GP2 setup before WL_REG_ON-high.
-CM base 0x3F101000, CM_GP2CTL at 0x80, CM_GP2DIV at 0x84, every
-write needs PASSWD = 0x5A in bits 31:24. With 19.2 MHz oscillator
-divided by 586 we get 32764 Hz -- close enough. ~30 lines of
-direct register pokes; can be a small SoC helper or inline in
-`sdhc_bcm2835_init`.
+End-to-end on real silicon:
+- SDHCI controller version 0x9902 (Broadcom + SDHCI 3.0).
+- Pinctrl correctly routes GPIO 34..39 (ALT3 = SD1 functions) and
+  GPIO 43 (ALT0 = GPCLK2 = chip's LPO input). The legacy GPPUD /
+  GPPUDCLK pull-control sequence is implemented in
+  `drivers/pinctrl/pinctrl_bcm2711.c` for this silicon (the modern
+  0xE4 PUP_PDN register is reserved on BCM2710).
+- `clock-frequency = <DT_FREQ_M(200)>` in `bcm2710.dtsi` matches
+  the actual clk_emmc rate the VPU firmware programs (PLLC_CORE0
+  /5 = 200 MHz, confirmed via Linux's clk_summary). Earlier this
+  was 100 MHz, which made the SDHCI divider produce 800 kHz SDCLK
+  -- 2× the SD spec card-identification limit. With 200 MHz the
+  driver's divider math correctly yields a 400 kHz SDCLK.
+- `CONTROL0 = 0x00000f00` (BUS_POWER + 3.3V), `CONTROL1 = 0x0000fa07`
+  (DATA_TOUNIT=0, CLK_FREQ=250, SDCLK+INTCLK enabled), `CONTROL2 =
+  0`, `INT_ENABLE / SIGNAL_ENABLE = 0x00FF0003`. Byte-for-byte
+  match to Linux's `bcm2835-mmc.c` register writes captured via
+  `trace_printk` instrumentation on Pi-downstream 6.12.87.
+- The SDHCI TX path is **perfect**: bit-bang wire capture of
+  controller-issued CMD52/CMD5 frames decodes byte-for-byte
+  correctly including hardware-computed CRC7. Pin 34 (SD_CLK)
+  toggles at proper 400 kHz.
+- The chip is **alive and responds**: bit-bang on GPIO 34/35
+  driving CMD5 with the controller bypassed gets a valid OCR
+  (0xA0FFFF00). Wire capture during SDHCI-issued CMD5 also shows
+  the chip driving the CMD line low during the response window
+  (87 LO samples in 8192 GPLEV1 reads; SDHCI PSTATE.CMD_LINE_LEVEL
+  sees the same drive).
 
-The full debug log -- what worked, what didn't, scaffolding
-diagnostics still in tree, secondary hypotheses -- is captured
-in the auto-memory at
-`~/.claude/projects/-Users-jep-github-SS/memory/project_rpi_zero_2w_sdio_debug.md`.
+### The wall
+
+The SDHCI controller's **RX state machine does not engage** on the
+chip's response despite the pad-level seeing the chip drive. CMD5
+fires CMD_TIMEOUT every time with RESP=0 and PSTATE.CMD_INHIBIT
+stuck on. Failure mode is identical whether driven from the C
+driver at init or via MP REPL `mem32` pokes.
+
+Crucially: **Linux's `/dev/mem` userspace driver on the same
+running kernel ALSO fails to issue commands** (tested previous
+session) -- so the difference isn't anywhere observable at the
+register level. Something in Linux's kernel-context bcm2835-mmc
+probe path (real registered IRQ handler, spinlock-held MMIO,
+tasklet-deferred error recovery) is the un-pinned-down piece.
+This is independent of which exact register values we write; the
+deep instrumentation captured 2026-05-11 (trace_printk on every
+writel, readl, and the function entries for irq/cmd_irq/
+finish_command/reset/set_clock/set_ios/tasklet_finish) confirmed
+that the kernel does **nothing** between writes that we can't see.
+
+Disproven hypotheses (preserved here so the next session doesn't
+re-test them):
+
+- **"GPCLK2 LPO isn't being generated."** VPU firmware leaves
+  `CM_GP2CTL=0x291`, `CM_GP2DIV=0x00249f00` (MASH-1, exact 32 768
+  Hz). Re-programming from Zephyr is empirically counterproductive
+  -- the 30-50 µs LPO outage during KILL+restart disturbs the
+  chip's PMU. **Leave VPU's GPCLK2 alone.**
+- **"WL_REG_ON cycling wakes the chip."** Tested 20 ms / 100 ms /
+  500 ms LOW with various HIGH-settle times up to 4 s (past the
+  3.5 s CYW43436 bootrom). No change. The VPU already drives
+  WL_REG_ON HIGH before the kernel runs; toggling makes things
+  worse. **Inherit VPU state.**
+- **"Ncr_min=5 lower bound."** Chip drives at Ncr=5; SDHCI spec
+  wants Ncr ≥ 8. The "controller rejects fast responses" theory
+  was disproven by Linux's iter1 CMD52 *also* failing identically
+  on the same silicon -- Linux's iter2 succeeds 1.4 s later
+  without any controller-side changes. Whatever the discriminator
+  is, it isn't Ncr enforcement.
+- **"Match Linux's exact register sequence including failing
+  iter1 first."** Done bit-for-bit. Replicated CMD52 read + CMD52
+  IO_RESET + 1.5 s wait + CMD0 + CMD8 + CMD5. CMD5 still times
+  out. The "1.4 s gap" Linux has between iter1 and iter2 is dead
+  air -- no register activity, no function calls, no reads. The
+  difference is entirely in what the kernel context provides
+  around the writes, not in the writes themselves.
+- **"BCM2711 low-bus-clock hang."** `sdhci-iproc.c` documents the
+  bug at 100 kHz × 500 MHz core_freq on Pi 4. Tested at 1.6 MHz
+  SDCLK on Pi Zero 2 W -- same failure. Different SoC; the bug
+  doesn't apply.
+- **"Auto-clock-gating drops SDCLK during response window."**
+  Sampled pin 34 SDCLK during the response window: it runs
+  continuously (62/38 hi/lo ratio is sampling artifact, not
+  gating).
+
+### Production driver state (as of 2026-05-11 bake-in commit)
+
+The Zephyr `drivers/sdhc/sdhc_bcm2835.c` is byte-for-byte matched
+to Linux's bcm2835-mmc.c for the write sequence, but cleaned of
+the experimental scaffolding that didn't help (5×4 freq sweep,
+CM register reads, one-shot ISR, WL_REG_ON toggle, GPCLK2
+reprogramming). The bring-up self-test now sends Linux's iter2
+sequence directly (CMD0 → CMD8 → CMD5_inq → CMD5_OCR) so the
+diagnostic output is comparable to the captured kernel trace.
+**The self-test is expected to fail at CMD5 until the kernel-
+context wall is cracked.**
+
+### Path forward, ranked
+
+1. **Build a Zephyr C driver with full kernel-style context.**
+   Real ISR registered via `IRQ_CONNECT` for the SDHCI IRQ at the
+   ARMC intc, request-path takes a spinlock, error path schedules
+   RESET_CMD+RESET_DATA via a work item rather than inline,
+   explicit `__DSB()` between MMIO writes. If this also fails,
+   kernel-context vs userspace isn't the differentiator and
+   we're missing something at a level neither register traces nor
+   source review have revealed.
+2. **External CYW43439 via SPI on Pico W coprocessor.** Reuses
+   the proven RP2350 + CYW43 SPI stack on `jetpax/pyDirect picosdk`
+   branch. ~$6 BOM addition. Zero new BCM silicon driver risk and
+   is fully under Zephyr control.
+
+The auto-memory at
+`~/.claude/projects/-Users-jep-github-SS/memory/project_rpi_zero_2w_sdio_debug.md`
+has the longer chronological investigation log.
 
 ## Open work, ranked
 
@@ -309,18 +406,15 @@ in the auto-memory at
 
 ### Harder
 
-- **CYW43439 Wi-Fi/Bluetooth.** Pi Zero 2 W's wireless lives on
-  SDIO. Zephyr's BCM SDHCI driver is missing entirely, and the
-  user already has CYW43439 + WHD-via-SPI working on RP2350 (in a
-  different branch -- see `rp2350-psram-bringup` in the same fork).
-  The path is:
-  1. Write a Zephyr SDIO host driver for the BCM2710 EMMC2/SDHOST
-     controller. (Linux: `sdhci-iproc.c` + `bcm2835_mmc.c` are
-     references.)
-  2. Adapt the AIROC WHD HAL bus shim to use SDIO.
-  3. Pull in the existing CYW43439 Zephyr driver.
-  This is months of work and is the gating piece for anything
-  network-based on this board.
+- **CYW43436 Wi-Fi/Bluetooth.** Pi Zero 2 W's wireless lives on
+  SDIO. A polled `brcm,bcm2835-sdhci` driver is now in tree at
+  `drivers/sdhc/sdhc_bcm2835.c` with register init matched
+  byte-for-byte to Linux's bcm2835-mmc.c -- but the kernel-
+  context wall (see SDIO bring-up status above) means CMD5 does
+  not yet succeed. The two realistic continuations are documented
+  in that section; option (2) (external CYW43439 via SPI on
+  Pico W coprocessor) is the lower-risk path and reuses the
+  proven `rp2350-psram-bringup` branch's CYW stack.
 - **Frozen `_boot.py`.** MP currently boots straight to a bare
   REPL. If you want frozen modules baked in (typical embedded MP
   workflow), the path is via MP's manifest mechanism in

@@ -33,14 +33,22 @@ typedef struct bcm2710_pinctrl_soc_pin {
 } pinctrl_soc_pin_t;
 
 /**
- * @brief Get pull configuration from DT node properties
+ * @brief Get pull configuration from DT node properties.
+ *
+ * When no bias property is set on the group, returns BCM2711_PULL_KEEP
+ * so the pinctrl driver leaves whatever pull the firmware (or a prior
+ * pinctrl state) configured. This matters on BCM2710: writing to the
+ * 0xE4 PUP_PDN register is a no-op (reserved), so the firmware-set
+ * pulls are what's actually active -- including the mini-UART RX
+ * pull-up that the console depends on. Explicit bias-disable still
+ * maps to BCM2711_PULL_NONE so callers can ask for "no pull" deliberately.
  *
  * @param node_id Node identifier (the group node).
  */
 #define BCM2710_GET_PULL(node_id)                                                                  \
 	COND_CASE_1(DT_PROP(node_id, bias_disable), (BCM2711_PULL_NONE),                           \
 		    DT_PROP(node_id, bias_pull_up), (BCM2711_PULL_UP),                         \
-		    DT_PROP(node_id, bias_pull_down), (BCM2711_PULL_DOWN), (BCM2711_PULL_NONE))
+		    DT_PROP(node_id, bias_pull_down), (BCM2711_PULL_DOWN), (BCM2711_PULL_KEEP))
 
 /**
  * @brief Utility macro to initialize each pin.

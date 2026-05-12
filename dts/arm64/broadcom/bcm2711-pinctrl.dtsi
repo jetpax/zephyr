@@ -78,16 +78,25 @@
 	 * walks the first phandle in pinctrl-0, so we collect both pin
 	 * groups under one phandle here. Used on Pi 3 / Pi Zero 2 W
 	 * for the on-module CYW43439 wireless chip.
+	 *
+	 * Bias is per-group: CLK and GPCLK2 take no pull (they're
+	 * actively driven outputs); CMD and DAT0..3 want pull-up so
+	 * they idle high between transactions, as the SDIO spec and
+	 * the CYW43439 datasheet require. Linux's emmc_gpio34 group
+	 * does the same (BCM2835_PUD_OFF on CLK, _UP on the rest).
 	 */
 	emmc_gpio34: emmc-gpio34 {
-		group1 {
+		group_clk {
 			pinmux = <EMMC_CLK_GPIO34>,
-				 <EMMC_CMD_GPIO35>,
+				 <GPCLK2_GPIO43>;
+		};
+		group_data {
+			pinmux = <EMMC_CMD_GPIO35>,
 				 <EMMC_DAT0_GPIO36>,
 				 <EMMC_DAT1_GPIO37>,
 				 <EMMC_DAT2_GPIO38>,
-				 <EMMC_DAT3_GPIO39>,
-				 <GPCLK2_GPIO43>;
+				 <EMMC_DAT3_GPIO39>;
+			bias-pull-up;
 		};
 	};
 };
