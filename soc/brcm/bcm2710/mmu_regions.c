@@ -30,6 +30,18 @@ static const struct arm_mmu_region mmu_regions[] = {
 			      0x0F000000UL,
 			      0x1000UL,
 			      MT_DEVICE_nGnRE | MT_P_RW_U_NA | MT_DEFAULT_SECURE_STATE),
+
+	/* Arasan SDHCI registers at 0x3F300000.
+	 *
+	 * Explicitly mapped as Device-nGnRE so the identity-mapped page
+	 * table entry has the right attribute from boot, before the SDHC
+	 * driver's DEVICE_MMIO_MAP runs at POST_KERNEL. Pi-downstream Linux
+	 * maps BCM283x peripheral space the same way.
+	 */
+	MMU_REGION_FLAT_ENTRY("ARASAN_SDHCI",
+			      0x3F300000UL,
+			      0x1000UL,
+			      MT_DEVICE_nGnRE | MT_P_RW_U_NA | MT_DEFAULT_SECURE_STATE),
 };
 
 const struct arm_mmu_config mmu_config = {

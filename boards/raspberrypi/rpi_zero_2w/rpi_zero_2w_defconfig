@@ -4,6 +4,10 @@
 CONFIG_ARM64_VA_BITS_36=y
 CONFIG_ARM64_PA_BITS_36=y
 
+# 64KB MMU page granule matches the Pi-downstream Linux kernel build
+# for this SoC family.
+CONFIG_ARM64_PAGE_SIZE_64KB=y
+
 # MMU translation tables: 8 (the default) is right at the edge --
 # image + L1_INTC + ARMCTRL_IC + sub-2MB region splits already fill
 # most of them. Bump to 12 so SoC mmu_regions additions (e.g.

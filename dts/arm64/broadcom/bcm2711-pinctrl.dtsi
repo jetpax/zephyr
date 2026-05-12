@@ -89,6 +89,12 @@
 		group_clk {
 			pinmux = <EMMC_CLK_GPIO34>,
 				 <GPCLK2_GPIO43>;
+			/* Explicit bias-disable on the clock pins.
+			 * Pi-downstream Linux's bcm283x.dtsi puts these at
+			 * BCM2835_PUD_OFF and the CYW43xxx chip's SDIO clock
+			 * input prefers an actively-driven line with no pull.
+			 */
+			bias-disable;
 		};
 		group_data {
 			pinmux = <EMMC_CMD_GPIO35>,

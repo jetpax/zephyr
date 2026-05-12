@@ -61,8 +61,8 @@
 #include <zephyr/init.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/arch/arm64/arm_mem.h>
 #include <zephyr/sd/sd_spec.h>
-#include <zephyr/sys/printk.h>
 
 LOG_MODULE_REGISTER(sdhc_bcm2835, CONFIG_SDHC_LOG_LEVEL);
 
@@ -644,14 +644,8 @@ static int sdhc_bcm2835_set_clock(const struct device *dev, uint32_t target_hz)
 	div = sdhc_bcm2835_calc_clk_div(cfg->clock_freq, target_hz);
 	ctrl1 |= ((div >> 8) & 0x3) << SDHCI_CTRL1_CLK_FREQ_MS_SHIFT;
 	ctrl1 |= (div & 0xFF) << SDHCI_CTRL1_CLK_FREQ_LO_SHIFT;
-	/* DATA_TOUNIT = 0 matches Linux bcm2835-mmc.c, confirmed by the
-	 * 2026-05-11 trace_printk capture: Linux writes CTRL1=0x0000fa07
-	 * at the start of every iter (DATA_TOUNIT bits 19:16 = 0). At 0
-	 * the count interval is 2^13 SDCLK cycles = ~20 ms at 400 kHz,
-	 * which is fast enough for our wait_int (default 5 s) to never
-	 * race the hardware timeout. Previous value 0x6 was an overshoot
-	 * that left the controller's CMD_INHIBIT stuck longer than needed
-	 * after a no-response CMD.
+	/* DATA_TOUNIT = 0 -- 2^13 SDCLK cycles (~20 ms at 400 kHz). The
+	 * software wait_int timeout (~5 s) is the operative deadline.
 	 */
 	ctrl1 |= 0x0 << SDHCI_CTRL1_DATA_TOUT_SHIFT;
 	ctrl1 |= SDHCI_CTRL1_CLK_INTLEN;
@@ -814,90 +808,70 @@ static int sdhc_bcm2835_init(const struct device *dev)
 	const struct sdhc_bcm2835_config *cfg = dev->config;
 	int ret;
 
-	DEVICE_MMIO_MAP(dev, K_MEM_CACHE_NONE);
-
-	/* Route GPIO 34..39 to ALT3 (SD1_CLK / SD1_CMD / SD1_DAT0..3) and
-	 * GPIO 43 to ALT0 (GPCLK2). Without this the controller's internal
-	 * state machine still runs and CMD_COMPLETE asserts (it depends on
-	 * timing alone, not pad activity), but no signalling reaches the
-	 * external chip -- so any command expecting a response would
-	 * timeout. Apply before reset so the lines are in alt mode by the
-	 * time the controller starts driving them.
+	/* MMIO mapping uses Device-nGnRE (early-write-ack permitted).
+	 * Zephyr's default K_MEM_CACHE_NONE maps as Device-nGnRnE; the
+	 * BCM283x peripheral region is documented as Device-nGnRE.
 	 */
+	DEVICE_MMIO_MAP(dev, K_MEM_ARM_DEVICE_nGnRE);
+
 	ret = pinctrl_apply_state(cfg->pincfg, PINCTRL_STATE_DEFAULT);
 	if (ret != 0) {
 		LOG_ERR("%s pinctrl apply failed: %d", dev->name, ret);
 		return ret;
 	}
 
-	/* If a WL_REG_ON-style enable line is wired (CYW43439 reset on Pi
-	 * Zero 2 W), force a clean reset before powering the chip up.
+	/* Disconnect Arasan SDHCI from the SD card slot pads.
 	 *
-	 * The chip may have been left running by a previous OS boot
-	 * (e.g. Pi OS had Wi-Fi associated, then we boot Zephyr cold).
-	 * Just driving WL_REG_ON high doesn't clear that residual state;
-	 * the chip ignores SDIO commands until something forces an
-	 * internal POR. Toggling low->high is what MicroPython's
-	 * cyw43-driver and Linux's wifi_pwrseq do for the same reason.
-	 *
-	 * Sequence:
-	 *   1. Drive WL_REG_ON LOW (asserts the regulator-disable),
-	 *      wait 20 ms for the chip to fully power down.
-	 *   2. Drive HIGH (powers up), wait 150 ms for cold-boot POR.
-	 *      Cypress's datasheet calls for >= 50 ms; Linux's
-	 *      bcm2837-rpi-zero-2-w.dts uses 100 ms via
-	 *      mmc-pwrseq's post-power-on-delay-ms; 150 ms is the safer
-	 *      floor for cold boot.
+	 * On Pi 3 / Zero 2 W the Arasan controller's CMD/DAT/CLK signals
+	 * are routable to two pad sets: GPIO 34..39 (ALT3, WLAN module)
+	 * and GPIO 48..53 (ALT3, microSD card slot). Pi firmware boots
+	 * with the slot pins at ALT3 so it can read kernel images, but
+	 * the SoC's Arasan RX input mux is tied to the 48..53 pad set --
+	 * leaving both groups at ALT3 means the controller listens on
+	 * the empty SD slot (pulled high) and never sees responses from
+	 * the WLAN chip. Mux 48..53 to ALT0 (the legacy SDHost path,
+	 * which Zephyr doesn't drive on this SoC) before issuing any
+	 * command. 3 bits per pin in GPFSEL4/5, ALT0 = 0b100 = 4.
 	 */
-	if (cfg->wifi_reg_on.port != NULL) {
-		if (!gpio_is_ready_dt(&cfg->wifi_reg_on)) {
-			LOG_ERR("%s wifi_reg_on GPIO not ready", dev->name);
-			return -ENODEV;
+	{
+		volatile uint32_t *gpfsel4 = (volatile uint32_t *)0x3F200010;
+		volatile uint32_t *gpfsel5 = (volatile uint32_t *)0x3F200014;
+		uint32_t f4 = *gpfsel4;
+		uint32_t f5 = *gpfsel5;
+		uint32_t mask5 = 0, set5 = 0;
+
+		f4 = (f4 & ~((7u << 24) | (7u << 27))) |
+		     ((4u << 24) | (4u << 27));
+		for (int n = 50; n <= 53; n++) {
+			int s = (n - 50) * 3;
+			mask5 |= 7u << s;
+			set5 |= 4u << s;
 		}
-		ret = gpio_pin_configure_dt(&cfg->wifi_reg_on,
-					    GPIO_OUTPUT_INACTIVE);
-		if (ret != 0) {
-			LOG_ERR("%s wifi_reg_on configure failed: %d",
-				dev->name, ret);
-			return ret;
-		}
-		k_msleep(20);
-		ret = gpio_pin_set_dt(&cfg->wifi_reg_on, 1);
-		if (ret != 0) {
-			LOG_ERR("%s wifi_reg_on set failed: %d",
-				dev->name, ret);
-			return ret;
-		}
-		k_msleep(150);
+		f5 = (f5 & ~mask5) | set5;
+
+		*gpfsel4 = f4;
+		*gpfsel5 = f5;
 	}
 
-	uintptr_t base = DEVICE_MMIO_GET(dev);
-	uint32_t slot_isr_ver = sys_read32(base + SDHCI_SLOT_INT_STATUS_VERSION);
-	uint16_t version = (uint16_t)(slot_isr_ver >> 16);
+	/* WL_REG_ON is driven HIGH by the Pi firmware before kernel handoff.
+	 * The wireless chip is past its bootrom settle window by the time
+	 * POST_KERNEL runs; toggling LOW->HIGH from here disturbs the
+	 * chip's PMU and is not required.
+	 */
 
 	ret = sdhc_bcm2835_soft_reset(dev, SDHCI_CTRL1_RESET_ALL);
 	if (ret != 0) {
-		printk("sdhc_bcm2835: %s reset timeout\n", dev->name);
 		LOG_ERR("%s reset timeout", dev->name);
 		return ret;
 	}
 
-	/* INT_ENABLE / SIGNAL_ENABLE = 0x00FF0003, matching Linux's
-	 * bcm2835_mmc_init exactly (confirmed by 2026-05-11 trace_printk
-	 * on Pi-downstream 6.12.87: WR 034=00ff0003, WR 038=00ff0003).
-	 *
-	 * Bits enabled: CMD_COMPLETE (0), DATA_END (1), and all CMD/DATA
-	 * error bits (16..23). Card insert/remove and the wider SDIO/
-	 * tuning bits stay masked because they're irrelevant for an
-	 * always-on wireless chip and enabling them empirically risks
-	 * non-spec behaviour on this silicon.
-	 *
-	 * Pi Zero 2 W silicon does not latch INT_STATUS bits unless the
-	 * matching SIGNAL_ENABLE bit is set, so both registers MUST get
-	 * the same value even though we drive the request path by
-	 * polling (no IRQ_CONNECT). The SoC intc / IRQ delivery layer is
-	 * a separate matter.
+	/* INT_ENABLE / SIGNAL_ENABLE = 0x00FF0003: CMD_COMPLETE,
+	 * DATA_END, and all CMD/DATA error bits. Both registers carry
+	 * the same value because this controller doesn't latch
+	 * INT_STATUS bits unless the matching SIGNAL_ENABLE bit is set,
+	 * even when the request path is polled.
 	 */
+	uintptr_t base = DEVICE_MMIO_GET(dev);
 	uint32_t int_en = SDHCI_INT_CMD_COMPLETE | SDHCI_INT_DATA_END |
 			  SDHCI_INT_CMD_TIMEOUT | SDHCI_INT_CMD_CRC |
 			  SDHCI_INT_CMD_END_BIT | SDHCI_INT_CMD_INDEX |
@@ -907,12 +881,6 @@ static int sdhc_bcm2835_init(const struct device *dev)
 	sys_write32(int_en, base + SDHCI_INT_ENABLE);
 	sys_write32(int_en, base + SDHCI_SIGNAL_ENABLE);
 
-	/* Scaffold self-test: exercise set_io with the canonical SD card
-	 * identification config (400 kHz, 1-bit, 3.3V, power on). Validates
-	 * the divider math + clock-stable handshake without needing
-	 * subsys/sd to drive us. Drop along with the rest of the bring-up
-	 * scaffolding when real traffic exercises set_io for free.
-	 */
 	struct sdhc_io ios = {
 		.clock = SDMMC_CLOCK_400KHZ,
 		.bus_width = SDHC_BUS_WIDTH1BIT,
@@ -921,122 +889,9 @@ static int sdhc_bcm2835_init(const struct device *dev)
 	};
 	ret = sdhc_bcm2835_set_io(dev, &ios);
 	if (ret != 0) {
-		printk("sdhc_bcm2835: %s set_io self-test failed: %d\n",
-		       dev->name, ret);
-		LOG_ERR("%s set_io self-test failed: %d", dev->name, ret);
+		LOG_ERR("%s set_io failed: %d", dev->name, ret);
 		return ret;
 	}
-
-	uint32_t ctrl0 = sys_read32(base + SDHCI_HOST_CONTROL);
-	uint32_t ctrl1 = sys_read32(base + SDHCI_CLOCK_CONTROL);
-
-	/* Diagnostic: peek at GPIO controller state to confirm pinctrl
-	 * actually applied and WL_REG_ON went high. The pinctrl driver
-	 * has already mapped 0x3f200000+0x100 via device_map, so reads
-	 * from absolute addresses in that range work.
-	 *
-	 *   GPFSEL3 (0x0C): alt-fn for pins 30..39, 3 bits/pin. Pins
-	 *                    34..39 in ALT3 = 0b111 each, so bits
-	 *                    [29:12] = 0x3FFFF.
-	 *   GPFSEL4 (0x10): alt-fn for pins 40..49. Pin 41 = OUTPUT = 1
-	 *                    in bits [5:3]; pin 43 = ALT0 = 4 in [11:9].
-	 *   GPLEV1  (0x38): level read for pins 32..53. Pin 41 -> bit 9.
-	 */
-	uint32_t gpfsel3 = sys_read32(0x3f200000 + 0x0C);
-	uint32_t gpfsel4 = sys_read32(0x3f200000 + 0x10);
-	uint32_t gplev1  = sys_read32(0x3f200000 + 0x38);
-
-	/* CLK-toggle diagnostic. Pin 34 (SD1_CLK) is at GPLEV1 bit 2.
-	 * If the SDHCI controller is actually outputting a clock, we'll
-	 * see this bit oscillate across rapid reads. If it's stuck, the
-	 * SD clock isn't leaving the SoC -- almost certainly because the
-	 * BCM clock manager hasn't enabled clk_emmc as an input to the
-	 * SDHCI's internal divider. (Register reads still work because
-	 * the AHB/CSR interface runs on a different clock domain than
-	 * SDCLK output.)
-	 */
-	uint32_t clk_high = 0, clk_low = 0;
-	for (int i = 0; i < 256; i++) {
-		if (sys_read32(0x3f200000 + 0x38) & BIT(2)) {
-			clk_high++;
-		} else {
-			clk_low++;
-		}
-	}
-
-	/* Bring-up self-test: replicate the EXACT Linux iter2 SDIO
-	 * enumeration sequence captured via trace_printk on Pi-downstream
-	 * 6.12.87. Linux's iter1 (CMD52 sdio_reset twice) always fails
-	 * with CMD_TIMEOUT; mmc_rescan then waits 1.4 s and iter2 issues
-	 * CMD0 + CMD8 + CMD5 in that order, which succeeds on the live
-	 * Pi. We replicate iter2 directly because the chip's bootrom is
-	 * past its settle window by the time POST_KERNEL inits run.
-	 *
-	 * KNOWN-ISSUE 2026-05-11: CMD5 still times out in this driver
-	 * even though every register write matches Linux byte-for-byte.
-	 * The chip drives a response (verified by PSTATE.CMD_LINE_LEVEL
-	 * + GPLEV1 dual-capture in prior session) but the controller's
-	 * RX state machine doesn't latch it. Linux's /dev/mem userspace
-	 * also fails identically -- something in the kernel-driver
-	 * context (real ISR registered via request_irq, spinlock-held
-	 * MMIO, tasklet-deferred reset) is the un-pinned-down
-	 * differentiator. Documented in board HANDOVER.md.
-	 */
-	struct sdhc_command cmd0 = {
-		.opcode = SD_GO_IDLE_STATE,
-		.arg = 0,
-		.response_type = SD_RSP_TYPE_NONE,
-	};
-	int ret_cmd0 = sdhc_bcm2835_request(dev, &cmd0, NULL);
-
-	struct sdhc_command cmd8 = {
-		.opcode = SD_SEND_IF_COND,
-		.arg = 0x000001AA,
-		.response_type = SD_RSP_TYPE_R7,
-	};
-	int ret_cmd8 = sdhc_bcm2835_request(dev, &cmd8, NULL);
-
-	struct sdhc_command cmd5_inq = {
-		.opcode = SDIO_SEND_OP_COND,
-		.arg = 0,
-		.response_type = SD_RSP_TYPE_R4,
-	};
-	int ret_cmd5_inq = sdhc_bcm2835_request(dev, &cmd5_inq, NULL);
-
-	struct sdhc_command cmd5_ocr = {
-		.opcode = SDIO_SEND_OP_COND,
-		.arg = 0x00300000,	/* 3.0-3.3V window per Linux trace */
-		.response_type = SD_RSP_TYPE_R4,
-	};
-	int ret_cmd5_ocr = sdhc_bcm2835_request(dev, &cmd5_ocr, NULL);
-
-	/* Post-CMD5 register snapshot. */
-	uint32_t pstate_after  = sys_read32(base + SDHCI_PRESENT_STATE);
-	uint32_t int_after     = sys_read32(base + SDHCI_INT_STATUS);
-	uint32_t int_en_after  = sys_read32(base + SDHCI_INT_ENABLE);
-
-	printk("sdhc_bcm2835: %s ver 0x%04x clk %u\n"
-	       "  CONTROL0=0x%08x CONTROL1=0x%08x\n"
-	       "  GPFSEL3=0x%08x GPFSEL4=0x%08x GPLEV1=0x%08x\n"
-	       "  pin34 CLK toggle: %u high / %u low (in 256 reads)\n"
-	       "  CMD0      ret=%d\n"
-	       "  CMD8      ret=%d resp=0x%08x (expect -116, SDIO ignores CMD8)\n"
-	       "  CMD5_inq  ret=%d resp=0x%08x (expect 0x20FFFF00 on success)\n"
-	       "  CMD5_OCR  ret=%d resp=0x%08x (expect 0xA0FFFF00 on success)\n"
-	       "  post PRESENT_STATE=0x%08x INT_STATUS=0x%08x INT_ENABLE=0x%08x\n",
-	       dev->name, version, cfg->clock_freq, ctrl0, ctrl1,
-	       gpfsel3, gpfsel4, gplev1, clk_high, clk_low,
-	       ret_cmd0,
-	       ret_cmd8, cmd8.response[0],
-	       ret_cmd5_inq, cmd5_inq.response[0],
-	       ret_cmd5_ocr, cmd5_ocr.response[0],
-	       pstate_after, int_after, int_en_after);
-
-	LOG_INF("%s ver 0x%04x clk %u CONTROL0=0x%08x CONTROL1=0x%08x "
-		"CMD0=%d CMD8=%d CMD5_inq=%d resp=0x%08x CMD5_OCR=%d resp=0x%08x",
-		dev->name, version, cfg->clock_freq, ctrl0, ctrl1,
-		ret_cmd0, ret_cmd8, ret_cmd5_inq, cmd5_inq.response[0],
-		ret_cmd5_ocr, cmd5_ocr.response[0]);
 
 	return 0;
 }
