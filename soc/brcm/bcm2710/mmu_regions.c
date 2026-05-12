@@ -17,6 +17,19 @@ static const struct arm_mmu_region mmu_regions[] = {
 			      DT_REG_ADDR(DT_INST(0, brcm_bcm2835_armctrl_ic)),
 			      DT_REG_SIZE(DT_INST(0, brcm_bcm2835_armctrl_ic)),
 			      MT_DEVICE_nGnRnE | MT_P_RW_U_NA | MT_DEFAULT_SECURE_STATE),
+
+	/* Mailbox scratch buffer at a fixed physical address well above
+	 * MP heap (heap is 64 MiB starting ~0x300000; this is at 240 MiB).
+	 * Mapped Device-nGnRE so ARM writes go straight to DRAM without
+	 * L1 caching -- avoids the otherwise-needed explicit cache flush
+	 * before the VPU reads the buffer via the bus alias 0xC0000000+x.
+	 * Used by MP REPL property-channel mailbox calls for SDHCI
+	 * power-state probing.
+	 */
+	MMU_REGION_FLAT_ENTRY("MBOX_SCRATCH",
+			      0x0F000000UL,
+			      0x1000UL,
+			      MT_DEVICE_nGnRE | MT_P_RW_U_NA | MT_DEFAULT_SECURE_STATE),
 };
 
 const struct arm_mmu_config mmu_config = {

@@ -4,6 +4,13 @@
 CONFIG_ARM64_VA_BITS_36=y
 CONFIG_ARM64_PA_BITS_36=y
 
+# MMU translation tables: 8 (the default) is right at the edge --
+# image + L1_INTC + ARMCTRL_IC + sub-2MB region splits already fill
+# most of them. Bump to 12 so SoC mmu_regions additions (e.g.
+# MBOX_SCRATCH at 0x0F000000) can allocate the L3 tables they need
+# without silent new_table() failure at MMU init.
+CONFIG_MAX_XLAT_TABLES=12
+
 # Zephyr Kernel Configuration
 CONFIG_XIP=n
 CONFIG_FLASH_SIZE=0

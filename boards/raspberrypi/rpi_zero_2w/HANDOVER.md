@@ -343,6 +343,22 @@ re-test them):
   Sampled pin 34 SDCLK during the response window: it runs
   continuously (62/38 hi/lo ratio is sampling artifact, not
   gating).
+- **"AxPROT or transaction-attribute filtering at the SDHCI
+  slave port."** Theory: userspace/MP REPL accesses are dropped
+  because they don't carry the privileged-mode AxPROT bit.
+  Tested by writing to FORCE_EVENT_ERROR_INTERRUPT_STATUS (offset
+  0x52) from MP REPL: bits 16 and 17 of INT_STATUS forced
+  successfully. Userspace writes ARE processed as commands.
+- **"VPU has the SDHCI peripheral in a partial-power state."**
+  Tested via property-channel mailbox GET_POWER_STATE for device
+  0 (SD Card): rcode=0x80000000, state.bit0=1 (on),
+  state.bit1=0 (device exists). SET_POWER_STATE(on) is a no-op.
+  Required a `MBOX_SCRATCH` MMU region at 0x0F000000 + CONFIG_MAX_
+  XLAT_TABLES bump from 8 to 12 to land the mailbox buffer in
+  uncached DRAM addressable from MP REPL.
+- **"VPU has clk_emmc clock-gated or set to wrong rate."** Same
+  mailbox path, GET_CLOCK_STATE for clk_emmc (id=1):
+  state=0x00000001 (on), rate=200000000 Hz. SET_CLOCK_STATE no-op.
 
 ### Production driver state (as of 2026-05-11 bake-in commit)
 
