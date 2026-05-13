@@ -6,6 +6,7 @@ zephyr_library_sources_ifdef(CONFIG_WIFI_BRCMFMAC
   brcmfmac_chip.c
   brcmfmac_sdio.c
   brcmfmac_bcdc.c
+  brcmfmac_net.c
   firmware/brcmfmac_fw.c
   firmware/brcmfmac_nvram.c
 )

@@ -12,6 +12,7 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/kernel.h>
+#include <zephyr/net/wifi_mgmt.h>
 #include <zephyr/sd/sd.h>
 #include <zephyr/sd/sdio.h>
 
@@ -97,8 +98,14 @@
 #define BRCMFMAC_F2_FIFO_ADDR           0x8000     /* SB_ACCESS_2_4B_FLAG bit */
 #define BRCMFMAC_F2_BLOCK_SIZE          512
 
+/* Selected WLC command IDs (Linux brcmfmac/fwil.h). */
+#define BRCMFMAC_WLC_UP                 2
+#define BRCMFMAC_WLC_DOWN               3
 #define BRCMFMAC_WLC_GET_VAR            262
 #define BRCMFMAC_WLC_SET_VAR            263
+
+/* Event-mask length (Linux BRCMF_EVENTING_MASK_LEN = roundup(160,8)/8). */
+#define BRCMFMAC_EVENTING_MASK_LEN      20
 
 #define BCDC_FLAG_ERROR                 0x01
 #define BCDC_FLAG_SET                   0x02
@@ -131,6 +138,138 @@ struct cdc_hdr {
 	uint32_t status;
 } __packed;
 
+/* BDC (Broadcom Data Codec) header sits between SDPCM and the L2 frame
+ * on chan=1 (event) + chan=2 (data). Distinct from the 16-B CDC IOCTL
+ * header used on chan=0.
+ */
+#define BDC_HEADER_LEN          4
+#define BDC_PROTO_VER           2
+#define BDC_PROTO_VER_SHIFT     4
+
+struct bdc_hdr {
+	uint8_t flags;          /* [7:4]=ver, [3]=SUM_NEEDED, [2]=SUM_GOOD */
+	uint8_t priority;
+	uint8_t flags2;         /* [3:0]=if_idx */
+	uint8_t data_offset;    /* additional bytes between BDC end and L2 frame, in 4-B units */
+} __packed;
+
+/* === Broadcom event frame (ethertype 0x886C over chan=1) ================== */
+#define BRCM_ETHERTYPE_EVENT    0x886C
+
+struct brcm_ethhdr {
+	uint16_t subtype;      /* BE */
+	uint16_t length;       /* BE */
+	uint8_t  version;
+	uint8_t  oui[3];
+	uint16_t usr_subtype;  /* BE */
+} __packed;
+
+struct brcmf_event_msg_be {
+	uint16_t version;
+	uint16_t flags;
+	uint32_t event_type;
+	uint32_t status;
+	uint32_t reason;
+	uint32_t auth_type;
+	uint32_t datalen;
+	uint8_t  addr[6];
+	char     ifname[16];
+	uint8_t  ifidx;
+	uint8_t  bsscfgidx;
+} __packed;
+
+/* WLC event type codes we care about (Linux fweh.h). */
+#define WLC_E_SET_SSID           0
+#define WLC_E_AUTH               3
+#define WLC_E_ASSOC              7
+#define WLC_E_DISASSOC_IND      12
+#define WLC_E_LINK              16
+#define WLC_E_ESCAN_RESULT      69
+
+/* Event status codes. */
+#define BRCMF_E_STATUS_SUCCESS   0
+#define BRCMF_E_STATUS_FAIL      1
+#define BRCMF_E_STATUS_TIMEOUT   2
+#define BRCMF_E_STATUS_NO_NETWORKS 3
+#define BRCMF_E_STATUS_PARTIAL   8
+
+/* === Escan IOVAR =========================================================
+ *
+ * iovar name "escan", value = struct brcmf_escan_params_le. Action=1 starts
+ * an escan; results stream back as chan=1 events of type WLC_E_ESCAN_RESULT
+ * (each event carries one or more bss_info_le records via brcmf_escan_result_le).
+ */
+#define BRCMF_SCAN_PARAMS_VERSION   1
+#define WL_ESCAN_ACTION_START       1
+#define BRCMF_SSID_MAX_LEN          32
+#define BRCMF_MCSSET_LEN            16
+
+struct brcmf_ssid_le {
+	uint32_t SSID_len;
+	uint8_t  SSID[BRCMF_SSID_MAX_LEN];
+} __packed;
+
+struct brcmf_scan_params_le {
+	struct brcmf_ssid_le ssid_le;
+	uint8_t  bssid[6];
+	int8_t   bss_type;
+	uint8_t  scan_type;
+	uint32_t nprobes;
+	uint32_t active_time;
+	uint32_t passive_time;
+	uint32_t home_time;
+	uint32_t channel_num;
+	uint16_t channel_list[1];   /* zero-length variable array placeholder */
+} __packed;
+
+struct brcmf_escan_params_le {
+	uint32_t version;
+	uint16_t action;
+	uint16_t sync_id;
+	struct brcmf_scan_params_le params_le;
+} __packed;
+
+/* Linux declares brcmf_bss_info_le WITHOUT __packed -- natural alignment
+ * inserts a pad byte before rateset.count, before RSSI, and before
+ * nbss_cap. Mirror that exactly or chanspec/RSSI read the wrong bytes.
+ */
+struct brcmf_bss_info_le {
+	uint32_t version;
+	uint32_t length;
+	uint8_t  BSSID[6];
+	uint16_t beacon_period;
+	uint16_t capability;
+	uint8_t  SSID_len;
+	uint8_t  SSID[32];
+	struct {
+		uint32_t count;
+		uint8_t  rates[16];
+	} rateset;
+	uint16_t chanspec;
+	uint16_t atim_window;
+	uint8_t  dtim_period;
+	uint16_t RSSI;
+	int8_t   phy_noise;
+	uint8_t  n_cap;
+	uint32_t nbss_cap;
+	uint8_t  ctl_ch;
+	uint32_t reserved32;
+	uint8_t  flags;
+	uint8_t  reserved[3];
+	uint8_t  basic_mcs[BRCMF_MCSSET_LEN];
+	uint16_t ie_offset;
+	uint32_t ie_length;
+	uint16_t SNR;
+};
+
+struct brcmf_escan_result_le {
+	uint32_t buflen;
+	uint32_t version;
+	uint16_t sync_id;
+	uint16_t bss_count;
+	struct brcmf_bss_info_le bss_info_le;
+};
+
 struct bcm_core {
 	uint16_t id;
 	uint32_t base;
@@ -144,13 +283,7 @@ struct brcmfmac_config {
 };
 
 struct brcmfmac_data;
-
-/* Event-frame callback (chan=1). Phase 4.4 hands the raw frame body
- * (BDC-stripped) to the handler; structured event parsing arrives
- * with wifi_mgmt in Phase 4.5.
- */
-typedef void (*brcmfmac_event_cb_t)(struct brcmfmac_data *data,
-				    const uint8_t *frame, uint16_t len);
+struct net_pkt;
 
 /* Pending IOCTL waiter: filled by query_dcmd, completed by RX thread. */
 struct brcmfmac_pending_ioctl {
@@ -184,7 +317,10 @@ struct brcmfmac_data {
 	uint16_t bcdc_reqid;
 	struct k_mutex bcdc_mutex;
 	struct brcmfmac_pending_ioctl pending;
-	brcmfmac_event_cb_t event_cb;
+
+	/* Net + scan state. */
+	struct net_if *iface;
+	scan_result_cb_t scan_cb;
 
 	/* MAC from chip OTP, read via cur_etheraddr IOCTL. */
 	uint8_t chip_mac[6];
@@ -236,11 +372,34 @@ int brcmfmac_bcdc_query_dcmd(struct brcmfmac_data *data, uint32_t cmd,
 int brcmfmac_bcdc_iovar_get(struct brcmfmac_data *data, const char *name,
 			    uint8_t *buf, uint16_t len);
 
-/* Register a callback for chan=1 event frames. NULL = no callback (frames
- * are still drained from F2, just not dispatched).
+/* SET dcmd variant: send a command with no response payload (chip echoes
+ * status back). For WLC_SET_VAR + others.
  */
-void brcmfmac_bcdc_set_event_cb(struct brcmfmac_data *data,
-				brcmfmac_event_cb_t cb);
+int brcmfmac_bcdc_set_dcmd(struct brcmfmac_data *data, uint32_t cmd,
+			   const uint8_t *tx_payload, uint16_t tx_len);
+
+/* IOVAR helper: WLC_SET_VAR with `name` as the var key + value as data. */
+int brcmfmac_bcdc_iovar_set(struct brcmfmac_data *data, const char *name,
+			    const uint8_t *value, uint16_t value_len);
+
+/* Build SDPCM headers in-place at start of `frame`, then F2 TX the
+ * (4-byte-padded) frame. Caller must hold bcdc_mutex. Used by both
+ * the IOCTL path (chan=0) and the data path (chan=2).
+ */
+int brcmfmac_bcdc_tx_frame(struct brcmfmac_data *data, uint8_t chan,
+			   uint8_t *frame, uint16_t total);
+
+/* === net_if + wifi_mgmt glue (brcmfmac_net.c) === */
+void brcmfmac_iface_init(struct net_if *iface);
+int  brcmfmac_iface_send(const struct device *dev, struct net_pkt *pkt);
+int  brcmfmac_mgmt_scan(const struct device *dev, struct net_if *iface,
+			struct wifi_scan_params *params, scan_result_cb_t cb);
+
+/* RX-thread dispatchers (called from bcdc.c's RX thread). */
+void brcmfmac_net_rx_data(struct brcmfmac_data *data,
+			  const uint8_t *frame, uint16_t len);
+void brcmfmac_net_rx_event(struct brcmfmac_data *data,
+			   const uint8_t *frame, uint16_t len);
 
 /* === Embedded firmware blobs (firmware/) === */
 extern const unsigned char brcmfmac_fw[];

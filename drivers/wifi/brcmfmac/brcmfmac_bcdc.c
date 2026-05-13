@@ -73,22 +73,19 @@ static void brcmfmac_handle_ctrl(struct brcmfmac_data *data,
 	k_sem_give(&data->pending.done);
 }
 
-static void brcmfmac_handle_event(struct brcmfmac_data *data,
-				  struct sdpcm_sw_hdr *sw,
-				  uint16_t total_len)
+/* Strip SDPCM headers, hand the body (BDC + L2 frame, or BDC + event frame)
+ * to the net layer. Both chan=1 (event) and chan=2 (data) use this shape.
+ */
+static const uint8_t *brcmfmac_rx_body(struct sdpcm_sw_hdr *sw,
+				       uint16_t total_len, uint16_t *body_len_out)
 {
 	uint16_t hdr_len = sw->hdrlen;
 	if (hdr_len > total_len) {
-		LOG_WRN("rx event: hdrlen=%u > total=%u", hdr_len, total_len);
-		return;
+		LOG_WRN("rx: hdrlen=%u > total=%u", hdr_len, total_len);
+		return NULL;
 	}
-	uint16_t body_len = (uint16_t)(total_len - hdr_len);
-	const uint8_t *body = (const uint8_t *)sw + (hdr_len - sizeof(struct sdpcm_frame_hdr));
-
-	LOG_DBG("rx event: body_len=%u", body_len);
-	if (data->event_cb) {
-		data->event_cb(data, body, body_len);
-	}
+	*body_len_out = (uint16_t)(total_len - hdr_len);
+	return (const uint8_t *)sw + (hdr_len - sizeof(struct sdpcm_frame_hdr));
 }
 
 static void brcmfmac_rx_thread_fn(void *p1, void *p2, void *p3)
@@ -120,7 +117,10 @@ static void brcmfmac_rx_thread_fn(void *p1, void *p2, void *p3)
 			continue;
 		}
 		if (fh->len < sizeof(*fh) + sizeof(*sw)) {
-			LOG_WRN("rx thread: short frame (len=%u)", fh->len);
+			/* Header-only frame -- chip flow control / credit
+			 * signaling. Linux's brcmfmac handles these silently.
+			 */
+			LOG_DBG("rx thread: short frame (len=%u)", fh->len);
 			k_msleep(BRCMFMAC_RX_IDLE_SLEEP_MS);
 			continue;
 		}
@@ -142,12 +142,22 @@ static void brcmfmac_rx_thread_fn(void *p1, void *p2, void *p3)
 			brcmfmac_handle_ctrl(data, rcdc, outlen);
 			break;
 		}
-		case SDPCM_CHAN_EVENT:
-			brcmfmac_handle_event(data, sw, fh->len);
+		case SDPCM_CHAN_EVENT: {
+			uint16_t body_len;
+			const uint8_t *body = brcmfmac_rx_body(sw, fh->len, &body_len);
+			if (body != NULL) {
+				brcmfmac_net_rx_event(data, body, body_len);
+			}
 			break;
-		case SDPCM_CHAN_DATA:
-			LOG_DBG("rx data: len=%u (net_if TODO)", fh->len);
+		}
+		case SDPCM_CHAN_DATA: {
+			uint16_t body_len;
+			const uint8_t *body = brcmfmac_rx_body(sw, fh->len, &body_len);
+			if (body != NULL) {
+				brcmfmac_net_rx_data(data, body, body_len);
+			}
 			break;
+		}
 		default:
 			LOG_DBG("rx: unknown chan=%u len=%u", sw->chan, fh->len);
 			break;
@@ -230,17 +240,12 @@ int brcmfmac_bcdc_init(struct brcmfmac_data *data)
 	return 0;
 }
 
-void brcmfmac_bcdc_set_event_cb(struct brcmfmac_data *data,
-				brcmfmac_event_cb_t cb)
-{
-	data->event_cb = cb;
-}
-
 /* Build SDPCM headers in-place at the start of `frame` and TX `total`
- * bytes (padded to 4) via incrementing CMD53 on F2.
+ * bytes (padded to 4) via incrementing CMD53 on F2. Caller must hold
+ * bcdc_mutex (serializes both txseq counter and F2 access).
  */
-static int brcmfmac_bcdc_tx(struct brcmfmac_data *data, uint8_t chan,
-			    uint8_t *frame, uint16_t total)
+int brcmfmac_bcdc_tx_frame(struct brcmfmac_data *data, uint8_t chan,
+			   uint8_t *frame, uint16_t total)
 {
 	struct sdpcm_frame_hdr *fh = (void *)frame;
 	struct sdpcm_sw_hdr *sw = (void *)(frame + sizeof(*fh));
@@ -290,8 +295,15 @@ int brcmfmac_bcdc_query_dcmd(struct brcmfmac_data *data, uint32_t cmd,
 	struct cdc_hdr *cdc = (void *)(tx_buf + sizeof(struct sdpcm_frame_hdr)
 					      + sizeof(struct sdpcm_sw_hdr));
 
+	/* cdc.len is one u32 -- the shared buffer size for both request
+	 * parsing (chip reads name etc.) and response output (chip writes
+	 * up to len bytes back). For a GET we need len >= rx_capacity or
+	 * the chip returns BUFTOOSHORT (-14).
+	 */
+	uint16_t cdc_len = (tx_len > rx_capacity) ? tx_len : rx_capacity;
+
 	cdc->cmd    = cmd;
-	cdc->outlen = tx_len;
+	cdc->outlen = cdc_len;
 	cdc->inlen  = 0;
 	data->bcdc_reqid++;
 	cdc->flags  = ((uint32_t)data->bcdc_reqid << BCDC_REQ_ID_SHIFT);
@@ -301,7 +313,21 @@ int brcmfmac_bcdc_query_dcmd(struct brcmfmac_data *data, uint32_t cmd,
 		memcpy((uint8_t *)cdc + sizeof(*cdc), tx_payload, tx_len);
 	}
 
-	uint16_t total = (uint16_t)(hdr_len + tx_len);
+	/* Pad the on-wire frame to cdc_len so the chip sees room for its
+	 * full response; any bytes past tx_len are already zeroed by the
+	 * memset above (well, just the header was; pad explicitly).
+	 */
+	uint16_t payload_len = cdc_len;
+	uint16_t total = (uint16_t)(hdr_len + payload_len);
+
+	if (hdr_len + payload_len > sizeof(tx_buf)) {
+		rc = -EMSGSIZE;
+		goto out;
+	}
+	if (payload_len > tx_len) {
+		memset((uint8_t *)cdc + sizeof(*cdc) + tx_len, 0,
+		       payload_len - tx_len);
+	}
 
 	/* Publish the waiter context BEFORE TX -- the RX thread may race
 	 * us to the response (chip can be fast).
@@ -314,7 +340,7 @@ int brcmfmac_bcdc_query_dcmd(struct brcmfmac_data *data, uint32_t cmd,
 	k_sem_reset(&data->pending.done);
 	data->pending.active = true;
 
-	rc = brcmfmac_bcdc_tx(data, SDPCM_CHAN_CTRL, tx_buf, total);
+	rc = brcmfmac_bcdc_tx_frame(data, SDPCM_CHAN_CTRL, tx_buf, total);
 	if (rc != 0) {
 		LOG_ERR("bcdc_query: TX failed: %d", rc);
 		data->pending.active = false;
@@ -359,4 +385,103 @@ int brcmfmac_bcdc_iovar_get(struct brcmfmac_data *data, const char *name,
 	return brcmfmac_bcdc_query_dcmd(data, BRCMFMAC_WLC_GET_VAR,
 					scratch, (uint16_t)name_len,
 					buf, len);
+}
+
+/* SET dcmd: same TX path as query_dcmd, BCDC_FLAG_SET in flags, no
+ * response payload (chip echoes status). We still wait for the chip's
+ * matching reqid ack so the call is synchronous.
+ */
+int brcmfmac_bcdc_set_dcmd(struct brcmfmac_data *data, uint32_t cmd,
+			   const uint8_t *tx_payload, uint16_t tx_len)
+{
+	if (!data->f2_ready) {
+		return -EAGAIN;
+	}
+
+	int rc = k_mutex_lock(&data->bcdc_mutex, K_FOREVER);
+	if (rc != 0) {
+		return rc;
+	}
+
+	static uint8_t tx_buf[1024] __aligned(4);
+
+	const size_t hdr_len = sizeof(struct sdpcm_frame_hdr)
+			     + sizeof(struct sdpcm_sw_hdr)
+			     + sizeof(struct cdc_hdr);
+
+	if (hdr_len + tx_len > sizeof(tx_buf)) {
+		rc = -EMSGSIZE;
+		goto out;
+	}
+
+	memset(tx_buf, 0, hdr_len);
+
+	struct cdc_hdr *cdc = (void *)(tx_buf + sizeof(struct sdpcm_frame_hdr)
+					      + sizeof(struct sdpcm_sw_hdr));
+
+	cdc->cmd    = cmd;
+	cdc->outlen = tx_len;
+	cdc->inlen  = 0;
+	data->bcdc_reqid++;
+	cdc->flags  = ((uint32_t)data->bcdc_reqid << BCDC_REQ_ID_SHIFT)
+		    | BCDC_FLAG_SET;
+	cdc->status = 0;
+
+	if (tx_payload != NULL && tx_len > 0) {
+		memcpy((uint8_t *)cdc + sizeof(*cdc), tx_payload, tx_len);
+	}
+
+	uint16_t total = (uint16_t)(hdr_len + tx_len);
+
+	data->pending.reqid = data->bcdc_reqid;
+	data->pending.out_buf = NULL;
+	data->pending.out_capacity = 0;
+	data->pending.out_copied = 0;
+	data->pending.status = 0;
+	k_sem_reset(&data->pending.done);
+	data->pending.active = true;
+
+	rc = brcmfmac_bcdc_tx_frame(data, SDPCM_CHAN_CTRL, tx_buf, total);
+	if (rc != 0) {
+		LOG_ERR("bcdc_set: TX failed: %d", rc);
+		data->pending.active = false;
+		goto out;
+	}
+
+	rc = k_sem_take(&data->pending.done, K_MSEC(BRCMFMAC_BCDC_TIMEOUT_MS));
+	data->pending.active = false;
+
+	if (rc == -EAGAIN) {
+		LOG_ERR("bcdc_set: timeout on reqid=%u cmd=%u",
+			data->pending.reqid, cmd);
+		rc = -ETIMEDOUT;
+		goto out;
+	}
+	if (rc == 0) {
+		rc = data->pending.status;
+	}
+
+out:
+	k_mutex_unlock(&data->bcdc_mutex);
+	return rc;
+}
+
+int brcmfmac_bcdc_iovar_set(struct brcmfmac_data *data, const char *name,
+			    const uint8_t *value, uint16_t value_len)
+{
+	size_t name_len = strlen(name) + 1;
+	static uint8_t scratch[1024] __aligned(4);
+
+	if (name_len + value_len > sizeof(scratch)) {
+		return -EMSGSIZE;
+	}
+
+	memset(scratch, 0, name_len);
+	memcpy(scratch, name, name_len);
+	if (value != NULL && value_len > 0) {
+		memcpy(scratch + name_len, value, value_len);
+	}
+
+	return brcmfmac_bcdc_set_dcmd(data, BRCMFMAC_WLC_SET_VAR,
+				      scratch, (uint16_t)(name_len + value_len));
 }
