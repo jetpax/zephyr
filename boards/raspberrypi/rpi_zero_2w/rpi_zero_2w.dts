@@ -57,6 +57,12 @@
 &emmc {
 	pinctrl-names = "default";
 	pinctrl-0 = <&emmc_gpio34>;
-	wifi-reg-on-gpios = <&gpio1 13 GPIO_ACTIVE_HIGH>;
 	status = "okay";
+
+	brcmfmac: brcmfmac {
+		compatible = "brcm,bcm43xxx-sdio";
+		wifi-reg-on-gpios = <&gpio1 13 GPIO_ACTIVE_HIGH>;
+		firmware-name = "brcmfmac43436s-sdio";
+		status = "okay";
+	};
 };

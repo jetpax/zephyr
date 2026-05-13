@@ -1,0 +1,37 @@
+# Copyright (c) 2026 jetpax
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig WIFI_BRCMFMAC
+	bool "Broadcom BCM43xxx SDIO Wi-Fi (brcmfmac)"
+	depends on DT_HAS_BRCM_BCM43XXX_SDIO_ENABLED
+	default y
+	select WIFI_OFFLOAD
+	select WIFI_USE_NATIVE_NETWORKING
+	select NET_L2_ETHERNET
+	select NET_L2_WIFI_MGMT
+	select SDHC
+	select SDIO_STACK
+	select GPIO
+	help
+	  Native-L2 driver for SDIO-attached Broadcom/Cypress combo chips
+	  speaking the brcmfmac SDPCM+BCDC protocol. Validated target:
+	  BCM43430A1 / CYW43439 module on Pi Zero 2 W with brcmfmac43436s
+	  firmware. Chip handles 802.11; Zephyr's ethernet/IP stack runs
+	  on top.
+
+if WIFI_BRCMFMAC
+
+config WIFI_BRCMFMAC_RX_THREAD_STACK_SIZE
+	int "RX thread stack size"
+	default 4096
+	help
+	  Stack for the dedicated RX polling thread that drains F2 and
+	  dispatches frames by SDPCM channel. Polling because the
+	  sdhc_bcm2835.c driver doesn't yet implement the SDIO in-band
+	  IRQ callback -- separate follow-up PR.
+
+config WIFI_BRCMFMAC_RX_THREAD_PRIO
+	int "RX thread priority"
+	default 4
+
+endif # WIFI_BRCMFMAC
