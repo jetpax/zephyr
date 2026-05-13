@@ -85,9 +85,11 @@ LOG_MODULE_REGISTER(sdhc_bcm2835, CONFIG_SDHC_LOG_LEVEL);
 #define SDHCI_SIGNAL_ENABLE		0x38	/* IRPT_EN */
 #define SDHCI_SLOT_INT_STATUS_VERSION	0xFC
 
-/* PRESENT_STATE bits (we only need the inhibit flags) */
-#define SDHCI_PSTATE_CMD_INHIBIT	BIT(0)	/* CMD line busy */
-#define SDHCI_PSTATE_DATA_INHIBIT	BIT(1)	/* DAT lines busy */
+/* PRESENT_STATE bits */
+#define SDHCI_PSTATE_CMD_INHIBIT		BIT(0)	/* CMD line busy */
+#define SDHCI_PSTATE_DATA_INHIBIT		BIT(1)	/* DAT lines busy */
+#define SDHCI_PSTATE_BUFFER_WRITE_ENABLE	BIT(10)	/* FIFO has space for write */
+#define SDHCI_PSTATE_BUFFER_READ_ENABLE		BIT(11)	/* FIFO has data to read */
 
 /* CMDTM (32-bit at 0x0C). The low 16 bits are TRANSFER_MODE, high 16 bits
  * are COMMAND. Per spec, writing the COMMAND half (= writing the 32-bit
@@ -415,28 +417,52 @@ static int sdhc_bcm2835_transfer_data(const struct device *dev,
 				     : SDHCI_INT_BUF_WRITE_READY;
 	uint32_t int_status;
 
+	/* Multi-block PIO: poll PRESENT_STATE.BUFFER_(READ|WRITE)_ENABLE
+	 * level-triggered, not INT_STATUS.BUF_(READ|WRITE)_READY edge-
+	 * triggered. The BCM2835 has a 1 KiB FIFO that buffers more than
+	 * one block, so on multi-block reads the spec's edge-triggered
+	 * BUF_READ_READY doesn't re-fire between blocks (no 0->1 transition
+	 * on BUFFER_READ_ENABLE because the FIFO never drained empty).
+	 * PSTATE reflects the actual current FIFO state. We still ack the
+	 * INT_STATUS edge bit for cleanliness; we just don't gate on it.
+	 * Wall #5, isolated 2026-05-13 by Spike B (128B = 2-block CMD53
+	 * read hung waiting on second BUF_READ_READY edge that never came).
+	 */
+	uint32_t ready_pstate = is_read ? SDHCI_PSTATE_BUFFER_READ_ENABLE
+					: SDHCI_PSTATE_BUFFER_WRITE_ENABLE;
+
 	while (blocks_left > 0) {
-		int_status = sdhc_bcm2835_wait_int(dev, ready_bit,
-						   SDHCI_INT_DATA_ERROR_MASK,
-						   timeout_ms);
-		if (int_status == 0) {
-			LOG_ERR("data %s: BUF_%s_READY timeout (blocks_left=%u blk_size=%u pstate=0x%08x)",
-				is_read ? "read" : "write",
-				is_read ? "READ" : "WRITE",
-				blocks_left, data->block_size,
-				sys_read32(base + SDHCI_PRESENT_STATE));
-			return -ETIMEDOUT;
+		int64_t deadline = k_uptime_get() + timeout_ms;
+		uint32_t pstate;
+		uint32_t err_status = 0;
+
+		while (true) {
+			pstate = sys_read32(base + SDHCI_PRESENT_STATE);
+			err_status = sys_read32(base + SDHCI_INT_STATUS) &
+				     SDHCI_INT_DATA_ERROR_MASK;
+			if ((pstate & ready_pstate) || err_status != 0) {
+				break;
+			}
+			if (k_uptime_get() > deadline) {
+				LOG_ERR("data %s: BUF_%s_ENABLE timeout (blocks_left=%u blk_size=%u pstate=0x%08x)",
+					is_read ? "read" : "write",
+					is_read ? "READ" : "WRITE",
+					blocks_left, data->block_size, pstate);
+				(void)sdhc_bcm2835_soft_reset(dev,
+							      SDHCI_CTRL1_RESET_DATA);
+				return -ETIMEDOUT;
+			}
+			k_busy_wait(10);
 		}
-		if (int_status & SDHCI_INT_DATA_ERROR_MASK) {
+
+		if (err_status != 0) {
 			LOG_ERR("data %s: int_status=0x%08x (blocks_left=%u blk_size=%u pstate=0x%08x)",
-				is_read ? "read" : "write", int_status,
-				blocks_left, data->block_size,
-				sys_read32(base + SDHCI_PRESENT_STATE));
-			sys_write32(int_status & SDHCI_INT_DATA_ERROR_MASK,
-				    base + SDHCI_INT_STATUS);
+				is_read ? "read" : "write", err_status,
+				blocks_left, data->block_size, pstate);
+			sys_write32(err_status, base + SDHCI_INT_STATUS);
 			(void)sdhc_bcm2835_soft_reset(dev,
 						      SDHCI_CTRL1_RESET_DATA);
-			if (int_status & SDHCI_INT_DATA_TIMEOUT) {
+			if (err_status & SDHCI_INT_DATA_TIMEOUT) {
 				return -ETIMEDOUT;
 			}
 			return -EIO;
