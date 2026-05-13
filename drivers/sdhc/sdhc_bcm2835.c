@@ -179,12 +179,7 @@ LOG_MODULE_REGISTER(sdhc_bcm2835, CONFIG_SDHC_LOG_LEVEL);
  */
 #define BCM2835_MAX_BLOCK_BYTES		1024	/* internal FIFO size */
 #define BCM2835_F_MIN_HZ		400000	/* card identification */
-/* TEMP: cap at 25 MHz while debugging CMD53 DATA_CRC at 50 MHz on the
- * WLAN DAT lines. CMD52 (CMD line only) works at 50 MHz; CMD53 fails
- * with DATA_CRC. Raise back to 50 MHz once the DAT-line timing /
- * signal-integrity issue is understood.
- */
-#define BCM2835_F_MAX_HZ		25000000 /* SDR12 / default speed */
+#define BCM2835_F_MAX_HZ		50000000 /* SDR25 / high speed */
 
 struct sdhc_bcm2835_config {
 	DEVICE_MMIO_ROM;
@@ -669,12 +664,11 @@ static int sdhc_bcm2835_set_clock(const struct device *dev, uint32_t target_hz)
 		return 0;
 	}
 
-	/* Single CTL1 write with divider + DATA_TOUT + CLK_INTLEN + CLK_EN
-	 * all at once, matching circle's emmcclk (addon/wlan/emmc.c:221-240).
-	 * The spec-suggested disable / configure / enable dance disturbs
-	 * the DAT-side state machine on this silicon, causing the first
-	 * CMD53 after sd_init's bus-config ramps to fire spurious
-	 * DATA_CRC. A single atomic CTL1 write avoids the issue.
+	/* Single atomic CTL1 write with divider + DATA_TOUT + CLK_INTLEN +
+	 * CLK_EN. The spec-suggested disable / configure / enable dance
+	 * disturbs the DAT-side state machine on this silicon, causing the
+	 * first CMD53 after sd_init's bus-config ramps to fire spurious
+	 * DATA_CRC.
 	 *
 	 * DATA_TOUNIT = 0xE -- 2^27 SDCLK cycles (~5.4 s at 25 MHz, the
 	 * spec-max). NO_HISPD_BIT quirk: we don't touch HCTL_HS in CONTROL0
@@ -716,13 +710,10 @@ static void sdhc_bcm2835_set_bus_width(const struct device *dev,
 		ctrl0 |= SDHCI_CTRL0_HCTL_DWIDTH;
 	}
 
-	/* RESET_DATA before the CTL0 write so the controller's internal
-	 * DAT-side bus-width state machine picks up the new width on a
-	 * freshly-reset state. Without this pair, on BCM43430A1 the first
-	 * 4-bit data transfer after sd_init's width ramp fires spurious
-	 * DATA_CRC even though every visible register reads correct.
-	 * Empirically isolated at REPL: chip-side CMD52 to CCCR_BUS_IF
-	 * doesn't help; host-side RESET_DATA + CTL0 write does.
+	/* On BCM43430A1, the first 4-bit data transfer after a width change
+	 * fires spurious DATA_CRC unless the DAT state machine is reset
+	 * around the CTL0 write. Plain RMW (Linux sdhci_set_bus_width style)
+	 * isn't enough on this silicon.
 	 */
 	(void)sdhc_bcm2835_soft_reset(dev, SDHCI_CTRL1_RESET_DATA);
 	sys_write32(ctrl0, base + SDHCI_HOST_CONTROL);
@@ -1021,21 +1012,14 @@ static int sdhc_bcm2835_init(const struct device *dev)
 	 */
 	DEVICE_MMIO_MAP(dev, K_MEM_ARM_DEVICE_nGnRE);
 
-	/* Disconnect Arasan SDHCI from the SD card slot pads FIRST, before
-	 * any other pinctrl runs. Mirrors circle's ether4330.c::sdioinit
-	 * order: 48..53 -> ALT0 first, THEN 34..39 -> ALT3.
-	 *
-	 * On Pi 3 / Pi Zero 2 W the Arasan controller's CMD/DAT/CLK signals
-	 * are routable to two pad sets: GPIO 34..39 (ALT3, WLAN module) and
-	 * GPIO 48..53 (ALT3, microSD card slot). Pi firmware boots with the
-	 * slot pins at ALT3, and the controller's RX input mux latches to
-	 * whichever pad set is at ALT3 first. If we apply pinctrl on
-	 * 34..39 while 48..53 is still at ALT3, both sets are simultaneously
-	 * ALT3 and the RX mux stays tied to 48..53 -- only the CMD line
-	 * happens to work (chip drives hard), while DAT1..3 read as the
-	 * empty SD slot's pull-up state, manifesting as DATA_CRC on CMD53.
-	 * Doing 48..53 -> ALT0 first ensures that when pinctrl puts
-	 * 34..39 at ALT3, that's the only ALT3 set and RX latches cleanly.
+	/* Disconnect Arasan SDHCI from the SD card slot pads BEFORE pinctrl
+	 * runs. On Pi 3 / Pi Zero 2 W, the Arasan controller is routable to
+	 * both GPIO 34..39 (WLAN) and GPIO 48..53 (microSD slot) via ALT3.
+	 * Pi firmware boots with the slot pins at ALT3; if pinctrl puts
+	 * 34..39 at ALT3 while 48..53 is still at ALT3, the controller's
+	 * RX mux stays tied to 48..53 and DAT1..3 read the empty slot's
+	 * pull state -- producing DATA_CRC on the first CMD53. Forcing
+	 * 48..53 -> ALT0 first makes 34..39 the only ALT3 set.
 	 *
 	 * 3 bits per pin in GPFSEL4/5, ALT0 = 0b100 = 4.
 	 */
