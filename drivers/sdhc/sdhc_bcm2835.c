@@ -179,7 +179,12 @@ LOG_MODULE_REGISTER(sdhc_bcm2835, CONFIG_SDHC_LOG_LEVEL);
  */
 #define BCM2835_MAX_BLOCK_BYTES		1024	/* internal FIFO size */
 #define BCM2835_F_MIN_HZ		400000	/* card identification */
-#define BCM2835_F_MAX_HZ		50000000 /* SDR25 / high speed */
+/* TEMP: cap at 25 MHz while debugging CMD53 DATA_CRC at 50 MHz on the
+ * WLAN DAT lines. CMD52 (CMD line only) works at 50 MHz; CMD53 fails
+ * with DATA_CRC. Raise back to 50 MHz once the DAT-line timing /
+ * signal-integrity issue is understood.
+ */
+#define BCM2835_F_MAX_HZ		25000000 /* SDR12 / default speed */
 
 struct sdhc_bcm2835_config {
 	DEVICE_MMIO_ROM;
@@ -420,9 +425,18 @@ static int sdhc_bcm2835_transfer_data(const struct device *dev,
 						   SDHCI_INT_DATA_ERROR_MASK,
 						   timeout_ms);
 		if (int_status == 0) {
+			LOG_ERR("data %s: BUF_%s_READY timeout (blocks_left=%u blk_size=%u pstate=0x%08x)",
+				is_read ? "read" : "write",
+				is_read ? "READ" : "WRITE",
+				blocks_left, data->block_size,
+				sys_read32(base + SDHCI_PRESENT_STATE));
 			return -ETIMEDOUT;
 		}
 		if (int_status & SDHCI_INT_DATA_ERROR_MASK) {
+			LOG_ERR("data %s: int_status=0x%08x (blocks_left=%u blk_size=%u pstate=0x%08x)",
+				is_read ? "read" : "write", int_status,
+				blocks_left, data->block_size,
+				sys_read32(base + SDHCI_PRESENT_STATE));
 			sys_write32(int_status & SDHCI_INT_DATA_ERROR_MASK,
 				    base + SDHCI_INT_STATUS);
 			(void)sdhc_bcm2835_soft_reset(dev,
@@ -443,9 +457,15 @@ static int sdhc_bcm2835_transfer_data(const struct device *dev,
 					   SDHCI_INT_DATA_ERROR_MASK,
 					   timeout_ms);
 	if (int_status == 0) {
+		LOG_ERR("data %s: DATA_END timeout (pstate=0x%08x)",
+			is_read ? "read" : "write",
+			sys_read32(base + SDHCI_PRESENT_STATE));
 		return -ETIMEDOUT;
 	}
 	if (int_status & SDHCI_INT_DATA_ERROR_MASK) {
+		LOG_ERR("data %s end: int_status=0x%08x (pstate=0x%08x)",
+			is_read ? "read" : "write", int_status,
+			sys_read32(base + SDHCI_PRESENT_STATE));
 		sys_write32(int_status & SDHCI_INT_DATA_ERROR_MASK,
 			    base + SDHCI_INT_STATUS);
 		(void)sdhc_bcm2835_soft_reset(dev, SDHCI_CTRL1_RESET_DATA);
@@ -530,10 +550,7 @@ static int sdhc_bcm2835_request(const struct device *dev,
 	 * at the 400 kHz initialisation clock and harmless at higher
 	 * post-init rates.
 	 */
-	sys_write32(SDHCI_INT_CMD_COMPLETE | SDHCI_INT_CMD_ERROR_MASK |
-		    SDHCI_INT_BUF_WRITE_READY | SDHCI_INT_BUF_READ_READY |
-		    SDHCI_INT_DATA_END | SDHCI_INT_DATA_ERROR_MASK,
-		    base + SDHCI_INT_STATUS);
+	sys_write32(0xFFFFFFFF, base + SDHCI_INT_STATUS);
 	k_busy_wait(10);
 
 	if (data != NULL) {
@@ -556,17 +573,41 @@ static int sdhc_bcm2835_request(const struct device *dev,
 	}
 
 	if (int_status & SDHCI_INT_CMD_ERROR_MASK) {
+		uint32_t cmd_err = int_status & SDHCI_INT_CMD_ERROR_MASK;
+
+		/* Plain CMD_TIMEOUT (no CRC / end-bit / index error alongside)
+		 * is expected for some probe commands -- notably CMD8 sent to
+		 * legacy SDIO cards that don't implement it (BCM43430A1). The
+		 * SD subsystem retries 11 times before falling back; logging
+		 * all 11 at LOG_ERR was masking real failures during bring-up.
+		 * Downgrade timeout-only to LOG_DBG; keep CRC / end-bit / index
+		 * at LOG_ERR.
+		 */
+		if (cmd_err == SDHCI_INT_CMD_TIMEOUT) {
+			LOG_DBG("CMD%u arg=0x%08x: timeout (pstate=0x%08x)",
+				cmd->opcode, cmd->arg,
+				sys_read32(base + SDHCI_PRESENT_STATE));
+		} else {
+			LOG_ERR("CMD%u arg=0x%08x: int_status=0x%08x pstate=0x%08x",
+				cmd->opcode, cmd->arg, int_status,
+				sys_read32(base + SDHCI_PRESENT_STATE));
+		}
 		sys_write32(int_status & SDHCI_INT_CMD_ERROR_MASK,
 			    base + SDHCI_INT_STATUS);
-		/* "The controller needs a reset of internal state machines
-		 * upon error conditions." -- bcm2835-mmc.c
-		 * Linux always pairs RESET_CMD with RESET_DATA in the
-		 * tasklet error path; without RESET_DATA the data-side
-		 * state machine can stay stuck and the next CMD enters
-		 * an undefined state.
+		/* Reset the CMD state machine to recover from the error.
+		 * Only reset the DATA state machine if this command had a
+		 * data phase; CMD-only commands (CMD0/3/5/7/8/52) don't
+		 * touch the DAT lines and pulsing RESET_DATA for them is
+		 * unnecessary -- and on this silicon, the repeated
+		 * RESET_DATA pulses during e.g. the 11 CMD8 retries of
+		 * sd_init's SD-2.0 probe destabilise the DAT state machine
+		 * for subsequent CMD53s.
 		 */
 		(void)sdhc_bcm2835_soft_reset(dev, SDHCI_CTRL1_RESET_CMD);
-		(void)sdhc_bcm2835_soft_reset(dev, SDHCI_CTRL1_RESET_DATA);
+		if (data != NULL) {
+			(void)sdhc_bcm2835_soft_reset(dev,
+						      SDHCI_CTRL1_RESET_DATA);
+		}
 		if (int_status & SDHCI_INT_CMD_TIMEOUT) {
 			return -ETIMEDOUT;
 		}
@@ -620,35 +661,31 @@ static int sdhc_bcm2835_set_clock(const struct device *dev, uint32_t target_hz)
 	uint32_t div;
 	int64_t deadline;
 
-	/* Tear down the current bus clock + internal clock so we can
-	 * reprogram the divider. SDHCI spec requires SDCE=0 before changing
-	 * the divider; we also drop ICE so the controller observes the new
-	 * value cleanly.
-	 */
-	ctrl1 = sys_read32(base + SDHCI_CLOCK_CONTROL);
-	ctrl1 &= ~(SDHCI_CTRL1_CLK_EN | SDHCI_CTRL1_CLK_INTLEN |
-		   SDHCI_CTRL1_CLK_FREQ_MASK | SDHCI_CTRL1_CLK_GENSEL |
-		   SDHCI_CTRL1_DATA_TOUT_MASK);
-	sys_write32(ctrl1, base + SDHCI_CLOCK_CONTROL);
-
 	if (target_hz == 0) {
-		return 0;	/* caller wants the clock gated */
+		/* Gate the bus clock by clearing CLK_EN only. */
+		ctrl1 = sys_read32(base + SDHCI_CLOCK_CONTROL);
+		ctrl1 &= ~SDHCI_CTRL1_CLK_EN;
+		sys_write32(ctrl1, base + SDHCI_CLOCK_CONTROL);
+		return 0;
 	}
 
-	/* Program the 10-bit divider in divided-clock mode (CLK_GENSEL=0).
-	 * Set DATA_TOUT to the maximum exponent so card-side data timeouts
-	 * don't trip during card identification. NO_HISPD_BIT quirk: we
-	 * don't touch HCTL_HS in CONTROL0 -- the silicon ignores it; speed
-	 * comes from the divider alone.
+	/* Single CTL1 write with divider + DATA_TOUT + CLK_INTLEN + CLK_EN
+	 * all at once, matching circle's emmcclk (addon/wlan/emmc.c:221-240).
+	 * The spec-suggested disable / configure / enable dance disturbs
+	 * the DAT-side state machine on this silicon, causing the first
+	 * CMD53 after sd_init's bus-config ramps to fire spurious
+	 * DATA_CRC. A single atomic CTL1 write avoids the issue.
+	 *
+	 * DATA_TOUNIT = 0xE -- 2^27 SDCLK cycles (~5.4 s at 25 MHz, the
+	 * spec-max). NO_HISPD_BIT quirk: we don't touch HCTL_HS in CONTROL0
+	 * -- the silicon ignores it; speed comes from the divider alone.
 	 */
 	div = sdhc_bcm2835_calc_clk_div(cfg->clock_freq, target_hz);
-	ctrl1 |= ((div >> 8) & 0x3) << SDHCI_CTRL1_CLK_FREQ_MS_SHIFT;
-	ctrl1 |= (div & 0xFF) << SDHCI_CTRL1_CLK_FREQ_LO_SHIFT;
-	/* DATA_TOUNIT = 0 -- 2^13 SDCLK cycles (~20 ms at 400 kHz). The
-	 * software wait_int timeout (~5 s) is the operative deadline.
-	 */
-	ctrl1 |= 0x0 << SDHCI_CTRL1_DATA_TOUT_SHIFT;
-	ctrl1 |= SDHCI_CTRL1_CLK_INTLEN;
+	ctrl1 = (((div >> 8) & 0x3) << SDHCI_CTRL1_CLK_FREQ_MS_SHIFT) |
+		((div & 0xFF) << SDHCI_CTRL1_CLK_FREQ_LO_SHIFT) |
+		(0xE << SDHCI_CTRL1_DATA_TOUT_SHIFT) |
+		SDHCI_CTRL1_CLK_INTLEN |
+		SDHCI_CTRL1_CLK_EN;
 	sys_write32(ctrl1, base + SDHCI_CLOCK_CONTROL);
 
 	/* Wait for the internal clock to stabilise. */
@@ -659,11 +696,6 @@ static int sdhc_bcm2835_set_clock(const struct device *dev, uint32_t target_hz)
 		}
 		k_busy_wait(10);
 	}
-
-	/* Internal clock is stable; now enable the SD bus clock. */
-	ctrl1 = sys_read32(base + SDHCI_CLOCK_CONTROL);
-	ctrl1 |= SDHCI_CTRL1_CLK_EN;
-	sys_write32(ctrl1, base + SDHCI_CLOCK_CONTROL);
 
 	return 0;
 }
@@ -684,6 +716,15 @@ static void sdhc_bcm2835_set_bus_width(const struct device *dev,
 		ctrl0 |= SDHCI_CTRL0_HCTL_DWIDTH;
 	}
 
+	/* RESET_DATA before the CTL0 write so the controller's internal
+	 * DAT-side bus-width state machine picks up the new width on a
+	 * freshly-reset state. Without this pair, on BCM43430A1 the first
+	 * 4-bit data transfer after sd_init's width ramp fires spurious
+	 * DATA_CRC even though every visible register reads correct.
+	 * Empirically isolated at REPL: chip-side CMD52 to CCCR_BUS_IF
+	 * doesn't help; host-side RESET_DATA + CTL0 write does.
+	 */
+	(void)sdhc_bcm2835_soft_reset(dev, SDHCI_CTRL1_RESET_DATA);
 	sys_write32(ctrl0, base + SDHCI_HOST_CONTROL);
 }
 
@@ -980,24 +1021,23 @@ static int sdhc_bcm2835_init(const struct device *dev)
 	 */
 	DEVICE_MMIO_MAP(dev, K_MEM_ARM_DEVICE_nGnRE);
 
-	ret = pinctrl_apply_state(cfg->pincfg, PINCTRL_STATE_DEFAULT);
-	if (ret != 0) {
-		LOG_ERR("%s pinctrl apply failed: %d", dev->name, ret);
-		return ret;
-	}
-
-	/* Disconnect Arasan SDHCI from the SD card slot pads.
+	/* Disconnect Arasan SDHCI from the SD card slot pads FIRST, before
+	 * any other pinctrl runs. Mirrors circle's ether4330.c::sdioinit
+	 * order: 48..53 -> ALT0 first, THEN 34..39 -> ALT3.
 	 *
-	 * On Pi 3 / Zero 2 W the Arasan controller's CMD/DAT/CLK signals
-	 * are routable to two pad sets: GPIO 34..39 (ALT3, WLAN module)
-	 * and GPIO 48..53 (ALT3, microSD card slot). Pi firmware boots
-	 * with the slot pins at ALT3 so it can read kernel images, but
-	 * the SoC's Arasan RX input mux is tied to the 48..53 pad set --
-	 * leaving both groups at ALT3 means the controller listens on
-	 * the empty SD slot (pulled high) and never sees responses from
-	 * the WLAN chip. Mux 48..53 to ALT0 (the legacy SDHost path,
-	 * which Zephyr doesn't drive on this SoC) before issuing any
-	 * command. 3 bits per pin in GPFSEL4/5, ALT0 = 0b100 = 4.
+	 * On Pi 3 / Pi Zero 2 W the Arasan controller's CMD/DAT/CLK signals
+	 * are routable to two pad sets: GPIO 34..39 (ALT3, WLAN module) and
+	 * GPIO 48..53 (ALT3, microSD card slot). Pi firmware boots with the
+	 * slot pins at ALT3, and the controller's RX input mux latches to
+	 * whichever pad set is at ALT3 first. If we apply pinctrl on
+	 * 34..39 while 48..53 is still at ALT3, both sets are simultaneously
+	 * ALT3 and the RX mux stays tied to 48..53 -- only the CMD line
+	 * happens to work (chip drives hard), while DAT1..3 read as the
+	 * empty SD slot's pull-up state, manifesting as DATA_CRC on CMD53.
+	 * Doing 48..53 -> ALT0 first ensures that when pinctrl puts
+	 * 34..39 at ALT3, that's the only ALT3 set and RX latches cleanly.
+	 *
+	 * 3 bits per pin in GPFSEL4/5, ALT0 = 0b100 = 4.
 	 */
 	{
 		volatile uint32_t *gpfsel4 = (volatile uint32_t *)0x3F200010;
@@ -1019,6 +1059,12 @@ static int sdhc_bcm2835_init(const struct device *dev)
 		*gpfsel5 = f5;
 	}
 
+	ret = pinctrl_apply_state(cfg->pincfg, PINCTRL_STATE_DEFAULT);
+	if (ret != 0) {
+		LOG_ERR("%s pinctrl apply failed: %d", dev->name, ret);
+		return ret;
+	}
+
 	/* WL_REG_ON is driven HIGH by the Pi firmware before kernel handoff.
 	 * The wireless chip is past its bootrom settle window by the time
 	 * POST_KERNEL runs; toggling LOW->HIGH from here disturbs the
@@ -1031,14 +1077,18 @@ static int sdhc_bcm2835_init(const struct device *dev)
 		return ret;
 	}
 
-	/* INT_ENABLE / SIGNAL_ENABLE = 0x00FF0003: CMD_COMPLETE,
-	 * DATA_END, and all CMD/DATA error bits. Both registers carry
-	 * the same value because this controller doesn't latch
-	 * INT_STATUS bits unless the matching SIGNAL_ENABLE bit is set,
-	 * even when the request path is polled.
+	/* INT_ENABLE / SIGNAL_ENABLE: CMD_COMPLETE, DATA_END, the
+	 * PIO buffer-ready signals, and all CMD/DATA error bits. Both
+	 * registers carry the same value because this controller doesn't
+	 * latch INT_STATUS bits unless the matching SIGNAL_ENABLE bit is
+	 * set, even when the request path is polled. BUF_READ_READY and
+	 * BUF_WRITE_READY are mandatory for PIO data phases -- mirrors
+	 * Linux's bcm2835_mmc_set_transfer_irqs: pio_irqs =
+	 * SDHCI_INT_DATA_AVAIL | SDHCI_INT_SPACE_AVAIL.
 	 */
 	uintptr_t base = DEVICE_MMIO_GET(dev);
 	uint32_t int_en = SDHCI_INT_CMD_COMPLETE | SDHCI_INT_DATA_END |
+			  SDHCI_INT_BUF_READ_READY | SDHCI_INT_BUF_WRITE_READY |
 			  SDHCI_INT_CMD_TIMEOUT | SDHCI_INT_CMD_CRC |
 			  SDHCI_INT_CMD_END_BIT | SDHCI_INT_CMD_INDEX |
 			  SDHCI_INT_DATA_TIMEOUT | SDHCI_INT_DATA_CRC |

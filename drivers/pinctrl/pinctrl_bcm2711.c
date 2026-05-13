@@ -37,13 +37,25 @@
 
 /* Legacy pull-control registers (BCM2710 / BCM2835 family). The 0xE4
  * register doesn't exist on this silicon -- writes there are silently
- * misrouted. The pull mode is selected via this three-step sequence
- * (BCM2835 datasheet ch. 6 "GPPUD"):
+ * misrouted. The pull mode is selected via this sequence (matches
+ * circle's gpiopull on p9arch.cpp lines 60-76, the canonical bare-metal
+ * reference for the Pi Zero 2 W WLAN bring-up):
  *   1. write GPPUD = mode
- *   2. wait >= 150 cycles (k_busy_wait(1) is a comfortable upper bound)
+ *   2. wait 5 us  ("1 us should be enough, but to be sure" -- circle)
  *   3. write GPPUDCLK[bank] = bit-mask of target pin(s)
- *   4. wait >= 150 cycles
- *   5. clear GPPUD and GPPUDCLK
+ *   4. wait 5 us
+ *   5. write GPPUD = 0           (clear the mode while strobe is still asserted)
+ *   6. write GPPUDCLK[bank] = 0  (clear the strobe last)
+ *
+ * Linux's pinctrl-bcm2835 uses udelay(1) and skips step 5; it gets away
+ * with that because Linux's udelay rounds up to a loop-calibrated lower
+ * bound (typically >= 1 us, often longer), whereas Zephyr's system-timer
+ * busy-wait can exit on the next 1 MHz tick boundary -- so a request for
+ * 1 us can be satisfied by 0..1 us of actual wait. Empirically the 1 us
+ * version of this routine failed to latch pull-up on DAT0..3 on this
+ * silicon (verified 2026-05-12 by forcing the pull-up manually from MP
+ * REPL with this exact sequence and watching 4-bit CMD53 succeed where
+ * it previously fired DATA_CRC).
  *
  * Note that the legacy mode encoding (1=DOWN, 2=UP) is the SWAP of the
  * BCM2711 0xE4 encoding (1=UP, 2=DOWN); we translate explicitly.
@@ -53,6 +65,25 @@
 #define LEGACY_PULL_OFF          0x0
 #define LEGACY_PULL_DOWN         0x1
 #define LEGACY_PULL_UP           0x2
+
+/* BCM2835 System Timer at 0x3F003000, register CLO at +0x04: a 32-bit
+ * free-running 1 MHz counter driven by the VPU since power-on. Used
+ * here instead of k_busy_wait() because pinctrl_apply_state can run
+ * at POST_KERNEL before Zephyr's generic-timer-based timing is
+ * usable on this SoC, in which case k_busy_wait(1) returns early
+ * and the GPPUD setup/hold windows don't actually elapse. Matches
+ * circle's CTimer::SimpleusDelay (lib/timer.cpp:653-668).
+ */
+#define BCM2835_ST_CLO 0x3F003004UL
+
+static inline void bcm2835_st_busy_wait_us(uint32_t us)
+{
+	uint32_t start = sys_read32(BCM2835_ST_CLO);
+
+	while ((sys_read32(BCM2835_ST_CLO) - start) < us) {
+		/* spin */
+	}
+}
 
 static inline uint32_t bcm2711_pinctrl_read(uintptr_t base, uint32_t offset)
 {
@@ -108,9 +139,9 @@ static void bcm2711_pinctrl_set_pull_legacy(uintptr_t base, uint8_t pin,
 	}
 
 	bcm2711_pinctrl_write(base, GPPUD_OFFSET, pud);
-	k_busy_wait(1);
+	bcm2835_st_busy_wait_us(5);
 	bcm2711_pinctrl_write(base, pud_offset, pin_bit);
-	k_busy_wait(1);
+	bcm2835_st_busy_wait_us(5);
 	bcm2711_pinctrl_write(base, GPPUD_OFFSET, 0);
 	bcm2711_pinctrl_write(base, pud_offset, 0);
 }

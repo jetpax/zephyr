@@ -23,6 +23,14 @@
 		zephyr,entropy = &rng;
 	};
 
+	/* sdhc0 alias: used by Zephyr's SDIO subsystem consumers
+	 * (subsys/sd/sdio.c via tests/subsys/sd/sdio/) and by the
+	 * BCM43430A1 bring-up shim in the MicroPython port.
+	 */
+	aliases {
+		sdhc0 = &emmc;
+	};
+
 	/*
 	 * Pi Zero 2 W has an on-board ACT LED, but it's wired through
 	 * the firmware (not on a fixed GPIO accessible to the ARM cores)

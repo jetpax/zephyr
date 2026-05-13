@@ -251,145 +251,183 @@ trivially small.
    commands.** Annoying for testing, harmless on real hardware via
    tio.
 
-## SDIO bring-up status (as of 2026-05-11)
+## SDIO bring-up status (as of 2026-05-12, end of day)
 
-The chip on Pi Zero 2 W is **CYW43436** (BCM43430-family, not
-CYW43439 as the original handover claimed). Confirmed via Linux's
-`brcmfmac` loading firmware `brcmfmac43430-sdio` on the live
-hardware. The on-die SDIO interface is the same.
+**Two walls cracked since the 2026-05-11 snapshot below. One wall
+still open. Read this section first; the older snapshot is preserved
+for archaeology but its "wall" is no longer the wall.**
 
-### What's verified working
+### Cracked wall #1: pin contention on GPFSEL4/5 (2026-05-12 AM)
 
-End-to-end on real silicon:
-- SDHCI controller version 0x9902 (Broadcom + SDHCI 3.0).
-- Pinctrl correctly routes GPIO 34..39 (ALT3 = SD1 functions) and
-  GPIO 43 (ALT0 = GPCLK2 = chip's LPO input). The legacy GPPUD /
-  GPPUDCLK pull-control sequence is implemented in
-  `drivers/pinctrl/pinctrl_bcm2711.c` for this silicon (the modern
-  0xE4 PUP_PDN register is reserved on BCM2710).
-- `clock-frequency = <DT_FREQ_M(200)>` in `bcm2710.dtsi` matches
-  the actual clk_emmc rate the VPU firmware programs (PLLC_CORE0
-  /5 = 200 MHz, confirmed via Linux's clk_summary). Earlier this
-  was 100 MHz, which made the SDHCI divider produce 800 kHz SDCLK
-  -- 2× the SD spec card-identification limit. With 200 MHz the
-  driver's divider math correctly yields a 400 kHz SDCLK.
-- `CONTROL0 = 0x00000f00` (BUS_POWER + 3.3V), `CONTROL1 = 0x0000fa07`
-  (DATA_TOUNIT=0, CLK_FREQ=250, SDCLK+INTCLK enabled), `CONTROL2 =
-  0`, `INT_ENABLE / SIGNAL_ENABLE = 0x00FF0003`. Byte-for-byte
-  match to Linux's `bcm2835-mmc.c` register writes captured via
-  `trace_printk` instrumentation on Pi-downstream 6.12.87.
-- The SDHCI TX path is **perfect**: bit-bang wire capture of
-  controller-issued CMD52/CMD5 frames decodes byte-for-byte
-  correctly including hardware-computed CRC7. Pin 34 (SD_CLK)
-  toggles at proper 400 kHz.
-- The chip is **alive and responds**: bit-bang on GPIO 34/35
-  driving CMD5 with the controller bypassed gets a valid OCR
-  (0xA0FFFF00). Wire capture during SDHCI-issued CMD5 also shows
-  the chip driving the CMD line low during the response window
-  (87 LO samples in 8192 GPLEV1 reads; SDHCI PSTATE.CMD_LINE_LEVEL
-  sees the same drive).
+Pi VPU/firmware boots with **GPIO 48..53 at ALT3** (Arasan path used
+by Pi firmware for boot-time SD slot access). On Pi 3 / Pi Zero 2 W
+the Arasan controller's **RX input mux inside the SoC latches to the
+48..53 pad set first** when both 34..39 and 48..53 are at ALT3 — the
+TX correctly drives both pad sets, the chip on pin 35 sees clean CMD
+frames and responds, but the controller's RX listens on pin 49 (empty
+SD slot, pulled high) and never sees the response. CMD_TIMEOUT every
+time.
 
-### The wall
+**Fix:** `drivers/sdhc/sdhc_bcm2835.c::sdhc_bcm2835_init` muxes pins
+48..53 → ALT0 *before* `pinctrl_apply_state` runs on 34..39. Linux/
+Pi-firmware boot path implicitly does this; circle's
+`ether4330.c::sdioinit` makes it explicit. Single ~15-line change.
 
-The SDHCI controller's **RX state machine does not engage** on the
-chip's response despite the pad-level seeing the chip drive. CMD5
-fires CMD_TIMEOUT every time with RESP=0 and PSTATE.CMD_INHIBIT
-stuck on. Failure mode is identical whether driven from the C
-driver at init or via MP REPL `mem32` pokes.
+### Cracked wall #2: pinctrl pull-up not sticking on DAT0..3 (2026-05-12 PM)
 
-Crucially: **Linux's `/dev/mem` userspace driver on the same
-running kernel ALSO fails to issue commands** (tested previous
-session) -- so the difference isn't anywhere observable at the
-register level. Something in Linux's kernel-context bcm2835-mmc
-probe path (real registered IRQ handler, spinlock-held MMIO,
-tasklet-deferred error recovery) is the un-pinned-down piece.
-This is independent of which exact register values we write; the
-deep instrumentation captured 2026-05-11 (trace_printk on every
-writel, readl, and the function entries for irq/cmd_irq/
-finish_command/reset/set_clock/set_ios/tasklet_finish) confirmed
-that the kernel does **nothing** between writes that we can't see.
+After wall #1 was lifted, CMD52 worked but the first 4-bit CMD53
+fired DATA_CRC (`int_status=0x00208000`, `pstate=0x01ff0202`).
+Confirmed via MP REPL test (saved at
+`~/zephyrproject/tools/sdio-4bit-pullup-repro.py`): manually re-doing
+the GPPUD pull-up dance on pins 36..39 right before a 4-bit CMD53
+made it succeed with clean CCCR bytes `32 02 02 02 00 00 00 42`. So
+the DT `bias-pull-up` on the emmc_gpio34 group was requesting
+pull-up, but `pinctrl_bcm2711.c::bcm2711_pinctrl_set_pull_legacy`
+wasn't actually latching it on this silicon.
 
-Disproven hypotheses (preserved here so the next session doesn't
-re-test them):
+**Fix:** in `drivers/pinctrl/pinctrl_bcm2711.c`, two deltas vs.
+circle's `gpiopull` (`addon/wlan/p9arch.cpp:60-76`):
+- Delay 1 µs → 5 µs (circle's own comment: "1 us should be enough,
+  but to be sure"; our 1 µs `bcm2835_st_busy_wait_us` can return
+  after a 0..1 µs wait depending on 1 MHz tick phase).
+- Re-add the `GPPUD = 0` write before the strobe clear (matches
+  circle and the REPL workaround; the previous comment in the file
+  saying this re-latches pull-off was a wrong diagnosis carried
+  forward).
+
+Verified by re-running the REPL test on the post-fix build *without*
+manually forcing GPPUD: 4-bit CMD53 succeeds. Pinctrl pull-up is now
+sticking through to MP REPL time.
+
+### Open wall #3: boot-time 4-bit CMD53 (func1 backplane chipid) fires DATA_CRC
+
+The bring-up shim at `SYS_INIT(APPLICATION, 99)` in
+`~/github/micropython/ports/zephyr/src/bcm43430_bringup.c` fails on
+its first CMD53 — a 4-byte read of the chipid via the func1 backplane
+window — with `int_status=0x00208000`, `pstate=0x01ff0202`. Every
+CMD52 (CCCR reads, IO_ENABLE, block size, CHIPCLKCSR force-ALP,
+SBADDR window writes) succeeds; only the first data-phase command
+fails.
+
+### What's confirmed working at REPL after pinctrl fix
+
+- 4-bit CMD53 read of 8 bytes from func 0 offset 0 (CCCR header)
+  succeeds *without* the GPPUD pull-up dance — i.e., pinctrl's
+  bias-pull-up on DAT0..3 is now sticking through to REPL time.
+  Verified by `~/zephyrproject/tools/sdio-check-pinctrl-pullup.py`.
+- The pinctrl change in `drivers/pinctrl/pinctrl_bcm2711.c`
+  (`bcm2835_st_busy_wait_us(5)` and an explicit `GPPUD = 0` write
+  before the strobe clear) is the load-bearing pinctrl fix.
+
+### Status of the func1 backplane CMD53 from REPL
+
+Unknown. A REPL script that does (RESET_DATA pulse → redo three CMD52
+SBADDR writes → CMD53 func1 backplane chipid read) returned a clean
+chipid `0x1541a9a6 id=43430 rev=1 type=1` (BCM43430A1) on one run
+during this session; subsequent runs of the same script failed with
+DATA_CRC, but the user's review identified a bug in that script.
+Rewrite it carefully and re-test before drawing any conclusions about
+the func1 backplane path.
+
+### What was attempted to migrate the workaround into the driver/shim, and broke things
+
+Each of these passed `west build` but caused regressions. **All
+reverted; the current driver and shim are clean.**
+
+- **RESET_DATA pulse at end of `sdhc_bcm2835_init`** (matching
+  circle's emmc.c::emmcinit lines 295-301). Init runs with clock
+  gated, so the polling `soft_reset` helper timed out (RESET_DATA
+  doesn't self-clear without a clock). Switched to circle's
+  force-write pattern (write CTL1 = RESET_DATA, busy_wait, write
+  CTL1 = 0) — boot then completed but the failing CMD53 was
+  unchanged.
+- **RESET_DATA at end of `sdhc_bcm2835_set_io` when `clock != 0`**.
+  Boot failed identically AND the REPL workaround stopped working.
+  The multiple RESET_DATA pulses during `sd_init`'s several set_io
+  calls apparently destabilise something the REPL pulse can't recover.
+- **RESET_DATA inside `sdhc_bcm2835_request` before every data-bearing
+  command**. Same regression pattern: boot fails, REPL workaround
+  stops working.
+- **RESET_DATA pulse in the bring-up shim itself just before the
+  chipid CMD53**. Pulse fired correctly (boot log shows
+  `RESET_DATA pulse before chipid CMD53: ctl1 now 0x000e0407`).
+  Next CMD53 still fired DATA_CRC. So a RESET_DATA pulse
+  immediately before the CMD53 is *not* sufficient by itself —
+  the REPL workaround is doing something more than just that.
+
+### Empirical facts the next attempt should anchor on
+
+- Function-0 CMD53 (CCCR read, 8 bytes from func 0 offset 0) works
+  at REPL after only pinctrl-applied pull-up — no extra GPPUD dance
+  needed. So the host's 4-bit data path is healthy for at least some
+  chip-side reads.
+- Function-1 backplane CMD53 (chipid, 4 bytes at offset 0x8000 with
+  the `SB_ACCESS_2_4B_FLAG` bit set) is the one that fails at boot.
+- All CMD52 transactions succeed throughout, including the SBADDR
+  window writes — chip echoes the data back correctly in R5.
+- CHIPCLKCSR reads `0x68` (ALP_AVAIL + ALP_AVAIL_REQ + HT_AVAIL_REQ)
+  right before the failing CMD53. ALP is up; HT is not.
+- The REPL workaround works reliably with the current build — the
+  earlier confusion in this session about "REPL test failing too"
+  came after speculative driver changes that have been reverted.
+
+### Suggested directions for the next session
+
+1. **Read the REPL workaround script carefully and identify which
+   step is doing the work.** The current best understanding:
+   `RESET_DATA + redo SBADDR window writes + CMD53` works at REPL,
+   but `RESET_DATA + CMD53` (without redoing SBADDR) does not.
+   That points at the backplane window state being lost or corrupted
+   in a way the SBADDR writes restore. Worth a focused test:
+   from REPL, RESET_DATA + CMD53 alone (no SBADDR writes), vs.
+   re-issue SBADDR + CMD53 (no RESET_DATA). One of those should
+   localise the variable.
+2. **Compare brcmfmac/sdio.c's exact backplane-read sequence** in
+   `~/github/linux/drivers/net/wireless/broadcom/brcm80211/brcmfmac/bcmsdh.c::brcmf_sdiod_readl`
+   and friends. Look for anything between "function 1 enabled" and
+   "first 4-byte backplane read" that the shim doesn't replicate.
+3. **Don't add driver-side pulses speculatively** — every attempt
+   this session regressed the REPL workaround. Whatever the fix is,
+   it's not "pulse RESET_DATA somewhere extra".
+
+### Disproven hypotheses from the 2026-05-11 session (don't re-test)
+
+These were eliminated *before* the pin-contention fix and stayed
+eliminated after. Preserved so future sessions skip them.
 
 - **"GPCLK2 LPO isn't being generated."** VPU firmware leaves
   `CM_GP2CTL=0x291`, `CM_GP2DIV=0x00249f00` (MASH-1, exact 32 768
-  Hz). Re-programming from Zephyr is empirically counterproductive
-  -- the 30-50 µs LPO outage during KILL+restart disturbs the
-  chip's PMU. **Leave VPU's GPCLK2 alone.**
+  Hz). Re-programming from Zephyr is counterproductive — the 30-50 µs
+  LPO outage during KILL+restart disturbs the chip's PMU. **Leave
+  VPU's GPCLK2 alone.**
 - **"WL_REG_ON cycling wakes the chip."** Tested 20 ms / 100 ms /
-  500 ms LOW with various HIGH-settle times up to 4 s (past the
-  3.5 s CYW43436 bootrom). No change. The VPU already drives
-  WL_REG_ON HIGH before the kernel runs; toggling makes things
-  worse. **Inherit VPU state.**
-- **"Ncr_min=5 lower bound."** Chip drives at Ncr=5; SDHCI spec
-  wants Ncr ≥ 8. The "controller rejects fast responses" theory
-  was disproven by Linux's iter1 CMD52 *also* failing identically
-  on the same silicon -- Linux's iter2 succeeds 1.4 s later
-  without any controller-side changes. Whatever the discriminator
-  is, it isn't Ncr enforcement.
-- **"Match Linux's exact register sequence including failing
-  iter1 first."** Done bit-for-bit. Replicated CMD52 read + CMD52
-  IO_RESET + 1.5 s wait + CMD0 + CMD8 + CMD5. CMD5 still times
-  out. The "1.4 s gap" Linux has between iter1 and iter2 is dead
-  air -- no register activity, no function calls, no reads. The
-  difference is entirely in what the kernel context provides
-  around the writes, not in the writes themselves.
-- **"BCM2711 low-bus-clock hang."** `sdhci-iproc.c` documents the
-  bug at 100 kHz × 500 MHz core_freq on Pi 4. Tested at 1.6 MHz
-  SDCLK on Pi Zero 2 W -- same failure. Different SoC; the bug
-  doesn't apply.
-- **"Auto-clock-gating drops SDCLK during response window."**
-  Sampled pin 34 SDCLK during the response window: it runs
-  continuously (62/38 hi/lo ratio is sampling artifact, not
-  gating).
-- **"AxPROT or transaction-attribute filtering at the SDHCI
-  slave port."** Theory: userspace/MP REPL accesses are dropped
-  because they don't carry the privileged-mode AxPROT bit.
-  Tested by writing to FORCE_EVENT_ERROR_INTERRUPT_STATUS (offset
-  0x52) from MP REPL: bits 16 and 17 of INT_STATUS forced
-  successfully. Userspace writes ARE processed as commands.
+  500 ms LOW with various HIGH-settle times up to 4 s. No change.
+  VPU drives it HIGH before kernel runs; toggling makes things worse.
+  **Inherit VPU state.**
+- **"Ncr_min=5 lower bound."** Chip drives at Ncr=5; SDHCI spec wants
+  Ncr ≥ 8. Disproven empirically.
+- **"BCM2711 low-bus-clock hang."** `sdhci-iproc.c` documents that
+  bug at 100 kHz × 500 MHz core_freq on Pi 4. Different SoC; doesn't
+  apply here.
+- **"Auto-clock-gating drops SDCLK during response window."** SDCLK
+  runs continuously, verified by sampling pin 34.
+- **"AxPROT / transaction-attribute filtering."** Userspace writes
+  to FORCE_EVENT_ERROR registers ARE processed; ruled out.
 - **"VPU has the SDHCI peripheral in a partial-power state."**
-  Tested via property-channel mailbox GET_POWER_STATE for device
-  0 (SD Card): rcode=0x80000000, state.bit0=1 (on),
-  state.bit1=0 (device exists). SET_POWER_STATE(on) is a no-op.
-  Required a `MBOX_SCRATCH` MMU region at 0x0F000000 + CONFIG_MAX_
-  XLAT_TABLES bump from 8 to 12 to land the mailbox buffer in
-  uncached DRAM addressable from MP REPL.
-- **"VPU has clk_emmc clock-gated or set to wrong rate."** Same
-  mailbox path, GET_CLOCK_STATE for clk_emmc (id=1):
-  state=0x00000001 (on), rate=200000000 Hz. SET_CLOCK_STATE no-op.
-
-### Production driver state (as of 2026-05-11 bake-in commit)
-
-The Zephyr `drivers/sdhc/sdhc_bcm2835.c` is byte-for-byte matched
-to Linux's bcm2835-mmc.c for the write sequence, but cleaned of
-the experimental scaffolding that didn't help (5×4 freq sweep,
-CM register reads, one-shot ISR, WL_REG_ON toggle, GPCLK2
-reprogramming). The bring-up self-test now sends Linux's iter2
-sequence directly (CMD0 → CMD8 → CMD5_inq → CMD5_OCR) so the
-diagnostic output is comparable to the captured kernel trace.
-**The self-test is expected to fail at CMD5 until the kernel-
-context wall is cracked.**
-
-### Path forward, ranked
-
-1. **Build a Zephyr C driver with full kernel-style context.**
-   Real ISR registered via `IRQ_CONNECT` for the SDHCI IRQ at the
-   ARMC intc, request-path takes a spinlock, error path schedules
-   RESET_CMD+RESET_DATA via a work item rather than inline,
-   explicit `__DSB()` between MMIO writes. If this also fails,
-   kernel-context vs userspace isn't the differentiator and
-   we're missing something at a level neither register traces nor
-   source review have revealed.
-2. **External CYW43439 via SPI on Pico W coprocessor.** Reuses
-   the proven RP2350 + CYW43 SPI stack on `jetpax/pyDirect picosdk`
-   branch. ~$6 BOM addition. Zero new BCM silicon driver risk and
-   is fully under Zephyr control.
+  Mailbox GET_POWER_STATE confirms device 0 (SD Card) is on. Required
+  a `MBOX_SCRATCH` MMU region at 0x0F000000 + CONFIG_MAX_XLAT_TABLES
+  bump from 8 to 12 to land the mailbox buffer in uncached DRAM
+  addressable from MP REPL.
+- **"VPU has clk_emmc gated or set to wrong rate."** Mailbox
+  GET_CLOCK_STATE: on at 200 MHz. SET_CLOCK_STATE no-op.
+- **"Kernel-context wall (need real ISR / spinlock / DSB)."** Was the
+  prior session's leading hypothesis. Disproven by 2026-05-12: the
+  actual wall was pin contention (above). Polled bare-metal flow works
+  fine once the pads are routed correctly.
 
 The auto-memory at
 `~/.claude/projects/-Users-jep-github-SS/memory/project_rpi_zero_2w_sdio_debug.md`
-has the longer chronological investigation log.
+has the longer investigation log.
 
 ## Open work, ranked
 
@@ -422,15 +460,17 @@ has the longer chronological investigation log.
 
 ### Harder
 
-- **CYW43436 Wi-Fi/Bluetooth.** Pi Zero 2 W's wireless lives on
-  SDIO. A polled `brcm,bcm2835-sdhci` driver is now in tree at
-  `drivers/sdhc/sdhc_bcm2835.c` with register init matched
-  byte-for-byte to Linux's bcm2835-mmc.c -- but the kernel-
-  context wall (see SDIO bring-up status above) means CMD5 does
-  not yet succeed. The two realistic continuations are documented
-  in that section; option (2) (external CYW43439 via SPI on
-  Pico W coprocessor) is the lower-risk path and reuses the
-  proven `rp2350-psram-bringup` branch's CYW stack.
+- **CYW43436 (BCM43430A1) Wi-Fi/Bluetooth.** Pi Zero 2 W's wireless
+  lives on SDIO. Polled `brcm,bcm2835-sdhci` driver at
+  `drivers/sdhc/sdhc_bcm2835.c` enumerates the chip cleanly (`sd_init`
+  succeeds: num_io=2, rca=0x0001, ocr=0xa0ffff00, 4-bit @ 25 MHz,
+  CCCR diagnostics all read clean). The remaining open issue is the
+  first 4-bit CMD53 — see "SDIO bring-up status (as of 2026-05-12,
+  end of day)" above. Once that's cracked the next steps are firmware
+  upload (`brcmfmac43430-sdio.{bin,txt,clm_blob}` via CMD53 block
+  writes through the func-1 backplane window) and a brcmfmac-style
+  WLAN driver. Linux reference at
+  `~/github/linux/drivers/net/wireless/broadcom/brcm80211/brcmfmac/`.
 - **Frozen `_boot.py`.** MP currently boots straight to a bare
   REPL. If you want frozen modules baked in (typical embedded MP
   workflow), the path is via MP's manifest mechanism in
