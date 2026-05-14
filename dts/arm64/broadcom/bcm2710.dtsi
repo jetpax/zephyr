@@ -202,6 +202,34 @@
 		};
 
 		/*
+		 * DMA controller -- a control-block (linked-list
+		 * descriptor) engine. The I2S and SPI peripherals pace
+		 * transfers off it via DREQ. Default disabled; board /
+		 * test overlays opt in.
+		 *
+		 * brcm,dma-channel-mask = 0x7f30 keeps channels 4,5,8..14
+		 * and excludes the VideoCore-firmware-reserved and
+		 * special-function channels (0,1,2,3,6,7). The interrupts
+		 * list covers exactly those mask channels: 4,5,8,9,10 have
+		 * dedicated lines, 11..14 share one.
+		 */
+		dma: dma@3f007000 {
+			compatible = "brcm,bcm2835-dma";
+			reg = <0x3f007000 0xf00>;
+			interrupts = <BCM2835_IRQ_DMA(4)  IRQ_TYPE_LEVEL 0>,
+				     <BCM2835_IRQ_DMA(5)  IRQ_TYPE_LEVEL 0>,
+				     <BCM2835_IRQ_DMA(8)  IRQ_TYPE_LEVEL 0>,
+				     <BCM2835_IRQ_DMA(9)  IRQ_TYPE_LEVEL 0>,
+				     <BCM2835_IRQ_DMA(10) IRQ_TYPE_LEVEL 0>,
+				     <BCM2835_IRQ_DMA_SHARED IRQ_TYPE_LEVEL 0>;
+			#dma-cells = <1>;
+			dma-channels = <16>;
+			brcm,dma-channel-mask = <0x7f30>;
+			dma-buf-addr-alignment = <64>;
+			status = "disabled";
+		};
+
+		/*
 		 * SPI0 -- the "main" SPI controller on the 40-pin header
 		 * (GPIO 7..11, ALT0). Default disabled; board overlays
 		 * opt in and add cs-gpios plus a pinctrl group.

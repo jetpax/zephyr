@@ -50,6 +50,12 @@
 #define BCM2835_IRQ_TIMER1          BCM2835_BANK1(1)
 #define BCM2835_IRQ_TIMER2          BCM2835_BANK1(2)
 #define BCM2835_IRQ_TIMER3          BCM2835_BANK1(3)
+/* DMA channel IRQs: channels 0..10 have dedicated lines at PEND1 bits
+ * 16..26; channels 11..14 share bit 27. (PEND1 bit 28, the "any DMA
+ * channel" line, is not exposed.)
+ */
+#define BCM2835_IRQ_DMA(n)          BCM2835_BANK1(16 + (n)) /* n = 0..10 */
+#define BCM2835_IRQ_DMA_SHARED      BCM2835_BANK1(27)       /* channels 11..14 */
 #define BCM2835_IRQ_AUX             BCM2835_BANK1(29) /* mini-UART, SPI1, SPI2 */
 
 /* GPU PEND2 (peripheral upper bank) */
