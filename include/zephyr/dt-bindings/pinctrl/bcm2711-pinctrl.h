@@ -168,6 +168,16 @@
 #define SPI0_MOSI_GPIO10  BCM2711_PINMUX(10, BCM2711_FSEL_ALT0)
 #define SPI0_SCLK_GPIO11  BCM2711_PINMUX(11, BCM2711_FSEL_ALT0)
 
+/* PCM / I2S pinmux. The PCM audio interface (pcm@7e203000) routes to
+ * GPIO 18..21 via ALT0 on the BCM283x family: PCM_CLK (bit clock),
+ * PCM_FS (frame sync / LRCLK), PCM_DIN, PCM_DOUT. This is the I2S pin
+ * group exposed on the Raspberry Pi 40-pin header.
+ */
+#define PCM_CLK_GPIO18    BCM2711_PINMUX(18, BCM2711_FSEL_ALT0)
+#define PCM_FS_GPIO19     BCM2711_PINMUX(19, BCM2711_FSEL_ALT0)
+#define PCM_DIN_GPIO20    BCM2711_PINMUX(20, BCM2711_FSEL_ALT0)
+#define PCM_DOUT_GPIO21   BCM2711_PINMUX(21, BCM2711_FSEL_ALT0)
+
 /* EMMC / SDHCI pinmux. The Arasan SDHCI controller (sdhci@7e300000)
  * routes to GPIO 34..39 via ALT3 on the BCM2710/2711/2837 family --
  * SD1_CLK / SD1_CMD / SD1_DAT0..3. On Pi 3 / Pi Zero 2 W this is the

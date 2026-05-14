@@ -1,0 +1,43 @@
+# Copyright (c) 2026 jetpax
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Broadcom BCM2835 / BCM2710 / BCM2837 PCM / I2S controller.
+
+  This is the PCM audio interface Linux binds with "brcm,bcm2835-i2s" --
+  the I2S block exposed on the Raspberry Pi 40-pin header (GPIO 18..21,
+  ALT0). It is a DMA-paced controller: sample buffers are streamed
+  between memory and its TX/RX FIFOs through the BCM2835 DMA controller,
+  with the PCM TX/RX DREQ lines pacing the transfers.
+
+  In master (controller) mode the bit clock is derived from the SoC
+  clock manager's PCM clock, a separate register block; the driver
+  programs that divider directly at i2s_configure() time, so there is
+  no clocks phandle here.
+
+compatible: "brcm,bcm2835-i2s"
+
+include: [i2s-controller.yaml, pinctrl-device.yaml]
+
+properties:
+  reg:
+    required: true
+
+  interrupts:
+    required: true
+
+  # pinctrl-0 / pinctrl-names come from the pinctrl-device.yaml include
+  # and are intentionally NOT required: a board may mux GPIO 18..21 to
+  # ALT0 via pinctrl at init, or leave them unset and mux imperatively
+  # at runtime. See /private/tmp/zephyr_board_config.html.
+
+  dmas:
+    required: true
+    description: |
+      TX and RX DMA channel specifiers. The single dma-cell is the
+      peripheral DREQ number used to pace the transfer: 2 for PCM TX,
+      3 for PCM RX.
+
+  dma-names:
+    required: true
+    description: Must be "tx" and "rx".

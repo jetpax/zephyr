@@ -1,0 +1,34 @@
+# Broadcom BCM2835 I2S / PCM controller
+#
+# Copyright (c) 2026 jetpax
+# SPDX-License-Identifier: Apache-2.0
+
+config I2S_BCM2835
+	bool "Broadcom BCM2835 I2S / PCM controller driver"
+	default y
+	depends on DT_HAS_BRCM_BCM2835_I2S_ENABLED
+	select DMA
+	help
+	  Enable the driver for the BCM2835 / BCM2710 / BCM2837 PCM / I2S
+	  controller -- the audio interface on the Raspberry Pi 40-pin
+	  header. Master mode, I2S (Philips) format, 16-bit stereo;
+	  sample buffers are streamed through the BCM2835 DMA controller,
+	  paced by the PCM TX/RX DREQ lines.
+
+if I2S_BCM2835
+
+config I2S_BCM2835_TX_BLOCK_COUNT
+	int "TX queue length"
+	default 4
+	help
+	  Maximum number of TX buffers that can be queued for
+	  transmission at once.
+
+config I2S_BCM2835_RX_BLOCK_COUNT
+	int "RX queue length"
+	default 4
+	help
+	  Maximum number of RX buffers the driver can hold before the
+	  application reads them.
+
+endif # I2S_BCM2835

@@ -230,6 +230,31 @@
 		};
 
 		/*
+		 * PCM / I2S audio interface on the 40-pin header (GPIO
+		 * 18..21, ALT0). DMA-paced: sample buffers stream through
+		 * the BCM2835 DMA controller, PCM TX = DREQ 2, RX = DREQ 3.
+		 * Default disabled; a board or test overlay opts in -- and
+		 * must also enable &dma, which the dmas phandles reference.
+		 *
+		 * In master mode the bit clock comes from the SoC clock
+		 * manager's PCM clock; the driver programs that divider
+		 * directly, so there is no clocks phandle here. The
+		 * interrupts entry is the PCM peripheral's own TXW/RXR/
+		 * error line -- declared as a hardware fact; the current
+		 * polled-DMA driver does not connect it.
+		 */
+		i2s: i2s@3f203000 {
+			compatible = "brcm,bcm2835-i2s";
+			reg = <0x3f203000 0x24>;
+			interrupts = <BCM2835_IRQ_PCM IRQ_TYPE_LEVEL 0>;
+			dmas = <&dma 2>, <&dma 3>;
+			dma-names = "tx", "rx";
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		/*
 		 * SPI0 -- the "main" SPI controller on the 40-pin header
 		 * (GPIO 7..11, ALT0). Default disabled; board overlays
 		 * opt in and add cs-gpios plus a pinctrl group.

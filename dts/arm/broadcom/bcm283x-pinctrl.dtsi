@@ -125,4 +125,18 @@
 				 <SPI0_SCLK_GPIO11>;
 		};
 	};
+
+	/* PCM / I2S full bus on GPIO 18..21 (ALT0): PCM_CLK, PCM_FS,
+	 * PCM_DIN, PCM_DOUT -- the I2S pin group on the 40-pin header.
+	 * A TX-only board (no capture) can define a 3-pin group omitting
+	 * PCM_DIN in its overlay.
+	 */
+	i2s_gpio18: i2s-gpio18 {
+		group1 {
+			pinmux = <PCM_CLK_GPIO18>,
+				 <PCM_FS_GPIO19>,
+				 <PCM_DIN_GPIO20>,
+				 <PCM_DOUT_GPIO21>;
+		};
+	};
 };
