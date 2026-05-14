@@ -87,17 +87,36 @@ LOG_MODULE_REGISTER(dma_bcm2835, CONFIG_DMA_LOG_LEVEL);
 #define TI_SRC_DREQ  BIT(10)
 #define TI_PERMAP(x) (((x) & 0x1fU) << 16)
 
-/* SDRAM is visible to the VideoCore-bus DMA master at the 0xC0000000
- * alias (VC L2 disabled). ARM memory is identity-mapped (VA == PA) on
- * this SoC, so OR-ing the alias onto an ARM address yields the bus
- * address. Valid for the SDRAM range (ARM physical < 0x40000000) --
- * which covers the whole 512 MiB of a Pi Zero 2 W. Confirmed against
- * soc/brcm/bcm2710/mmu_regions.c.
+/* The DMA engine is a VideoCore-bus master and does not see ARM-physical
+ * addresses directly. Two ranges matter:
+ *
+ *   - SDRAM appears at the 0xC0000000 alias (VC L2 disabled -- the
+ *     correct alias when the ARM manages its own caches). ARM memory is
+ *     identity-mapped (VA == PA) on this SoC, so OR-ing the alias onto
+ *     an ARM address yields the bus address.
+ *
+ *   - The peripheral block lives at ARM-physical 0x3F000000..0x3FFFFFFF
+ *     but is reached by the DMA master at the 0x7E000000 VideoCore
+ *     peripheral window. A peripheral DREQ transfer (an I2S / SPI FIFO
+ *     <-> memory copy) hands the driver an ARM peripheral address that
+ *     must be re-based here -- OR-ing the SDRAM alias onto it would
+ *     point the engine at bogus SDRAM.
+ *
+ * Confirmed against soc/brcm/bcm2710/mmu_regions.c and the BCM2835 ARM
+ * Peripherals datasheet ch. 1.2.1 (ARM physical / VC bus address map).
  */
-#define DMA_BUS_ALIAS 0xC0000000U
+#define DMA_BUS_ALIAS   0xC0000000U
+#define DMA_PERIPH_ARM  0x3F000000U
+#define DMA_PERIPH_BUS  0x7E000000U
+#define DMA_PERIPH_SIZE 0x01000000U
 
 static inline uint32_t dma_bcm2835_bus_addr(uintptr_t arm_addr)
 {
+	if (arm_addr >= DMA_PERIPH_ARM &&
+	    arm_addr < DMA_PERIPH_ARM + DMA_PERIPH_SIZE) {
+		return (uint32_t)(arm_addr - DMA_PERIPH_ARM) | DMA_PERIPH_BUS;
+	}
+
 	return (uint32_t)arm_addr | DMA_BUS_ALIAS;
 }
 
