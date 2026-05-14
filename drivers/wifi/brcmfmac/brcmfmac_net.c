@@ -94,7 +94,7 @@ int brcmfmac_iface_send(const struct device *dev, struct net_pkt *pkt)
 	}
 
 	const uint8_t *l2 = tx_buf + hdr_len;
-	LOG_INF("TX  len=%zu  dst=%02x:%02x:%02x:%02x:%02x:%02x  type=0x%02x%02x",
+	LOG_DBG("TX  len=%zu  dst=%02x:%02x:%02x:%02x:%02x:%02x  type=0x%02x%02x",
 		pkt_len,
 		l2[0], l2[1], l2[2], l2[3], l2[4], l2[5],
 		l2[12], l2[13]);
@@ -149,7 +149,7 @@ void brcmfmac_net_rx_data(struct brcmfmac_data *data,
 		return;
 	}
 
-	LOG_INF("RX  len=%u  src=%02x:%02x:%02x:%02x:%02x:%02x  type=0x%02x%02x",
+	LOG_DBG("RX  len=%u  src=%02x:%02x:%02x:%02x:%02x:%02x  type=0x%02x%02x",
 		l2_len,
 		l2[6], l2[7], l2[8], l2[9], l2[10], l2[11],
 		l2[12], l2[13]);
@@ -236,7 +236,7 @@ static void brcmfmac_handle_escan_event(struct brcmfmac_data *data,
 
 		data->scan_cb(data->iface, 0, &entry);
 	} else if (status == BRCMF_E_STATUS_SUCCESS) {
-		LOG_INF("escan complete");
+		LOG_DBG("escan complete");
 		data->scan_cb(data->iface, 0, NULL);
 		data->scan_cb = NULL;
 	} else {
@@ -284,7 +284,7 @@ void brcmfmac_net_rx_event(struct brcmfmac_data *data,
 		break;
 
 	case WLC_E_AUTH:
-		LOG_INF("WLC_E_AUTH  status=%u reason=%u", status, reason);
+		LOG_DBG("WLC_E_AUTH  status=%u reason=%u", status, reason);
 		if (status != BRCMF_E_STATUS_SUCCESS) {
 			data->link_state = BRCMFMAC_LINK_DOWN;
 			wifi_mgmt_raise_connect_result_event(data->iface, -EIO);
@@ -294,7 +294,7 @@ void brcmfmac_net_rx_event(struct brcmfmac_data *data,
 		break;
 
 	case WLC_E_ASSOC:
-		LOG_INF("WLC_E_ASSOC status=%u reason=%u", status, reason);
+		LOG_DBG("WLC_E_ASSOC status=%u reason=%u", status, reason);
 		if (status != BRCMF_E_STATUS_SUCCESS) {
 			data->link_state = BRCMFMAC_LINK_DOWN;
 			wifi_mgmt_raise_connect_result_event(data->iface, -EIO);
@@ -304,22 +304,17 @@ void brcmfmac_net_rx_event(struct brcmfmac_data *data,
 	case WLC_E_LINK:
 		if (status == BRCMF_E_STATUS_SUCCESS &&
 		    (ev_flags & BRCMF_EVENT_MSG_LINK)) {
-			LOG_INF("WLC_E_LINK UP (admin_up=%d oper=%d)",
-				net_if_is_admin_up(data->iface),
-				net_if_oper_state(data->iface));
+			LOG_INF("link UP");
 			data->link_state = BRCMFMAC_LINK_UP;
 			if (data->iface != NULL) {
 				net_if_dormant_off(data->iface);
-				LOG_INF("dormant_off  oper=%d",
-					net_if_oper_state(data->iface));
 #if defined(CONFIG_NET_DHCPV4)
 				net_dhcpv4_restart(data->iface);
-				LOG_INF("net_dhcpv4_restart fired");
 #endif
 			}
 			wifi_mgmt_raise_connect_result_event(data->iface, 0);
 		} else {
-			LOG_INF("WLC_E_LINK DOWN  status=%u reason=%u flags=0x%04x",
+			LOG_INF("link DOWN  status=%u reason=%u flags=0x%04x",
 				status, reason, ev_flags);
 			data->link_state = BRCMFMAC_LINK_DOWN;
 			if (data->iface != NULL) {
@@ -329,7 +324,7 @@ void brcmfmac_net_rx_event(struct brcmfmac_data *data,
 		break;
 
 	case WLC_E_DISASSOC_IND:
-		LOG_INF("WLC_E_DISASSOC_IND  reason=%u", reason);
+		LOG_DBG("WLC_E_DISASSOC_IND  reason=%u", reason);
 		data->link_state = BRCMFMAC_LINK_DOWN;
 		if (data->iface != NULL) {
 			net_if_dormant_on(data->iface);
@@ -338,7 +333,7 @@ void brcmfmac_net_rx_event(struct brcmfmac_data *data,
 		break;
 
 	case WLC_E_SET_SSID:
-		LOG_INF("WLC_E_SET_SSID  status=%u (join %s)",
+		LOG_DBG("WLC_E_SET_SSID  status=%u (join %s)",
 			status,
 			status == BRCMF_E_STATUS_SUCCESS ? "ok" : "failed");
 		if (status != BRCMF_E_STATUS_SUCCESS) {
@@ -350,16 +345,15 @@ void brcmfmac_net_rx_event(struct brcmfmac_data *data,
 	case WLC_E_PSK_SUP:
 		/* PSK_SUP uses its own status-code namespace (WLC_SUP_*),
 		 * NOT the generic BRCMF_E_STATUS_*. status=6 = WLC_SUP_KEYED
-		 * (pairwise key installed -- success); 0 = DISCONNECTED, 1 =
-		 * CONNECTING. Log raw value; interpretation is event-specific.
+		 * (pairwise key installed -- success).
 		 */
-		LOG_INF("WLC_E_PSK_SUP  status=%u reason=%u  (6=KEYED)",
+		LOG_DBG("WLC_E_PSK_SUP  status=%u reason=%u  (6=KEYED)",
 			status, reason);
 		break;
 
 	case WLC_E_DEAUTH:
 	case WLC_E_DEAUTH_IND:
-		LOG_INF("WLC_E_DEAUTH%s  reason=%u",
+		LOG_DBG("WLC_E_DEAUTH%s  reason=%u",
 			event_type == WLC_E_DEAUTH_IND ? "_IND" : "", reason);
 		break;
 
@@ -368,7 +362,7 @@ void brcmfmac_net_rx_event(struct brcmfmac_data *data,
 		break;
 
 	default:
-		LOG_INF("event %u status=%u reason=%u datalen=%u (no handler)",
+		LOG_DBG("event %u status=%u reason=%u datalen=%u (no handler)",
 			event_type, status, reason, datalen);
 		break;
 	}
@@ -419,7 +413,7 @@ int brcmfmac_mgmt_scan(const struct device *dev, struct net_if *iface,
 		data->scan_cb = NULL;
 		return ret;
 	}
-	LOG_INF("escan started -- results streaming via WLC_E_ESCAN_RESULT");
+	LOG_DBG("escan started -- results streaming via WLC_E_ESCAN_RESULT");
 	return 0;
 }
 
@@ -452,7 +446,7 @@ int brcmfmac_mgmt_connect(const struct device *dev, struct net_if *iface,
 	}
 	if (params->security != WIFI_SECURITY_TYPE_PSK &&
 	    params->security != WIFI_SECURITY_TYPE_PSK_SHA256) {
-		LOG_ERR("connect: only WPA2-PSK supported in 4.5b (got security=%u)",
+		LOG_ERR("connect: only WPA2-PSK supported (got security=%u)",
 			params->security);
 		return -ENOTSUP;
 	}
@@ -466,6 +460,9 @@ int brcmfmac_mgmt_connect(const struct device *dev, struct net_if *iface,
 		params->ssid_length, params->ssid, params->psk_length);
 
 	data->link_state = BRCMFMAC_LINK_AUTHING;
+	memcpy(data->connected_ssid, params->ssid, params->ssid_length);
+	data->connected_ssid_len = params->ssid_length;
+	data->connected_security = params->security;
 
 	/* Sequence mirrors a known-working bare-metal join path for the
 	 * same chip family. Plain WLC commands for infra/auth/wsec (chip
@@ -550,7 +547,7 @@ int brcmfmac_mgmt_connect(const struct device *dev, struct net_if *iface,
 		goto fail;
 	}
 
-	LOG_INF("connect: join fired -- awaiting WLC_E_LINK on chan=1");
+	LOG_DBG("connect: join fired -- awaiting WLC_E_LINK on chan=1");
 	return 0;
 
 fail:
@@ -574,9 +571,56 @@ int brcmfmac_mgmt_disconnect(const struct device *dev, struct net_if *iface)
 	}
 
 	data->link_state = BRCMFMAC_LINK_DOWN;
+	data->connected_ssid_len = 0;
 	if (data->iface != NULL) {
 		net_if_dormant_on(data->iface);
 	}
-	LOG_INF("disconnect: fired -- awaiting WLC_E_DISASSOC_IND on chan=1");
+	LOG_DBG("disconnect: fired -- awaiting WLC_E_DISASSOC_IND on chan=1");
+	return 0;
+}
+
+/* === wifi_mgmt_ops.iface_status ============================================
+ *
+ * Minimal: state + ssid + security from last connect(). Channel/rssi/bssid
+ * would need an extra IOCTL round-trip; punt until a caller needs them.
+ */
+int brcmfmac_mgmt_iface_status(const struct device *dev, struct net_if *iface,
+			       struct wifi_iface_status *status)
+{
+	struct brcmfmac_data *data = dev->data;
+	ARG_UNUSED(iface);
+
+	memset(status, 0, sizeof(*status));
+	status->band = WIFI_FREQ_BAND_2_4_GHZ;
+	status->iface_mode = WIFI_MODE_INFRA;
+	status->link_mode = WIFI_LINK_MODE_UNKNOWN;
+	status->security = data->connected_security;
+	status->mfp = WIFI_MFP_OPTIONAL;
+	status->channel = 0;
+	status->rssi = 0;
+
+	switch (data->link_state) {
+	case BRCMFMAC_LINK_DOWN:
+		status->state = WIFI_STATE_DISCONNECTED;
+		break;
+	case BRCMFMAC_LINK_AUTHING:
+		status->state = WIFI_STATE_AUTHENTICATING;
+		break;
+	case BRCMFMAC_LINK_ASSOCING:
+		status->state = WIFI_STATE_ASSOCIATING;
+		break;
+	case BRCMFMAC_LINK_UP:
+		status->state = WIFI_STATE_COMPLETED;
+		break;
+	}
+
+	if (data->connected_ssid_len > 0 &&
+	    data->connected_ssid_len <= sizeof(status->ssid)) {
+		memcpy(status->ssid, data->connected_ssid,
+		       data->connected_ssid_len);
+		status->ssid_len = data->connected_ssid_len;
+	}
+	memcpy(status->bssid, data->chip_mac, sizeof(status->bssid));
+
 	return 0;
 }

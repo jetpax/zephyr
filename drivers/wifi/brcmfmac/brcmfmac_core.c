@@ -186,65 +186,21 @@ static int brcmfmac_init(const struct device *dev)
 		LOG_ERR("event_msgs set failed: %d", ret);
 		return ret;
 	}
-	LOG_INF("event_msgs set (escan + auth/assoc/link/disassoc/set_ssid)");
+	LOG_DBG("event_msgs set (escan + auth/assoc/link/disassoc/set_ssid)");
 
 	data->probed = true;
-	LOG_INF("Phase 4.5b: bring-up + BCDC + RX thread complete in %lld ms; iface_init pending",
+	LOG_INF("bring-up complete in %lld ms; awaiting iface_init",
 		(long long)(k_uptime_get() - t0));
 	return 0;
 }
 
-#if defined(CONFIG_WIFI_BRCMFMAC_TEST_CONNECT_AT_BOOT)
-/* Phase 4.5b verification scaffold: fire a WPA2-PSK connect ~5 s after
- * boot using the Kconfig-supplied test credentials, log the event flow,
- * and surface the DHCP-assigned IP once the link is up. Disposable --
- * goes away when MP network.WLAN (Phase 4.6) provides a real entry
- * point with credentials sourced from the MP runtime.
- */
-static void brcmfmac_phase45b_connect_work_fn(struct k_work *work)
-{
-	ARG_UNUSED(work);
-	const struct device *dev = DEVICE_DT_INST_GET(0);
-
-	static const uint8_t ssid[]  = CONFIG_WIFI_BRCMFMAC_TEST_SSID;
-	static const uint8_t psk[]   = CONFIG_WIFI_BRCMFMAC_TEST_PSK;
-
-	struct wifi_connect_req_params params = {
-		.ssid          = ssid,
-		.ssid_length   = sizeof(ssid) - 1,    /* strip trailing NUL */
-		.psk           = psk,
-		.psk_length    = sizeof(psk) - 1,
-		.security      = WIFI_SECURITY_TYPE_PSK,
-		.channel       = WIFI_CHANNEL_ANY,
-		.band          = WIFI_FREQ_BAND_2_4_GHZ,
-		.mfp           = WIFI_MFP_OPTIONAL,
-	};
-
-	LOG_INF("phase 4.5b: triggering test connect to \"%s\"",
-		CONFIG_WIFI_BRCMFMAC_TEST_SSID);
-	int ret = brcmfmac_mgmt_connect(dev, NULL, &params);
-	if (ret != 0) {
-		LOG_ERR("phase 4.5b connect failed to start: %d", ret);
-	}
-}
-
-static K_WORK_DELAYABLE_DEFINE(brcmfmac_phase45b_connect_work,
-			       brcmfmac_phase45b_connect_work_fn);
-
-static int brcmfmac_phase45b_arm_test(void)
-{
-	k_work_schedule(&brcmfmac_phase45b_connect_work, K_SECONDS(5));
-	return 0;
-}
-SYS_INIT(brcmfmac_phase45b_arm_test, APPLICATION, 99);
-#endif /* CONFIG_WIFI_BRCMFMAC_TEST_CONNECT_AT_BOOT */
-
 /* === wifi_mgmt + ethernet_api wiring ====================================== */
 
 static const struct wifi_mgmt_ops brcmfmac_mgmt_ops = {
-	.scan       = brcmfmac_mgmt_scan,
-	.connect    = brcmfmac_mgmt_connect,
-	.disconnect = brcmfmac_mgmt_disconnect,
+	.scan         = brcmfmac_mgmt_scan,
+	.connect      = brcmfmac_mgmt_connect,
+	.disconnect   = brcmfmac_mgmt_disconnect,
+	.iface_status = brcmfmac_mgmt_iface_status,
 };
 
 static const struct net_wifi_mgmt_offload brcmfmac_api = {

@@ -370,6 +370,13 @@ struct brcmfmac_data {
 	 */
 	enum brcmfmac_link_state link_state;
 
+	/* Last connect()'s SSID + security, retained so iface_status can
+	 * report something meaningful. Cleared on disconnect.
+	 */
+	uint8_t  connected_ssid[32];
+	uint8_t  connected_ssid_len;
+	uint8_t  connected_security;  /* enum wifi_security_type */
+
 	/* MAC from chip OTP, read via cur_etheraddr IOCTL. */
 	uint8_t chip_mac[6];
 
@@ -454,6 +461,8 @@ int  brcmfmac_mgmt_scan(const struct device *dev, struct net_if *iface,
 int  brcmfmac_mgmt_connect(const struct device *dev, struct net_if *iface,
 			   struct wifi_connect_req_params *params);
 int  brcmfmac_mgmt_disconnect(const struct device *dev, struct net_if *iface);
+int  brcmfmac_mgmt_iface_status(const struct device *dev, struct net_if *iface,
+				struct wifi_iface_status *status);
 
 /* RX-thread dispatchers (called from bcdc.c's RX thread). */
 void brcmfmac_net_rx_data(struct brcmfmac_data *data,
