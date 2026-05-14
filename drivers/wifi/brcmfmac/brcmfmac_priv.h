@@ -101,11 +101,50 @@
 /* Selected WLC command IDs (Linux brcmfmac/fwil.h). */
 #define BRCMFMAC_WLC_UP                 2
 #define BRCMFMAC_WLC_DOWN               3
+#define BRCMFMAC_WLC_SET_INFRA          20
+#define BRCMFMAC_WLC_SET_AUTH           22
+#define BRCMFMAC_WLC_SET_SSID           26
+#define BRCMFMAC_WLC_DISASSOC           52
+#define BRCMFMAC_WLC_SET_WSEC           134
+#define BRCMFMAC_WLC_SET_WPA_AUTH       165
 #define BRCMFMAC_WLC_GET_VAR            262
 #define BRCMFMAC_WLC_SET_VAR            263
+#define BRCMFMAC_WLC_SET_WSEC_PMK       268
 
 /* Event-mask length (Linux BRCMF_EVENTING_MASK_LEN = roundup(160,8)/8). */
 #define BRCMFMAC_EVENTING_MASK_LEN      20
+
+/* WPA2-PSK assoc constants (Linux brcmu_wifi.h). */
+#define WSEC_AES_ENABLED                0x0004
+#define WPA_AUTH_PSK                    0x0004
+#define WPA2_AUTH_PSK                   0x0080
+#define WPA_WPA2_AUTH_PSK_MIXED         (WPA_AUTH_PSK | WPA2_AUTH_PSK)
+
+/* wsec_pmk flags (Linux brcmfmac/fwil_types.h). */
+#define BRCMF_WSEC_PASSPHRASE           0x0001  /* key is passphrase, chip derives PMK */
+#define BRCMF_WSEC_MAX_PSK_LEN          32      /* PMK length when flags=0 */
+#define BRCMF_WSEC_MAX_PASSPHRASE_LEN   64      /* generous upper bound */
+
+struct brcmf_wsec_pmk_le {
+	uint16_t key_len;
+	uint16_t flags;
+	uint8_t  key[64];   /* BRCMF_WSEC_MAX_PASSPHRASE_LEN */
+};
+
+/* Event reason codes (Linux brcmfmac/fweh.h subset). */
+#define BRCMFMAC_E_REASON_LINK_BSSCFG_DIS  4
+#define BRCMFMAC_E_REASON_INITIAL_ASSOC    0
+#define BRCMFMAC_E_REASON_LOW_RSSI         1
+#define BRCMFMAC_E_REASON_DISASSOC         2
+#define BRCMFMAC_E_REASON_DEAUTH           3
+
+/* Internal connect state (driven by chan=1 event arrival). */
+enum brcmfmac_link_state {
+	BRCMFMAC_LINK_DOWN = 0,
+	BRCMFMAC_LINK_AUTHING,
+	BRCMFMAC_LINK_ASSOCING,
+	BRCMFMAC_LINK_UP,
+};
 
 #define BCDC_FLAG_ERROR                 0x01
 #define BCDC_FLAG_SET                   0x02
@@ -184,6 +223,10 @@ struct brcmf_event_msg_be {
 #define WLC_E_ASSOC              7
 #define WLC_E_DISASSOC_IND      12
 #define WLC_E_LINK              16
+#define WLC_E_DEAUTH_IND        33
+#define WLC_E_DEAUTH            34
+#define WLC_E_AUTH_FAIL         42
+#define WLC_E_PSK_SUP           46
 #define WLC_E_ESCAN_RESULT      69
 
 /* Event status codes. */
@@ -322,6 +365,11 @@ struct brcmfmac_data {
 	struct net_if *iface;
 	scan_result_cb_t scan_cb;
 
+	/* Link / assoc state. Updated from the RX thread when WLC_E_LINK /
+	 * WLC_E_DISASSOC_IND arrive.
+	 */
+	enum brcmfmac_link_state link_state;
+
 	/* MAC from chip OTP, read via cur_etheraddr IOCTL. */
 	uint8_t chip_mac[6];
 
@@ -382,6 +430,15 @@ int brcmfmac_bcdc_set_dcmd(struct brcmfmac_data *data, uint32_t cmd,
 int brcmfmac_bcdc_iovar_set(struct brcmfmac_data *data, const char *name,
 			    const uint8_t *value, uint16_t value_len);
 
+/* bsscfg-prefixed iovar SET. The chip recognizes some iovars (sup_wpa,
+ * sup_wpa_tmo, etc.) only when sent in the bsscfg-namespaced form even
+ * for bsscfgidx=0. Wire format:
+ *   WLC_SET_VAR cmd, payload = "bsscfg:NAME\0" + LE32(bsscfgidx) + value
+ */
+int brcmfmac_bcdc_bsscfg_iovar_set_int(struct brcmfmac_data *data,
+				       const char *name, uint32_t bsscfgidx,
+				       int32_t value);
+
 /* Build SDPCM headers in-place at start of `frame`, then F2 TX the
  * (4-byte-padded) frame. Caller must hold bcdc_mutex. Used by both
  * the IOCTL path (chan=0) and the data path (chan=2).
@@ -394,6 +451,9 @@ void brcmfmac_iface_init(struct net_if *iface);
 int  brcmfmac_iface_send(const struct device *dev, struct net_pkt *pkt);
 int  brcmfmac_mgmt_scan(const struct device *dev, struct net_if *iface,
 			struct wifi_scan_params *params, scan_result_cb_t cb);
+int  brcmfmac_mgmt_connect(const struct device *dev, struct net_if *iface,
+			   struct wifi_connect_req_params *params);
+int  brcmfmac_mgmt_disconnect(const struct device *dev, struct net_if *iface);
 
 /* RX-thread dispatchers (called from bcdc.c's RX thread). */
 void brcmfmac_net_rx_data(struct brcmfmac_data *data,

@@ -485,3 +485,38 @@ int brcmfmac_bcdc_iovar_set(struct brcmfmac_data *data, const char *name,
 	return brcmfmac_bcdc_set_dcmd(data, BRCMFMAC_WLC_SET_VAR,
 				      scratch, (uint16_t)(name_len + value_len));
 }
+
+int brcmfmac_bcdc_bsscfg_iovar_set_int(struct brcmfmac_data *data,
+				       const char *name, uint32_t bsscfgidx,
+				       int32_t value)
+{
+	static uint8_t scratch[64] __aligned(4);
+	const char *prefix = "bsscfg:";
+	size_t prefix_len = strlen(prefix);
+	size_t name_len = strlen(name) + 1;     /* include NUL */
+
+	if (prefix_len + name_len + 8 > sizeof(scratch)) {
+		return -EMSGSIZE;
+	}
+
+	uint8_t *p = scratch;
+	memcpy(p, prefix, prefix_len);
+	p += prefix_len;
+	memcpy(p, name, name_len);
+	p += name_len;
+	/* bsscfgidx LE32 */
+	p[0] = (uint8_t)(bsscfgidx & 0xFF);
+	p[1] = (uint8_t)((bsscfgidx >> 8) & 0xFF);
+	p[2] = (uint8_t)((bsscfgidx >> 16) & 0xFF);
+	p[3] = (uint8_t)((bsscfgidx >> 24) & 0xFF);
+	p += 4;
+	/* value LE32 (signed) */
+	uint32_t v = (uint32_t)value;
+	p[0] = (uint8_t)(v & 0xFF);
+	p[1] = (uint8_t)((v >> 8) & 0xFF);
+	p[2] = (uint8_t)((v >> 16) & 0xFF);
+	p[3] = (uint8_t)((v >> 24) & 0xFF);
+
+	uint16_t total = (uint16_t)(prefix_len + name_len + 8);
+	return brcmfmac_bcdc_set_dcmd(data, BRCMFMAC_WLC_SET_VAR, scratch, total);
+}

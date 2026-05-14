@@ -4,10 +4,12 @@
  *
  * Broadcom BCM43xxx SDIO Wi-Fi driver (brcmfmac protocol).
  *
- * Phase 4.5a: net_if registration (ETHERNET_L2) + iface_api.send/recv
- * + wifi_mgmt_ops.scan via the "escan" IOVAR. Iface stays dormant
- * until association lands in 4.5b. Connect/disconnect, event-driven
- * link state, and DHCP integration are 4.5b's job.
+ * Phase 4.5b: WPA2-PSK association + event-driven link state + DHCP
+ * autostart on top of 4.5a's net_if + scan. Connect IOCTL sequence
+ * (mpc/auth/wsec/wpa_auth/wsec_pmk/WLC_SET_SSID) and chan=1 event
+ * parsing (WLC_E_AUTH / ASSOC / LINK / DISASSOC_IND -> wifi_mgmt
+ * raise calls) live in brcmfmac_net.c. On link-up: net_if_dormant_off
+ * + net_dhcpv4_restart drive the iface to UP and acquire an IP.
  */
 
 #define DT_DRV_COMPAT brcm_bcm43xxx_sdio
@@ -15,6 +17,7 @@
 #include <zephyr/device.h>
 #include <zephyr/init.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/net/conn_mgr/connectivity_wifi_mgmt.h>
 #include <zephyr/net/ethernet.h>
 #include <zephyr/net/wifi_mgmt.h>
 #include <zephyr/sd/sd.h>
@@ -147,9 +150,15 @@ static int brcmfmac_init(const struct device *dev)
 	}
 	LOG_INF("WLC_UP ok");
 
-	/* Enable WLC_E_ESCAN_RESULT in the chip's event mask, otherwise
-	 * scan results never reach chan=1. Read current mask first so we
-	 * don't clobber chip defaults.
+	/* Enable the events we care about in the chip's event mask. Read
+	 * current mask first so we don't clobber chip defaults. Events the
+	 * chip leaves disabled by default but we need:
+	 *   - WLC_E_ESCAN_RESULT  (scan results stream)
+	 *   - WLC_E_AUTH          (auth attempt outcome)
+	 *   - WLC_E_ASSOC         (assoc attempt outcome)
+	 *   - WLC_E_LINK          (link up/down -- triggers dormant_off + DHCP)
+	 *   - WLC_E_DISASSOC_IND  (disconnect notice)
+	 *   - WLC_E_SET_SSID      (echo of WLC_SET_SSID outcome)
 	 */
 	uint8_t event_mask[BRCMFMAC_EVENTING_MASK_LEN] = {0};
 	int em_got = brcmfmac_bcdc_iovar_get(data, "event_msgs",
@@ -158,65 +167,84 @@ static int brcmfmac_init(const struct device *dev)
 		LOG_WRN("event_msgs get returned %d; starting from zero", em_got);
 		memset(event_mask, 0, sizeof(event_mask));
 	}
-	event_mask[WLC_E_ESCAN_RESULT / 8] |= (1u << (WLC_E_ESCAN_RESULT % 8));
+#define ENABLE_EVENT(ev) \
+	(event_mask[(ev) / 8] |= (uint8_t)(1u << ((ev) % 8)))
+	ENABLE_EVENT(WLC_E_ESCAN_RESULT);
+	ENABLE_EVENT(WLC_E_AUTH);
+	ENABLE_EVENT(WLC_E_ASSOC);
+	ENABLE_EVENT(WLC_E_LINK);
+	ENABLE_EVENT(WLC_E_DISASSOC_IND);
+	ENABLE_EVENT(WLC_E_DEAUTH);
+	ENABLE_EVENT(WLC_E_DEAUTH_IND);
+	ENABLE_EVENT(WLC_E_AUTH_FAIL);
+	ENABLE_EVENT(WLC_E_PSK_SUP);
+	ENABLE_EVENT(WLC_E_SET_SSID);
+#undef ENABLE_EVENT
 	ret = brcmfmac_bcdc_iovar_set(data, "event_msgs",
 				      event_mask, sizeof(event_mask));
 	if (ret != 0) {
 		LOG_ERR("event_msgs set failed: %d", ret);
 		return ret;
 	}
-	LOG_INF("event_msgs set (WLC_E_ESCAN_RESULT enabled)");
+	LOG_INF("event_msgs set (escan + auth/assoc/link/disassoc/set_ssid)");
 
 	data->probed = true;
-	LOG_INF("Phase 4.5a: bring-up + BCDC + RX thread complete in %lld ms; iface_init pending",
+	LOG_INF("Phase 4.5b: bring-up + BCDC + RX thread complete in %lld ms; iface_init pending",
 		(long long)(k_uptime_get() - t0));
 	return 0;
 }
 
-/* Phase 4.5a verification scaffold: trigger a single escan a few seconds
- * after boot and log results. Disposable -- goes away when MP
- * network.WLAN (Phase 4.6) provides a real entry point.
+#if defined(CONFIG_WIFI_BRCMFMAC_TEST_CONNECT_AT_BOOT)
+/* Phase 4.5b verification scaffold: fire a WPA2-PSK connect ~5 s after
+ * boot using the Kconfig-supplied test credentials, log the event flow,
+ * and surface the DHCP-assigned IP once the link is up. Disposable --
+ * goes away when MP network.WLAN (Phase 4.6) provides a real entry
+ * point with credentials sourced from the MP runtime.
  */
-static void brcmfmac_phase45a_scan_log_cb(struct net_if *iface, int status,
-					  struct wifi_scan_result *entry)
-{
-	ARG_UNUSED(iface);
-	if (entry == NULL) {
-		LOG_INF("phase 4.5a scan complete (status=%d)", status);
-		return;
-	}
-	LOG_INF("scan: \"%.*s\"  bssid=%02x:%02x:%02x:%02x:%02x:%02x  rssi=%d  ch=%u",
-		entry->ssid_length, entry->ssid,
-		entry->mac[0], entry->mac[1], entry->mac[2],
-		entry->mac[3], entry->mac[4], entry->mac[5],
-		entry->rssi, entry->channel);
-}
-
-static void brcmfmac_phase45a_scan_work_fn(struct k_work *work)
+static void brcmfmac_phase45b_connect_work_fn(struct k_work *work)
 {
 	ARG_UNUSED(work);
 	const struct device *dev = DEVICE_DT_INST_GET(0);
-	LOG_INF("phase 4.5a: triggering test escan");
-	int ret = brcmfmac_mgmt_scan(dev, NULL, NULL, brcmfmac_phase45a_scan_log_cb);
+
+	static const uint8_t ssid[]  = CONFIG_WIFI_BRCMFMAC_TEST_SSID;
+	static const uint8_t psk[]   = CONFIG_WIFI_BRCMFMAC_TEST_PSK;
+
+	struct wifi_connect_req_params params = {
+		.ssid          = ssid,
+		.ssid_length   = sizeof(ssid) - 1,    /* strip trailing NUL */
+		.psk           = psk,
+		.psk_length    = sizeof(psk) - 1,
+		.security      = WIFI_SECURITY_TYPE_PSK,
+		.channel       = WIFI_CHANNEL_ANY,
+		.band          = WIFI_FREQ_BAND_2_4_GHZ,
+		.mfp           = WIFI_MFP_OPTIONAL,
+	};
+
+	LOG_INF("phase 4.5b: triggering test connect to \"%s\"",
+		CONFIG_WIFI_BRCMFMAC_TEST_SSID);
+	int ret = brcmfmac_mgmt_connect(dev, NULL, &params);
 	if (ret != 0) {
-		LOG_ERR("phase 4.5a scan failed to start: %d", ret);
+		LOG_ERR("phase 4.5b connect failed to start: %d", ret);
 	}
 }
 
-static K_WORK_DELAYABLE_DEFINE(brcmfmac_phase45a_scan_work,
-			       brcmfmac_phase45a_scan_work_fn);
+static K_WORK_DELAYABLE_DEFINE(brcmfmac_phase45b_connect_work,
+			       brcmfmac_phase45b_connect_work_fn);
 
-static int brcmfmac_phase45a_arm_test(void)
+static int brcmfmac_phase45b_arm_test(void)
 {
-	k_work_schedule(&brcmfmac_phase45a_scan_work, K_SECONDS(3));
+	k_work_schedule(&brcmfmac_phase45b_connect_work, K_SECONDS(5));
 	return 0;
 }
-SYS_INIT(brcmfmac_phase45a_arm_test, APPLICATION, 99);
+SYS_INIT(brcmfmac_phase45b_arm_test, APPLICATION, 99);
+#endif /* CONFIG_WIFI_BRCMFMAC_TEST_CONNECT_AT_BOOT */
 
 /* === wifi_mgmt + ethernet_api wiring ====================================== */
 
 static const struct wifi_mgmt_ops brcmfmac_mgmt_ops = {
-	.scan = brcmfmac_mgmt_scan,
+	.scan       = brcmfmac_mgmt_scan,
+	.connect    = brcmfmac_mgmt_connect,
+	.disconnect = brcmfmac_mgmt_disconnect,
 };
 
 static const struct net_wifi_mgmt_offload brcmfmac_api = {
@@ -243,3 +271,5 @@ NET_DEVICE_DT_INST_DEFINE(0, brcmfmac_init, NULL,
 			  ETHERNET_L2,
 			  NET_L2_GET_CTX_TYPE(ETHERNET_L2),
 			  NET_ETH_MTU);
+
+CONNECTIVITY_WIFI_MGMT_BIND(Z_DEVICE_DT_DEV_ID(DT_DRV_INST(0)));

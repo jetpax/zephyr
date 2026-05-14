@@ -34,4 +34,24 @@ config WIFI_BRCMFMAC_RX_THREAD_PRIO
 	int "RX thread priority"
 	default 4
 
+config WIFI_BRCMFMAC_TEST_CONNECT_AT_BOOT
+	bool "Auto-connect at boot using test SSID/PSK (Phase 4.5b debug)"
+	default y
+	help
+	  Schedule a one-shot WPA2-PSK association via wifi_mgmt_ops.connect
+	  ~5 seconds after boot, using CONFIG_WIFI_BRCMFMAC_TEST_SSID and
+	  CONFIG_WIFI_BRCMFMAC_TEST_PSK. Verifies the connect path without a
+	  Zephyr shell. Disposable -- drop once MP network.WLAN (Phase 4.6)
+	  provides a real entry point.
+
+config WIFI_BRCMFMAC_TEST_SSID
+	string "Test SSID for auto-connect"
+	depends on WIFI_BRCMFMAC_TEST_CONNECT_AT_BOOT
+	default "Paxnet"
+
+config WIFI_BRCMFMAC_TEST_PSK
+	string "Test passphrase for auto-connect (WPA2-PSK)"
+	depends on WIFI_BRCMFMAC_TEST_CONNECT_AT_BOOT
+	default "rtyu4567"
+
 endif # WIFI_BRCMFMAC
