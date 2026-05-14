@@ -66,3 +66,14 @@
 		status = "okay";
 	};
 };
+
+/*
+ * SPI0 on the 40-pin header. Enabled as a SoC controller — the
+ * controller is a chip fact, so it belongs in the board DTS (layered
+ * board-config model). No pinctrl-0 here: pin muxing is a board /
+ * runtime concern, supplied either by an overlay or a runtime
+ * board-init shim. See /private/tmp/zephyr_board_config.html.
+ */
+&spi0 {
+	status = "okay";
+};
