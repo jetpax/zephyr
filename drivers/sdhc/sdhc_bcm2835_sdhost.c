@@ -216,16 +216,24 @@ static int sdhost_wait_cmd_done(const struct device *dev, int timeout_ms)
 static int sdhost_data_direction(const struct sdhc_command *cmd, bool *is_read)
 {
 	switch (cmd->opcode) {
-	case SD_READ_SINGLE_BLOCK:
-	case SD_READ_MULTIPLE_BLOCK:
-	case SD_APP_SEND_SCR:
+	case SD_READ_SINGLE_BLOCK:		/* CMD17 -- 1 block */
+	case SD_READ_MULTIPLE_BLOCK:		/* CMD18 -- N blocks */
+	case SD_SWITCH:				/* CMD6  -- 64-byte switch status
+						 *          (NB same opcode as
+						 *          ACMD6 SET_BUS_WIDTH
+						 *          which is non-data;
+						 *          this case only fires
+						 *          when data != NULL, so
+						 *          unambiguous) */
+	case SD_APP_SEND_SCR:			/* ACMD51 -- 8-byte SCR */
+	case SD_APP_SEND_NUM_WRITTEN_BLK:	/* ACMD22 -- 4-byte count */
 		*is_read = true;
 		return 0;
-	case SD_WRITE_SINGLE_BLOCK:
-	case SD_WRITE_MULTIPLE_BLOCK:
+	case SD_WRITE_SINGLE_BLOCK:		/* CMD24 -- 1 block */
+	case SD_WRITE_MULTIPLE_BLOCK:		/* CMD25 -- N blocks */
 		*is_read = false;
 		return 0;
-	case SDIO_RW_EXTENDED:
+	case SDIO_RW_EXTENDED:			/* CMD53 -- SDIO multi-byte */
 		*is_read = !(cmd->arg & BIT(SDIO_CMD_ARG_RW_SHIFT));
 		return 0;
 	default:
