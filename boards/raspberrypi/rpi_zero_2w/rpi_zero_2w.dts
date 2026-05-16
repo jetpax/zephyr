@@ -17,8 +17,8 @@
 	#size-cells = <1>;
 
 	chosen {
-		zephyr,console = &uart1;
-		zephyr,shell-uart = &uart1;
+		zephyr,console = &uart0;
+		zephyr,shell-uart = &uart0;
 		zephyr,sram = &sram0;
 		zephyr,entropy = &rng;
 	};
@@ -38,10 +38,20 @@
 	 */
 };
 
-&uart1 {
+&uart0 {
 	pinctrl-names = "default";
-	pinctrl-0 = <&uart1_gpio14>;
-	current-speed = <115200>;
+	pinctrl-0 = <&uart0_gpio14>;
+	/*
+	 * 1 Mbaud. With the default PL011 UART_CLK (48 MHz, from the
+	 * SoC dtsi's clk_uart fixed-clock node) the divisor is exactly 3
+	 * (IBRD=3, FBRD=0), giving 48 MHz / 16 / 3 = 1 MHz on the wire
+	 * with zero error -- no clock-manager fractional precision to
+	 * worry about. 921600 was tried first but the macOS USB-serial
+	 * adapter used here produces ~850 kbps when asked for 921600;
+	 * 1 Mbaud is unambiguous on both sides. Must match the
+	 * init_uart_baud value in install-to-sdcard.sh's config.txt.
+	 */
+	current-speed = <1000000>;
 	status = "okay";
 };
 
