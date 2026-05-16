@@ -207,6 +207,166 @@ static int sdhost_wait_cmd_done(const struct device *dev, int timeout_ms)
 	return 0;
 }
 
+/* ===== Direction inference =========================================
+ * sdhc.h's struct sdhc_data has no direction field. For commands that
+ * carry a data phase, the direction is baked into the opcode (or, for
+ * SDIO CMD53, into arg bit 31). Mirror the Arasan driver's table;
+ * extend as new opcodes need data-phase support.
+ */
+static int sdhost_data_direction(const struct sdhc_command *cmd, bool *is_read)
+{
+	switch (cmd->opcode) {
+	case SD_READ_SINGLE_BLOCK:
+	case SD_READ_MULTIPLE_BLOCK:
+	case SD_APP_SEND_SCR:
+		*is_read = true;
+		return 0;
+	case SD_WRITE_SINGLE_BLOCK:
+	case SD_WRITE_MULTIPLE_BLOCK:
+		*is_read = false;
+		return 0;
+	case SDIO_RW_EXTENDED:
+		*is_read = !(cmd->arg & BIT(SDIO_CMD_ARG_RW_SHIFT));
+		return 0;
+	default:
+		/* Unrecognised data-phase opcode -- refuse rather than
+		 * guess a direction (a wrong direction on a write would
+		 * leave the card holding bytes we never sent). */
+		return -EINVAL;
+	}
+}
+
+/* ===== Polled PIO transfer =========================================
+ * Drains (read) or fills (write) the SDDATA FIFO, one block at a
+ * time, until all data->blocks have moved. Mirrors Linux's
+ * bcm2835_transfer_block_pio at bcm2835.c:327 minus the scatter-
+ * gather dance (Zephyr's sdhc.h gives us a single contiguous
+ * data->data buffer).
+ *
+ * Inner loop reads SDEDM to find the FIFO fill level (bits 9:5). For
+ * a read, "available" is words IN the FIFO; for a write, words FREE
+ * in the FIFO. When the FIFO doesn't have enough words for the next
+ * burst we check FSM is in an active data state -- if not, the
+ * controller errored out, so we surface SDHSTS error bits and bail.
+ * Outer deadline catches the case where a card silently disappears
+ * mid-transfer.
+ *
+ * After the last block: re-read SDHSTS and check for CRC / FIFO /
+ * timeout errors that the inner loop's per-cycle check might have
+ * missed at the trailing edge.
+ */
+static int sdhost_pio_xfer(const struct device *dev, struct sdhc_data *data,
+			   bool is_read)
+{
+	uintptr_t base = DEVICE_MMIO_GET(dev);
+	uint8_t *buf = (uint8_t *)data->data;
+	uint32_t blocks_left = data->blocks;
+	uint32_t words_per_block = data->block_size / 4;
+	int64_t deadline = k_uptime_get() +
+			   (data->timeout_ms ? data->timeout_ms : 500);
+	uint32_t sdhsts;
+
+	if (data->block_size % 4 != 0) {
+		/* Word-paced FIFO; partial-word blocks would need a
+		 * scratch-word read with byte-shift unpacking. SD spec
+		 * blocks are always multiples of 4 so refuse rather than
+		 * carry dead code. */
+		return -EINVAL;
+	}
+
+	while (blocks_left > 0) {
+		uint32_t words_left = words_per_block;
+
+		while (words_left > 0) {
+			uint32_t edm = sys_read32(base + SDEDM);
+			uint32_t fifo_used = (edm >> 4) & 0x1f;
+			uint32_t fifo_ready = is_read ? fifo_used
+						      : (SDDATA_FIFO_WORDS -
+							 fifo_used);
+
+			if (fifo_ready == 0) {
+				uint32_t fsm = edm & SDEDM_FSM_MASK;
+				bool fsm_active = is_read
+					? (fsm == SDEDM_FSM_READDATA ||
+					   fsm == SDEDM_FSM_READWAIT ||
+					   fsm == SDEDM_FSM_READCRC)
+					: (fsm == SDEDM_FSM_WRITEDATA ||
+					   fsm == SDEDM_FSM_WRITESTART1 ||
+					   fsm == SDEDM_FSM_WRITESTART2);
+
+				if (!fsm_active) {
+					sdhsts = sys_read32(base + SDHSTS);
+					if (sdhsts & SDHSTS_ERROR_MASK) {
+						LOG_ERR("PIO %s: sdhsts=0x%08x fsm=0x%x blocks_left=%u words_left=%u",
+							is_read ? "read" : "write",
+							sdhsts, fsm,
+							blocks_left, words_left);
+						sys_write32(sdhsts & SDHSTS_W1C_ALL,
+							    base + SDHSTS);
+						return (sdhsts &
+							(SDHSTS_CMD_TIME_OUT |
+							 SDHSTS_REW_TIME_OUT))
+							       ? -ETIMEDOUT
+							       : -EIO;
+					}
+				}
+
+				if (k_uptime_get() > deadline) {
+					LOG_ERR("PIO %s: timeout edm=0x%08x blocks_left=%u words_left=%u",
+						is_read ? "read" : "write",
+						edm, blocks_left, words_left);
+					return -ETIMEDOUT;
+				}
+				continue;
+			}
+
+			uint32_t do_words = fifo_ready < words_left
+						    ? fifo_ready
+						    : words_left;
+
+			for (uint32_t i = 0; i < do_words; i++) {
+				if (is_read) {
+					uint32_t w = sys_read32(base + SDDATA);
+
+					buf[0] = w & 0xff;
+					buf[1] = (w >> 8) & 0xff;
+					buf[2] = (w >> 16) & 0xff;
+					buf[3] = (w >> 24) & 0xff;
+				} else {
+					uint32_t w =
+						(uint32_t)buf[0] |
+						((uint32_t)buf[1] << 8) |
+						((uint32_t)buf[2] << 16) |
+						((uint32_t)buf[3] << 24);
+
+					sys_write32(w, base + SDDATA);
+				}
+				buf += 4;
+				words_left--;
+			}
+		}
+		blocks_left--;
+	}
+
+	sdhsts = sys_read32(base + SDHSTS);
+	if (sdhsts & (SDHSTS_CRC16_ERROR | SDHSTS_CRC7_ERROR |
+		      SDHSTS_FIFO_ERROR)) {
+		LOG_ERR("PIO %s post-xfer error sdhsts=0x%08x",
+			is_read ? "read" : "write", sdhsts);
+		sys_write32(sdhsts & SDHSTS_W1C_ALL, base + SDHSTS);
+		return -EILSEQ;
+	}
+	if (sdhsts & (SDHSTS_CMD_TIME_OUT | SDHSTS_REW_TIME_OUT)) {
+		LOG_ERR("PIO %s post-xfer timeout sdhsts=0x%08x",
+			is_read ? "read" : "write", sdhsts);
+		sys_write32(sdhsts & SDHSTS_W1C_ALL, base + SDHSTS);
+		return -ETIMEDOUT;
+	}
+
+	data->bytes_xfered = (size_t)data->blocks * data->block_size;
+	return 0;
+}
+
 /* ===== Clock divider math =========================================
  * SDHost bus clock = clk_in / (SDCDIV + 2). To get the largest bus
  * clock <= target_hz we ceil-divide clk_in/target_hz and subtract 2.
@@ -262,18 +422,21 @@ static int sdhc_bcm2835_sdhost_set_io(const struct device *dev,
 						     : SDVDD_POWER_OFF,
 		    base + SDVDD);
 
-	/* Bus width + SLOW_CARD. WIDE_EXT_BUS is the external (slot)
-	 * 4-bit toggle; WIDE_INT_BUS is for the (unused) internal
-	 * variant. SLOW_CARD forces the ident-clock divisor at all
-	 * times -- per Linux: "Disable clever clock switching, to cope
-	 * with fast core clocks". Without it, data-mode uses a coarser
-	 * 3-bit divisor that's wrong above core_freq=250.
+	/* Bus width + SLOW_CARD + WIDE_INT_BUS. WIDE_EXT_BUS is the
+	 * external (slot) 4-bit toggle. WIDE_INT_BUS gates the wide
+	 * internal datapath that feeds the FIFO -- without it set, FIFO
+	 * byte assembly produces sliding-window garbage even on a 1-bit
+	 * read (the bytes never settle into 32-bit words correctly).
+	 * Linux sets it on every set_ios call regardless of external
+	 * bus width; we do the same. SLOW_CARD forces the ident-clock
+	 * divisor at all times per Linux: "Disable clever clock
+	 * switching, to cope with fast core clocks".
 	 */
 	data->hcfg &= ~SDHCFG_WIDE_EXT_BUS;
 	if (ios->bus_width == SDHC_BUS_WIDTH4BIT) {
 		data->hcfg |= SDHCFG_WIDE_EXT_BUS;
 	}
-	data->hcfg |= SDHCFG_SLOW_CARD;
+	data->hcfg |= SDHCFG_WIDE_INT_BUS | SDHCFG_SLOW_CARD;
 	sys_write32(data->hcfg, base + SDHCFG);
 
 	return 0;
@@ -290,12 +453,20 @@ static int sdhc_bcm2835_sdhost_request(const struct device *dev,
 	int cmd_timeout_ms;
 	int ret;
 
+	bool data_is_read = false;
+
 	if (cmd == NULL) {
 		return -EINVAL;
 	}
 	if (data != NULL) {
-		/* PIO data path lands in sub-task D. */
-		return -ENOSYS;
+		if (data->data == NULL || data->blocks == 0 ||
+		    data->block_size == 0) {
+			return -EINVAL;
+		}
+		ret = sdhost_data_direction(cmd, &data_is_read);
+		if (ret != 0) {
+			return ret;
+		}
 	}
 
 	cmd_timeout_ms = cmd->timeout_ms ? cmd->timeout_ms
@@ -356,6 +527,18 @@ static int sdhc_bcm2835_sdhost_request(const struct device *dev,
 		return -EINVAL;
 	}
 
+	/* If this command has a data phase, set the FIFO direction bit
+	 * and program SDHBCT (byte count per block) + SDHBLC (block
+	 * count) before arming the command. The controller uses SDHBLC
+	 * to know when the data transfer is done; without it set, the
+	 * FSM never leaves the DATA state.
+	 */
+	if (data != NULL) {
+		sdcmd |= data_is_read ? SDCMD_READ_CMD : SDCMD_WRITE_CMD;
+		sys_write32(data->block_size, base + SDHBCT);
+		sys_write32(data->blocks, base + SDHBLC);
+	}
+
 	sys_write32(cmd->arg, base + SDARG);
 	sys_write32(sdcmd | SDCMD_NEW_FLAG, base + SDCMD);
 
@@ -397,6 +580,13 @@ static int sdhc_bcm2835_sdhost_request(const struct device *dev,
 			cmd->response[1] = sys_read32(base + SDRSP1);
 			cmd->response[2] = sys_read32(base + SDRSP2);
 			cmd->response[3] = sys_read32(base + SDRSP3);
+		}
+	}
+
+	if (data != NULL) {
+		ret = sdhost_pio_xfer(dev, data, data_is_read);
+		if (ret != 0) {
+			return ret;
 		}
 	}
 
@@ -626,10 +816,106 @@ static void sdhost_selftest(const struct device *dev)
 	}
 	LOG_INF("CMD7 SELECT_CARD: ok (status=0x%08x)", cmd.response[0]);
 
-	/* Bus up to 25 MHz / 4-bit for the next layer. Not strictly
-	 * required for the selftest -- this just exercises the set_io
-	 * path one more time with non-default args.
+	/* CMD17 SD_READ_SINGLE_BLOCK at sector 0 -- read the MBR. For
+	 * SDHC/SDXC cards (CCS=1 from the OCR above) the arg is the
+	 * block index. Pi-boot SD cards always have 0x55/0xAA at
+	 * offset 510/511 -- whether the layout is MBR + FAT partition,
+	 * a "superfloppy" FAT VBR, or a GPT protective MBR.
+	 *
+	 * Run TWICE to cover both bus widths:
+	 *
+	 *   pass 1: 400 kHz / 1-bit (current bus state from CMD0..CMD7).
+	 *     Proves the PIO data path works when host and card bus
+	 *     widths agree.
+	 *
+	 *   pass 2: 25 MHz / 4-bit. Requires sending ACMD6 SET_BUS_WIDTH=4
+	 *     to the card BEFORE switching the host. Without ACMD6, the
+	 *     card stays in 1-bit mode driving DAT0 only while the host
+	 *     reads all 4 lines -- the controller assembles {DAT0,1,1,1}
+	 *     into nibbles, getting valid-looking 0xFE/0xEE/0xFF garbage
+	 *     that even passes the controller's own CRC check (it CRCs
+	 *     what it sees), and the card-side END bit on DAT0 alone
+	 *     never registers as a 4-bit END so the FSM hangs in
+	 *     READDATA forever. Production SD init in subsys/sd handles
+	 *     ACMD6 automatically; the selftest has to mimic that.
 	 */
+	static uint8_t sector_buf[512];
+	struct sdhc_data sd = {
+		.block_addr = 0,
+		.block_size = 512,
+		.blocks = 1,
+		.data = sector_buf,
+		.timeout_ms = 500,
+	};
+	uintptr_t base = DEVICE_MMIO_GET(dev);
+
+	LOG_INF("--- pass 1: CMD17 at 400 kHz / 1-bit ---");
+	LOG_INF("  pre-CMD17:  SDEDM=0x%08x SDHSTS=0x%08x",
+		sys_read32(base + SDEDM), sys_read32(base + SDHSTS));
+
+	memset(sector_buf, 0xa5, sizeof(sector_buf));   /* poison */
+	cmd = (struct sdhc_command){
+		.opcode = SD_READ_SINGLE_BLOCK,
+		.arg = 0,
+		.response_type = SD_RSP_TYPE_R1,
+	};
+	ret = sdhc_bcm2835_sdhost_request(dev, &cmd, &sd);
+	if (ret != 0) {
+		LOG_ERR("CMD17(1-bit) failed: %d", ret);
+		return;
+	}
+	LOG_INF("  post-CMD17: SDEDM=0x%08x SDHSTS=0x%08x  status=0x%08x bytes=%u",
+		sys_read32(base + SDEDM), sys_read32(base + SDHSTS),
+		cmd.response[0], sd.bytes_xfered);
+	LOG_INF("  sec0[0..15]:   %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+		sector_buf[0], sector_buf[1], sector_buf[2], sector_buf[3],
+		sector_buf[4], sector_buf[5], sector_buf[6], sector_buf[7],
+		sector_buf[8], sector_buf[9], sector_buf[10], sector_buf[11],
+		sector_buf[12], sector_buf[13], sector_buf[14], sector_buf[15]);
+	LOG_INF("  sec0[504..511]:%02x %02x %02x %02x %02x %02x %02x %02x  (sig expect ...55 aa)",
+		sector_buf[504], sector_buf[505], sector_buf[506], sector_buf[507],
+		sector_buf[508], sector_buf[509], sector_buf[510], sector_buf[511]);
+	if (sector_buf[510] == 0x55 && sector_buf[511] == 0xaa) {
+		LOG_INF("  MBR signature OK at 1-bit -- PIO data path verified");
+	} else {
+		LOG_ERR("  MBR signature MISMATCH at 1-bit -- driver bug, not bus-width");
+		return;
+	}
+
+	/* CMD55 APP_CMD + ACMD6 SET_BUS_WIDTH(=4): tell the card to
+	 * switch its side to 4-bit. ACMD6 arg bits[1:0] = bus width
+	 * (00=1-bit, 10=4-bit). The card ACKs in R1 and the switch
+	 * takes effect immediately, so the host-side set_io to 4-bit
+	 * must follow without intervening data-mode commands.
+	 *
+	 * Opcode literal 6 because sd_spec.h doesn't ship a named
+	 * SD_APP_SET_BUS_WIDTH constant -- it's an ACMD, distinguished
+	 * from CMD6 (SWITCH_FUNC) by the preceding CMD55.
+	 */
+	LOG_INF("--- pass 2: ACMD6 SET_BUS_WIDTH=4, then CMD17 at 25 MHz / 4-bit ---");
+
+	cmd = (struct sdhc_command){
+		.opcode = SD_APP_CMD,
+		.arg = ((uint32_t)rca) << 16,
+		.response_type = SD_RSP_TYPE_R1,
+	};
+	ret = sdhc_bcm2835_sdhost_request(dev, &cmd, NULL);
+	if (ret != 0) {
+		LOG_ERR("CMD55 APP_CMD failed: %d", ret);
+		return;
+	}
+	cmd = (struct sdhc_command){
+		.opcode = 6,	/* ACMD6 SET_BUS_WIDTH */
+		.arg = 2,	/* 0b10 = 4-bit */
+		.response_type = SD_RSP_TYPE_R1,
+	};
+	ret = sdhc_bcm2835_sdhost_request(dev, &cmd, NULL);
+	if (ret != 0) {
+		LOG_ERR("ACMD6 SET_BUS_WIDTH=4 failed: %d", ret);
+		return;
+	}
+	LOG_INF("ACMD6 SET_BUS_WIDTH=4: ok (status=0x%08x)", cmd.response[0]);
+
 	ios.clock = SD_CLOCK_25MHZ;
 	ios.bus_width = SDHC_BUS_WIDTH4BIT;
 	ret = sdhc_bcm2835_sdhost_set_io(dev, &ios);
@@ -638,6 +924,34 @@ static void sdhost_selftest(const struct device *dev)
 		return;
 	}
 	LOG_INF("set_io: 25 MHz, 4-bit, 3.3V");
+
+	memset(sector_buf, 0x5a, sizeof(sector_buf));   /* different poison */
+	cmd = (struct sdhc_command){
+		.opcode = SD_READ_SINGLE_BLOCK,
+		.arg = 0,
+		.response_type = SD_RSP_TYPE_R1,
+	};
+	ret = sdhc_bcm2835_sdhost_request(dev, &cmd, &sd);
+	if (ret != 0) {
+		LOG_ERR("CMD17(4-bit) failed: %d", ret);
+		return;
+	}
+	LOG_INF("  post-CMD17: SDEDM=0x%08x SDHSTS=0x%08x  status=0x%08x bytes=%u",
+		sys_read32(base + SDEDM), sys_read32(base + SDHSTS),
+		cmd.response[0], sd.bytes_xfered);
+	LOG_INF("  sec0[0..15]:   %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+		sector_buf[0], sector_buf[1], sector_buf[2], sector_buf[3],
+		sector_buf[4], sector_buf[5], sector_buf[6], sector_buf[7],
+		sector_buf[8], sector_buf[9], sector_buf[10], sector_buf[11],
+		sector_buf[12], sector_buf[13], sector_buf[14], sector_buf[15]);
+	LOG_INF("  sec0[504..511]:%02x %02x %02x %02x %02x %02x %02x %02x  (sig expect ...55 aa)",
+		sector_buf[504], sector_buf[505], sector_buf[506], sector_buf[507],
+		sector_buf[508], sector_buf[509], sector_buf[510], sector_buf[511]);
+	if (sector_buf[510] == 0x55 && sector_buf[511] == 0xaa) {
+		LOG_INF("  MBR signature OK at 25 MHz/4-bit -- PIO data path fully verified");
+	} else {
+		LOG_ERR("  MBR signature MISMATCH at 25 MHz/4-bit -- still investigating");
+	}
 
 	LOG_INF("--- selftest complete ---");
 }
