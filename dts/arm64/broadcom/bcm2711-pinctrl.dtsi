@@ -105,4 +105,29 @@
 			bias-pull-up;
 		};
 	};
+
+	/* Legacy SDHost on GPIO 48..53 (ALT0) -- SDCLK / SDCMD / SDDAT0..3
+	 * for the external microSD card slot on Pi 3 / Pi Zero 2 W. The
+	 * Arasan SDHCI controller on the same SoC uses GPIO 34..39 / ALT3
+	 * for the on-module CYW43439 wireless chip (emmc_gpio34 above);
+	 * both controllers coexist.
+	 *
+	 * Bias matches the SDIO pin idle requirements (and Linux's
+	 * sdhost_gpio48 group): CLK actively driven with no pull, CMD and
+	 * DAT0..3 pulled up so they idle high between transactions.
+	 */
+	sdhost_gpio48: sdhost-gpio48 {
+		group_clk {
+			pinmux = <SDHOST_CLK_GPIO48>;
+			bias-disable;
+		};
+		group_data {
+			pinmux = <SDHOST_CMD_GPIO49>,
+				 <SDHOST_DAT0_GPIO50>,
+				 <SDHOST_DAT1_GPIO51>,
+				 <SDHOST_DAT2_GPIO52>,
+				 <SDHOST_DAT3_GPIO53>;
+			bias-pull-up;
+		};
+	};
 };

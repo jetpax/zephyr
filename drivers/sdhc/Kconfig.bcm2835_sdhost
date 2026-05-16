@@ -1,0 +1,29 @@
+# Copyright (c) 2026 jetpax
+# SPDX-License-Identifier: Apache-2.0
+
+config BCM2835_SDHOST
+	bool "BCM2835 / BCM2710 / BCM2837 legacy SDHost host controller"
+	default y
+	depends on DT_HAS_BRCM_BCM2835_SDHOST_ENABLED
+	select SDHC_SUPPORTS_NATIVE_MODE
+	help
+	  Enable the Broadcom BCM2835-family legacy SDHost host controller
+	  driver. Drives the external microSD card slot on Pi 3 / Pi Zero
+	  2 W via GPIO 48..53 at ALT0. Polled implementation of the sdhc.h
+	  device API; no IRQ support yet, no DMA yet -- the BCM SDHost
+	  block's small FIFO is drained by the CPU.
+
+if BCM2835_SDHOST
+
+config SDHC_BCM2835_SDHOST_SELFTEST
+	bool "Run a card-init self-test in driver init"
+	default n
+	help
+	  After the driver has reset the controller and configured the bus
+	  to 400 kHz / 1-bit / 3.3 V, fire CMD0..CMD9 through the driver's
+	  own request() path to verify card identification end-to-end
+	  before the SD subsystem mounts the disk. Logs each step; does not
+	  fail init on command errors (the device stays available for later
+	  layers). Used during bring-up; disable in production builds.
+
+endif # BCM2835_SDHOST

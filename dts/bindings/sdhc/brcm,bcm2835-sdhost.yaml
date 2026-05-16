@@ -1,0 +1,44 @@
+# Copyright (c) 2026 jetpax
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Broadcom BCM2835 / BCM2710 / BCM2837 legacy SDHost host controller.
+
+  This is the second, non-Arasan SD controller on the BCM283x SoCs --
+  proprietary Broadcom register layout (SDCMD / SDARG / SDHSTS / SDEDM
+  / SDDATA / SDCDIV at offsets 0x00..0x50), NOT SDHCI-spec. On the Pi
+  3 / Pi Zero 2 W it drives the external microSD card slot via GPIO
+  48..53 at ALT0. The other SD controller on these SoCs is the Arasan
+  SDHCI block (brcm,bcm2835-sdhci) which serves the on-module CYW43439
+  wireless chip via GPIO 34..39 at ALT3 -- the two controllers coexist
+  on the same SoC and the same board.
+
+compatible: "brcm,bcm2835-sdhost"
+
+include: [sdhc.yaml, pinctrl-device.yaml]
+
+properties:
+  reg:
+    required: true
+
+  interrupts:
+    required: true
+
+  clock-frequency:
+    type: int
+    required: true
+    description: |
+      Frequency in Hz of the VPU core clock that feeds the SDHost
+      reference. The driver scales this down to the bus SD clock via
+      the SDCDIV register. Typical 250 MHz on Pi Zero 2 W with
+      core_freq=250 in config.txt.
+
+  bus-width:
+    type: int
+    default: 4
+    enum:
+      - 1
+      - 4
+    description: |
+      Number of data lines wired between the controller and the SD
+      card. 4-bit is standard for the microSD slot on the Pi family.

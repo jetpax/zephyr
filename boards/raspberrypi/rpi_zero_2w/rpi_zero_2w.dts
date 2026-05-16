@@ -26,9 +26,14 @@
 	/* sdhc0 alias: used by Zephyr's SDIO subsystem consumers
 	 * (subsys/sd/sdio.c via tests/subsys/sd/sdio/) and by the
 	 * BCM43430A1 bring-up shim in the MicroPython port.
+	 *
+	 * sdhc1 alias: the legacy SDHost controller driving the external
+	 * microSD card slot; mounted at /sd from the MicroPython REPL via
+	 * `vfs.mount(zephyr.DiskAccess("SD"), "/sd")`.
 	 */
 	aliases {
 		sdhc0 = &emmc;
+		sdhc1 = &sdhost;
 	};
 
 	/*
@@ -86,4 +91,29 @@
  */
 &spi0 {
 	status = "okay";
+};
+
+/*
+ * Legacy SDHost controller -> external microSD card slot. The slot is
+ * a board-level fact (it's on the Pi Zero 2 W PCB, GPIO 48..53 ALT0
+ * routing is fixed), so the enablement + pinctrl + sdmmc-disk child
+ * live in the board DTS rather than in an application overlay.
+ *
+ * The sdmmc child is a zephyr,sdmmc-disk node that the SD subsystem
+ * (drivers/disk/sdmmc_subsys.c) consumes to register a disk_access
+ * disk named "SD". From MicroPython that becomes /sd via
+ * `vfs.mount(zephyr.DiskAccess("SD"), "/sd")`. The disk_access
+ * registration only actually fires when CONFIG_DISK_DRIVER_SDMMC=y +
+ * CONFIG_SDMMC_STACK=y in the application config; the DT node is
+ * harmless when those are off.
+ */
+&sdhost {
+	pinctrl-names = "default";
+	pinctrl-0 = <&sdhost_gpio48>;
+	status = "okay";
+
+	sdmmc {
+		compatible = "zephyr,sdmmc-disk";
+		disk-name = "SD";
+	};
 };

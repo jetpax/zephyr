@@ -199,4 +199,18 @@
  */
 #define GPCLK2_GPIO43     BCM2711_PINMUX(43, BCM2711_FSEL_ALT0)
 
+/* SDHost pinmux. The legacy SDHost controller (sdhost@7e202000 in the
+ * Linux DT; brcm,bcm2835-sdhost) routes to GPIO 48..53 via ALT0 on the
+ * BCM283x family -- SDCLK / SDCMD / SDDAT0..3. On Pi 3 / Pi Zero 2 W
+ * this is the external microSD card slot. The Arasan SDHCI block on
+ * the same SoC uses GPIO 34..39 / ALT3 for the on-module wireless
+ * chip; the two SD controllers coexist on the same board.
+ */
+#define SDHOST_CLK_GPIO48   BCM2711_PINMUX(48, BCM2711_FSEL_ALT0)
+#define SDHOST_CMD_GPIO49   BCM2711_PINMUX(49, BCM2711_FSEL_ALT0)
+#define SDHOST_DAT0_GPIO50  BCM2711_PINMUX(50, BCM2711_FSEL_ALT0)
+#define SDHOST_DAT1_GPIO51  BCM2711_PINMUX(51, BCM2711_FSEL_ALT0)
+#define SDHOST_DAT2_GPIO52  BCM2711_PINMUX(52, BCM2711_FSEL_ALT0)
+#define SDHOST_DAT3_GPIO53  BCM2711_PINMUX(53, BCM2711_FSEL_ALT0)
+
 #endif /* ZEPHYR_INCLUDE_DT_BINDINGS_PINCTRL_BCM2711_PINCTRL_H_ */
