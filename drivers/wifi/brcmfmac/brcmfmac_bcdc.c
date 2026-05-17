@@ -30,7 +30,22 @@
 
 LOG_MODULE_DECLARE(brcmfmac, CONFIG_WIFI_LOG_LEVEL);
 
-#define BRCMFMAC_BCDC_RX_BUF       512
+/* RX buffer for the two-phase CMD53 read in `brcmfmac_rx_thread_fn`.
+ * Must hold the largest SDPCM frame the chip will deliver in a single
+ * F2 FIFO read. Empirically (2026-05-16) we've seen ~4.4 KB aggregated
+ * frames during a TCP-fed bulk upload; SDPCM headers, BDC headers,
+ * Ethernet header, and any A-MSDU framing push the worst case above
+ * what we initially predicted. 8192 covers everything observed in
+ * practice with comfortable slack. If `fh->len > sizeof(rx_buf)` ever
+ * trips again, the right move is dynamic net_pkt allocation rather
+ * than another static bump.
+ *
+ * History: was 512 → truncated frames >~470 B, surfaced as TCP
+ * checksum drops upstream. Bumped to 2048 → exposed CMD53 overread
+ * DATA_CRC (parking-lot item 10) which forced the two-phase split.
+ * Then sized to 8192 here to absorb chip-side aggregation.
+ */
+#define BRCMFMAC_BCDC_RX_BUF       8192
 #define BRCMFMAC_BCDC_TIMEOUT_MS  2000
 #define BRCMFMAC_RX_IDLE_SLEEP_MS    1
 
@@ -99,8 +114,30 @@ static void brcmfmac_rx_thread_fn(void *p1, void *p2, void *p3)
 	LOG_INF("rx thread started");
 
 	while (1) {
+		/* Phase 1: read one block to learn the frame size.
+		 *
+		 * The CYW43439 F2 FIFO only yields the bytes it actually has
+		 * queued. A multi-block CMD53 that requests more blocks than
+		 * the chip has buffered comes back with a DATA_CRC error from
+		 * the SDHCI controller — the chip stops driving the bus before
+		 * the requested block count is satisfied. So we can't issue a
+		 * speculative max-MTU read up front; we have to size each
+		 * transfer to what's actually available.
+		 *
+		 * The first block always contains the SDPCM frame header at
+		 * offset 0 (fh->len + fh->notlen XOR check). Once we have
+		 * that, fh->len tells us the total frame size — including
+		 * the bytes we already read in this first block. If more
+		 * blocks are needed, phase 2 reads them in a single follow-up
+		 * CMD53 sized to the exact remaining block count.
+		 *
+		 * Linux brcmfmac avoids the second CMD53 by carrying
+		 * sw->nextlen forward as a hint for the *next* frame's first
+		 * read. That optimisation is parked (see project memory
+		 * `project_rpi_zero_2w_parking_lot.md` item 9).
+		 */
 		int ret = sdio_read_addr(&data->radio, BRCMFMAC_F2_FIFO_ADDR,
-					 rx_buf, sizeof(rx_buf));
+					 rx_buf, BRCMFMAC_F2_BLOCK_SIZE);
 		if (ret != 0) {
 			LOG_DBG("rx thread: F2 read failed: %d", ret);
 			k_msleep(BRCMFMAC_RX_IDLE_SLEEP_MS);
@@ -123,6 +160,58 @@ static void brcmfmac_rx_thread_fn(void *p1, void *p2, void *p3)
 			LOG_DBG("rx thread: short frame (len=%u)", fh->len);
 			k_msleep(BRCMFMAC_RX_IDLE_SLEEP_MS);
 			continue;
+		}
+
+		/* Phase 2: if the frame spans more than one block, read the
+		 * remaining blocks in a single follow-up CMD53. fh->len is
+		 * total frame length; we already have the first
+		 * BRCMFMAC_F2_BLOCK_SIZE bytes. Round up to the next block. */
+		if (fh->len > BRCMFMAC_F2_BLOCK_SIZE) {
+			uint16_t remaining = fh->len - BRCMFMAC_F2_BLOCK_SIZE;
+			uint16_t extra_blocks =
+				(remaining + BRCMFMAC_F2_BLOCK_SIZE - 1) /
+				BRCMFMAC_F2_BLOCK_SIZE;
+			size_t extra_bytes = (size_t)extra_blocks *
+					     BRCMFMAC_F2_BLOCK_SIZE;
+			if (BRCMFMAC_F2_BLOCK_SIZE + extra_bytes >
+			    sizeof(rx_buf)) {
+				/* Frame too big for rx_buf. Drain the rest of
+				 * the frame from the FIFO in rx_buf-sized
+				 * chunks so the next read starts on a clean
+				 * frame boundary — otherwise we'd interpret
+				 * mid-frame bytes as a new SDPCM header and
+				 * either crash or feed garbage upstream.
+				 */
+				LOG_WRN("rx: frame too big (len=%u, max=%zu) — draining",
+					fh->len, sizeof(rx_buf));
+				size_t to_drain = extra_bytes;
+				while (to_drain > 0) {
+					size_t chunk = to_drain < sizeof(rx_buf)
+						       ? to_drain
+						       : sizeof(rx_buf);
+					int dret = sdio_read_addr(
+						&data->radio,
+						BRCMFMAC_F2_FIFO_ADDR,
+						rx_buf, chunk);
+					if (dret != 0) {
+						LOG_WRN("rx: drain read failed (%d) — FIFO desynced",
+							dret);
+						break;
+					}
+					to_drain -= chunk;
+				}
+				continue;
+			}
+			ret = sdio_read_addr(&data->radio,
+					     BRCMFMAC_F2_FIFO_ADDR,
+					     rx_buf + BRCMFMAC_F2_BLOCK_SIZE,
+					     extra_bytes);
+			if (ret != 0) {
+				LOG_WRN("rx: phase-2 read failed (len=%u, ret=%d)",
+					fh->len, ret);
+				k_msleep(BRCMFMAC_RX_IDLE_SLEEP_MS);
+				continue;
+			}
 		}
 
 		switch (sw->chan) {
