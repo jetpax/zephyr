@@ -317,6 +317,15 @@
 			 */
 			clock-frequency = <DT_FREQ_M(200)>;
 			bus-width = <4>;
+			/* DREQ 11 = Arasan SDHCI BUFFER FIFO (per BCM2835 ARM
+			 * Peripherals datasheet ch. 4 DMA controller, and
+			 * Linux's bcm270x.dtsi). The controller's own DMA
+			 * caps register reads zero on this silicon (no SDMA
+			 * / ADMA2); data path runs through the external DMA
+			 * engine PIO-style via DREQ-paced FIFO accesses.
+			 * Board overlay must also enable &dma. */
+			dmas = <&dma 11>;
+			dma-names = "rx-tx";
 			status = "disabled";
 		};
 	};

@@ -46,6 +46,24 @@ properties:
       attached card / chip. The Arasan core does not support 8-bit;
       4-bit is required for the CYW43439 wireless module.
 
+  dmas:
+    required: true
+    description: |
+      Single DMA channel specifier for the controller's data phase.
+      The Arasan core's built-in DMA (SDMA / ADMA2) is not usable on
+      this silicon (CAPABILITIES register reads zero); instead the
+      external BCM2835 DMA engine drains/fills the BUFFER FIFO via
+      a DREQ. The single dma-cell is that DREQ number — 11 for the
+      Arasan SDHCI per the BCM2835 ARM Peripherals datasheet.
+
+  dma-names:
+    required: true
+    description: |
+      Must be "rx-tx" — a single shared channel is reconfigured for
+      each direction at request() time rather than holding two
+      channels open simultaneously (only one transfer is ever in
+      flight on this controller).
+
   wifi-reg-on-gpios:
     type: phandle-array
     description: |

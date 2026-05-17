@@ -83,6 +83,17 @@
 };
 
 /*
+ * Enable the BCM2835 DMA controller — the Arasan SDHCI driver above
+ * uses it (DREQ 11) for its data phase, replacing what would otherwise
+ * be a CPU-burning polled-PIO FIFO loop. Board-level rather than SoC-
+ * level enablement because other boards may want a different mix of
+ * DMA-using peripherals.
+ */
+&dma {
+	status = "okay";
+};
+
+/*
  * SPI0 on the 40-pin header. Enabled as a SoC controller — the
  * controller is a chip fact, so it belongs in the board DTS (layered
  * board-config model). No pinctrl-0 here: pin muxing is a board /

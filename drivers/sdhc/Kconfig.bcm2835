@@ -6,11 +6,19 @@ config BCM2835_SDHC
 	default y
 	depends on DT_HAS_BRCM_BCM2835_SDHCI_ENABLED
 	select SDHC_SUPPORTS_NATIVE_MODE
+	# Data path is driven by the external BCM2835 DMA engine via DREQ
+	# (the Arasan core's CAPABILITIES register reads zero on this silicon
+	# so SDMA / ADMA2 are not available). DMA pulls in CACHE_MANAGEMENT
+	# for buffer flush/invalidate around transfers (see
+	# feedback_zephyr_sys_cache_needs_cache_management).
+	select DMA
+	select CACHE_MANAGEMENT
 	help
 	  Enable the Broadcom BCM2835-family Arasan SDHCI host controller
 	  driver. Drives the EMMC port that's wired to the BCM43430A1
-	  wireless chip on Pi 3 / Pi Zero 2 W. Polled implementation of
-	  the sdhc.h device API; no IRQ support yet, R1b deferred.
+	  wireless chip on Pi 3 / Pi Zero 2 W. Polled control path (no IRQ
+	  yet); data phase moves bytes through the external BCM2835 DMA
+	  engine via DREQ 11. R1b/R5b deferred.
 
 if BCM2835_SDHC
 

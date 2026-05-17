@@ -61,8 +61,11 @@
 #include <zephyr/init.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/cache.h>
+#include <zephyr/drivers/dma.h>
 #include <zephyr/arch/arm64/arm_mem.h>
 #include <zephyr/sd/sd_spec.h>
+#include <string.h>
 
 LOG_MODULE_REGISTER(sdhc_bcm2835, CONFIG_SDHC_LOG_LEVEL);
 
@@ -187,13 +190,24 @@ struct sdhc_bcm2835_config {
 	DEVICE_MMIO_ROM;
 	const struct pinctrl_dev_config *pincfg;
 	struct gpio_dt_spec wifi_reg_on;	/* CYW43439 WL_REG_ON */
+	const struct device *dma_dev;
 	uint32_t clock_freq;
+	uint32_t fifo_phys;	/* ARM-phys addr of SDHCI BUFFER (base + 0x20) */
+	uint32_t dma_dreq;	/* DREQ slot programmed into the DMA channel */
 	uint8_t bus_width;
 };
 
 struct sdhc_bcm2835_data {
 	DEVICE_MMIO_RAM;
 	struct sdhc_io host_io;
+	/* External DMA engine state. One channel acquired at init and
+	 * reconfigured per-transfer for direction; only one transfer is
+	 * ever in flight on this controller so no per-direction split. */
+	uint32_t dma_channel;
+	struct k_sem dma_done;
+	int dma_status;		/* set by callback; 0 = success */
+	struct dma_block_config dma_block;
+	struct dma_config dma_cfg;
 };
 
 /* Forward decl: error recovery in request() needs to reset the cmd line. */
@@ -342,137 +356,118 @@ static int sdhc_bcm2835_build_cmd(const struct sdhc_command *cmd,
 	return 0;
 }
 
-/* Per-block PIO transfer. Linux's sdhci_{read,write}_block_pio
- * collapses to this once you strip the sg_miter scatter-gather:
- * read 1 word from BUFFER (or write 1 word to BUFFER), assembling
- * bytes into / from the caller's buffer. Tail bytes < 4 share the
- * same scratch word -- a partial-word read still costs one full
- * BUFFER read, the controller delivers the FIFO contents word-aligned.
- *
- * Loop invariant: when this returns, exactly one block has moved.
- * The caller polls INT_STATUS for BUFFER_*_READY between blocks
- * (and DATA_END after the last one).
- */
-static void sdhc_bcm2835_pio_xfer_one_block(uintptr_t base, uint8_t **bufp,
-					    size_t blksize, bool is_read)
+/* External DMA completion. The Zephyr DMA core invokes this from an ISR
+ * context after the BCM2835 DMA engine raises its per-channel done bit.
+ * Just stash status + wake the request thread; the SDHCI side has its
+ * own DATA_END to wait on separately. */
+static void sdhc_bcm2835_dma_cb(const struct device *dma_dev, void *user_data,
+				uint32_t channel, int status)
 {
-	uint8_t *buf = *bufp;
-	uint32_t scratch;
+	struct sdhc_bcm2835_data *drvdata = user_data;
 
-	while (blksize >= 4) {
-		if (is_read) {
-			scratch = sys_read32(base + SDHCI_BUFFER);
-			buf[0] = scratch & 0xFF;
-			buf[1] = (scratch >> 8) & 0xFF;
-			buf[2] = (scratch >> 16) & 0xFF;
-			buf[3] = (scratch >> 24) & 0xFF;
-		} else {
-			scratch = (uint32_t)buf[0] |
-				  ((uint32_t)buf[1] << 8) |
-				  ((uint32_t)buf[2] << 16) |
-				  ((uint32_t)buf[3] << 24);
-			sys_write32(scratch, base + SDHCI_BUFFER);
-		}
-		buf += 4;
-		blksize -= 4;
-	}
-
-	if (blksize > 0) {
-		if (is_read) {
-			scratch = sys_read32(base + SDHCI_BUFFER);
-			while (blksize > 0) {
-				*buf++ = scratch & 0xFF;
-				scratch >>= 8;
-				blksize--;
-			}
-		} else {
-			scratch = 0;
-			unsigned int shift = 0;
-
-			while (blksize > 0) {
-				scratch |= (uint32_t)*buf << shift;
-				shift += 8;
-				buf++;
-				blksize--;
-			}
-			sys_write32(scratch, base + SDHCI_BUFFER);
-		}
-	}
-
-	*bufp = buf;
+	ARG_UNUSED(dma_dev);
+	ARG_UNUSED(channel);
+	drvdata->dma_status = status;
+	k_sem_give(&drvdata->dma_done);
 }
 
-/* Drive the data phase to completion: poll for BUFFER_*_READY, transfer
- * one block, ack, repeat. After the last block the controller asserts
- * DATA_END; we ack and return.
+/* Arm the external DMA engine to drain (RX) or fill (TX) the SDHCI
+ * BUFFER FIFO. Must be called BEFORE the command is fired -- otherwise
+ * the controller's FIFO can fill on a multi-KB read while DMA is still
+ * being configured, stalling the data phase or worse losing data.
+ *
+ * The controller itself is NOT told it's doing DMA (TRANSFER_MODE.DMA_EN
+ * stays zero); from its perspective the FIFO is accessed via the BUFFER
+ * port as in PIO. The external engine just steals every FIFO access via
+ * the DREQ handshake, freeing the CPU to do other work.
+ *
+ * Cache management on the user buffer:
+ *   TX: flush -- write back any CPU-dirty cache lines so the engine
+ *       reads the latest data from DRAM.
+ *   RX: invalidate -- drop any speculatively-loaded stale lines so the
+ *       engine's DRAM writes are not masked when the CPU re-reads.
+ * A second invalidate-after on RX lives in transfer_data().
+ *
+ * Requires CONFIG_CACHE_MANAGEMENT=y (Kconfig.bcm2835 selects it). */
+static int sdhc_bcm2835_dma_prepare(const struct device *dev,
+				    struct sdhc_data *data, bool is_read)
+{
+	const struct sdhc_bcm2835_config *cfg = dev->config;
+	struct sdhc_bcm2835_data *drvdata = dev->data;
+	size_t total = (size_t)data->blocks * data->block_size;
+	int ret;
+
+	if (is_read) {
+		sys_cache_data_invd_range(data->data, total);
+	} else {
+		sys_cache_data_flush_range(data->data, total);
+	}
+
+	memset(&drvdata->dma_block, 0, sizeof(drvdata->dma_block));
+	memset(&drvdata->dma_cfg, 0, sizeof(drvdata->dma_cfg));
+
+	if (is_read) {
+		drvdata->dma_block.source_address = cfg->fifo_phys;
+		drvdata->dma_block.dest_address   = (uint32_t)(uintptr_t)data->data;
+		drvdata->dma_block.source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
+		drvdata->dma_block.dest_addr_adj   = DMA_ADDR_ADJ_INCREMENT;
+		drvdata->dma_cfg.channel_direction = PERIPHERAL_TO_MEMORY;
+	} else {
+		drvdata->dma_block.source_address = (uint32_t)(uintptr_t)data->data;
+		drvdata->dma_block.dest_address   = cfg->fifo_phys;
+		drvdata->dma_block.source_addr_adj = DMA_ADDR_ADJ_INCREMENT;
+		drvdata->dma_block.dest_addr_adj   = DMA_ADDR_ADJ_NO_CHANGE;
+		drvdata->dma_cfg.channel_direction = MEMORY_TO_PERIPHERAL;
+	}
+	drvdata->dma_block.block_size = total;
+
+	drvdata->dma_cfg.dma_slot             = cfg->dma_dreq;
+	drvdata->dma_cfg.complete_callback_en = 1;
+	drvdata->dma_cfg.block_count          = 1;
+	drvdata->dma_cfg.head_block           = &drvdata->dma_block;
+	drvdata->dma_cfg.dma_callback         = sdhc_bcm2835_dma_cb;
+	drvdata->dma_cfg.user_data            = drvdata;
+	/* One 32-bit word per DREQ — matches the SDHCI BUFFER access width. */
+	drvdata->dma_cfg.source_data_size     = 4;
+	drvdata->dma_cfg.dest_data_size       = 4;
+	drvdata->dma_cfg.source_burst_length  = 4;
+	drvdata->dma_cfg.dest_burst_length    = 4;
+
+	k_sem_reset(&drvdata->dma_done);
+	drvdata->dma_status = 0;
+
+	ret = dma_config(cfg->dma_dev, drvdata->dma_channel, &drvdata->dma_cfg);
+	if (ret != 0) {
+		LOG_ERR("dma_config failed: %d", ret);
+		return ret;
+	}
+	ret = dma_start(cfg->dma_dev, drvdata->dma_channel);
+	if (ret != 0) {
+		LOG_ERR("dma_start failed: %d", ret);
+		return ret;
+	}
+	return 0;
+}
+
+/* Wait for the data phase to finish on both sides: the SDHCI controller
+ * raises DATA_END once it has moved every byte across the FIFO; the DMA
+ * engine raises its completion callback once it has flushed the last
+ * burst into DRAM (for RX) or read the last burst from DRAM (for TX).
+ * Both must happen; either-order works in practice but we wait DATA_END
+ * first because it carries the controller-side error bits.
+ *
+ * Post-DMA invalidate on RX guards against any speculative line-fill
+ * the CPU may have done into cache while DMA was in flight.
  */
 static int sdhc_bcm2835_transfer_data(const struct device *dev,
 				      struct sdhc_data *data, bool is_read,
 				      int timeout_ms)
 {
+	const struct sdhc_bcm2835_config *cfg = dev->config;
+	struct sdhc_bcm2835_data *drvdata = dev->data;
 	uintptr_t base = DEVICE_MMIO_GET(dev);
-	uint8_t *buf = (uint8_t *)data->data;
-	uint32_t blocks_left = data->blocks;
-	uint32_t ready_bit = is_read ? SDHCI_INT_BUF_READ_READY
-				     : SDHCI_INT_BUF_WRITE_READY;
+	size_t total = (size_t)data->blocks * data->block_size;
 	uint32_t int_status;
-
-	/* Multi-block PIO: poll PRESENT_STATE.BUFFER_(READ|WRITE)_ENABLE
-	 * level-triggered, not INT_STATUS.BUF_(READ|WRITE)_READY edge-
-	 * triggered. The BCM2835 has a 1 KiB FIFO that buffers more than
-	 * one block, so on multi-block reads the spec's edge-triggered
-	 * BUF_READ_READY doesn't re-fire between blocks (no 0->1 transition
-	 * on BUFFER_READ_ENABLE because the FIFO never drained empty).
-	 * PSTATE reflects the actual current FIFO state. We still ack the
-	 * INT_STATUS edge bit for cleanliness; we just don't gate on it.
-	 * Wall #5, isolated 2026-05-13 by Spike B (128B = 2-block CMD53
-	 * read hung waiting on second BUF_READ_READY edge that never came).
-	 */
-	uint32_t ready_pstate = is_read ? SDHCI_PSTATE_BUFFER_READ_ENABLE
-					: SDHCI_PSTATE_BUFFER_WRITE_ENABLE;
-
-	while (blocks_left > 0) {
-		int64_t deadline = k_uptime_get() + timeout_ms;
-		uint32_t pstate;
-		uint32_t err_status = 0;
-
-		while (true) {
-			pstate = sys_read32(base + SDHCI_PRESENT_STATE);
-			err_status = sys_read32(base + SDHCI_INT_STATUS) &
-				     SDHCI_INT_DATA_ERROR_MASK;
-			if ((pstate & ready_pstate) || err_status != 0) {
-				break;
-			}
-			if (k_uptime_get() > deadline) {
-				LOG_ERR("data %s: BUF_%s_ENABLE timeout (blocks_left=%u blk_size=%u pstate=0x%08x)",
-					is_read ? "read" : "write",
-					is_read ? "READ" : "WRITE",
-					blocks_left, data->block_size, pstate);
-				(void)sdhc_bcm2835_soft_reset(dev,
-							      SDHCI_CTRL1_RESET_DATA);
-				return -ETIMEDOUT;
-			}
-			k_busy_wait(10);
-		}
-
-		if (err_status != 0) {
-			LOG_ERR("data %s: int_status=0x%08x (blocks_left=%u blk_size=%u pstate=0x%08x)",
-				is_read ? "read" : "write", err_status,
-				blocks_left, data->block_size, pstate);
-			sys_write32(err_status, base + SDHCI_INT_STATUS);
-			(void)sdhc_bcm2835_soft_reset(dev,
-						      SDHCI_CTRL1_RESET_DATA);
-			if (err_status & SDHCI_INT_DATA_TIMEOUT) {
-				return -ETIMEDOUT;
-			}
-			return -EIO;
-		}
-
-		sdhc_bcm2835_pio_xfer_one_block(base, &buf, data->block_size,
-						is_read);
-		sys_write32(ready_bit, base + SDHCI_INT_STATUS);
-		blocks_left--;
-	}
 
 	int_status = sdhc_bcm2835_wait_int(dev, SDHCI_INT_DATA_END,
 					   SDHCI_INT_DATA_ERROR_MASK,
@@ -481,6 +476,7 @@ static int sdhc_bcm2835_transfer_data(const struct device *dev,
 		LOG_ERR("data %s: DATA_END timeout (pstate=0x%08x)",
 			is_read ? "read" : "write",
 			sys_read32(base + SDHCI_PRESENT_STATE));
+		dma_stop(cfg->dma_dev, drvdata->dma_channel);
 		return -ETIMEDOUT;
 	}
 	if (int_status & SDHCI_INT_DATA_ERROR_MASK) {
@@ -490,10 +486,31 @@ static int sdhc_bcm2835_transfer_data(const struct device *dev,
 		sys_write32(int_status & SDHCI_INT_DATA_ERROR_MASK,
 			    base + SDHCI_INT_STATUS);
 		(void)sdhc_bcm2835_soft_reset(dev, SDHCI_CTRL1_RESET_DATA);
+		dma_stop(cfg->dma_dev, drvdata->dma_channel);
 		return -EIO;
 	}
 	sys_write32(SDHCI_INT_DATA_END, base + SDHCI_INT_STATUS);
-	data->bytes_xfered = data->blocks * data->block_size;
+
+	/* DMA-side completion. DATA_END fires when the SDHCI moves the last
+	 * byte across the FIFO; the DMA engine has at most one burst still
+	 * to flush. 100 ms is several orders of magnitude over worst-case. */
+	if (k_sem_take(&drvdata->dma_done, K_MSEC(100)) != 0) {
+		LOG_ERR("data %s: DMA callback timeout after DATA_END",
+			is_read ? "read" : "write");
+		dma_stop(cfg->dma_dev, drvdata->dma_channel);
+		return -EIO;
+	}
+	if (drvdata->dma_status != 0) {
+		LOG_ERR("data %s: DMA callback status %d",
+			is_read ? "read" : "write", drvdata->dma_status);
+		return -EIO;
+	}
+
+	if (is_read) {
+		sys_cache_data_invd_range(data->data, total);
+	}
+
+	data->bytes_xfered = total;
 	return 0;
 }
 
@@ -579,6 +596,15 @@ static int sdhc_bcm2835_request(const struct device *dev,
 				      ((uint32_t)data->blocks << 16);
 		sys_write32(blksizecnt, base + SDHCI_BLKSIZECNT);
 		k_busy_wait(10);
+
+		/* Arm the external DMA channel BEFORE the command fires; the
+		 * controller starts moving bytes through the BUFFER FIFO as
+		 * soon as it processes the data phase, and the FIFO can fill
+		 * in microseconds on a multi-KB read. */
+		ret = sdhc_bcm2835_dma_prepare(dev, data, is_read);
+		if (ret != 0) {
+			return ret;
+		}
 	}
 
 	sys_write32(cmd->arg, base + SDHCI_ARG1);
@@ -1030,7 +1056,21 @@ static void sdhc_bcm2835_selftest(const struct device *dev)
 static int sdhc_bcm2835_init(const struct device *dev)
 {
 	const struct sdhc_bcm2835_config *cfg = dev->config;
+	struct sdhc_bcm2835_data *drvdata = dev->data;
 	int ret;
+
+	if (!device_is_ready(cfg->dma_dev)) {
+		LOG_ERR("%s: DMA controller %s not ready", dev->name,
+			cfg->dma_dev->name);
+		return -ENODEV;
+	}
+	k_sem_init(&drvdata->dma_done, 0, 1);
+	ret = dma_request_channel(cfg->dma_dev, NULL);
+	if (ret < 0) {
+		LOG_ERR("%s: dma_request_channel failed: %d", dev->name, ret);
+		return ret;
+	}
+	drvdata->dma_channel = (uint32_t)ret;
 
 	/* MMIO mapping uses Device-nGnRE (early-write-ack permitted).
 	 * Zephyr's default K_MEM_CACHE_NONE maps as Device-nGnRnE; the
@@ -1142,6 +1182,10 @@ static DEVICE_API(sdhc, sdhc_bcm2835_api) = {
 		.pincfg = PINCTRL_DT_INST_DEV_CONFIG_GET(inst),			\
 		.wifi_reg_on = GPIO_DT_SPEC_INST_GET_OR(inst,			\
 				wifi_reg_on_gpios, {0}),			\
+		.dma_dev    = DEVICE_DT_GET(					\
+				DT_INST_DMAS_CTLR_BY_NAME(inst, rx_tx)),	\
+		.fifo_phys  = DT_INST_REG_ADDR(inst) + SDHCI_BUFFER,		\
+		.dma_dreq   = DT_INST_DMAS_CELL_BY_NAME(inst, rx_tx, dreq),	\
 		.clock_freq = DT_INST_PROP(inst, clock_frequency),		\
 		.bus_width  = DT_INST_PROP(inst, bus_width),			\
 	};									\
