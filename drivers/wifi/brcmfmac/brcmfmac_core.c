@@ -188,6 +188,51 @@ static int brcmfmac_init(const struct device *dev)
 	}
 	LOG_DBG("event_msgs set (escan + auth/assoc/link/disassoc/set_ssid)");
 
+	/* Mirror Linux brcmf_dongle_roam + brcmf_cfg80211_set_power_mgmt
+	 * setup. Without these the firmware's defaults left us self-deauthing
+	 * after ~10 Mbit/s UDP bursts (chip emitted WLC_E_LINK reason=2
+	 * BRCMF_E_REASON_DEAUTH without an inbound deauth frame -- i.e. the
+	 * firmware itself decided the AP was unreachable).
+	 *
+	 * Specifically:
+	 *   - roam_off=1 disables firmware-internal roaming (we have one AP)
+	 *   - bcn_timeout=4 matches Linux's roam-off default
+	 *   - pm=PM_FAST + pm2_sleep_ret=2000 matches Linux's default
+	 *     "power save on, but wake immediately on TX activity"
+	 *
+	 * Best-effort: errors are logged but non-fatal -- the chip still
+	 * brings up, just with looser defaults.
+	 */
+	{
+		const uint32_t roam_off    = 1;     /* no firmware-side roaming */
+		const uint32_t bcn_timeout = 4;     /* seconds without beacons */
+		const uint32_t pm_mode     = 2;     /* PM_FAST */
+		const uint32_t pm2_sleep   = 2000;  /* ms */
+		int rret;
+
+		rret = brcmfmac_bcdc_iovar_set(data, "roam_off",
+					       (const uint8_t *)&roam_off, 4);
+		if (rret != 0) {
+			LOG_WRN("roam_off=1 set failed: %d (best-effort)", rret);
+		}
+		rret = brcmfmac_bcdc_iovar_set(data, "bcn_timeout",
+					       (const uint8_t *)&bcn_timeout, 4);
+		if (rret != 0) {
+			LOG_WRN("bcn_timeout=4 set failed: %d (best-effort)", rret);
+		}
+		rret = brcmfmac_bcdc_set_dcmd(data, BRCMFMAC_WLC_SET_PM,
+					      (const uint8_t *)&pm_mode, 4);
+		if (rret != 0) {
+			LOG_WRN("WLC_SET_PM=FAST set failed: %d (best-effort)", rret);
+		}
+		rret = brcmfmac_bcdc_iovar_set(data, "pm2_sleep_ret",
+					       (const uint8_t *)&pm2_sleep, 4);
+		if (rret != 0) {
+			LOG_WRN("pm2_sleep_ret=2000 set failed: %d (best-effort)", rret);
+		}
+		LOG_INF("post-up tuning: roam_off=1 bcn_timeout=4s pm=FAST pm2_sleep_ret=2000ms");
+	}
+
 	data->probed = true;
 	LOG_INF("bring-up complete in %lld ms; awaiting iface_init",
 		(long long)(k_uptime_get() - t0));

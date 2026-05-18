@@ -314,6 +314,13 @@ void brcmfmac_net_rx_event(struct brcmfmac_data *data,
 			}
 			wifi_mgmt_raise_connect_result_event(data->iface, 0);
 		} else {
+			/* For WLC_E_LINK the firmware fills `reason` with its
+			 * own BRCMF_E_REASON_* code, NOT the 802.11 reason code:
+			 *   0=INITIAL_ASSOC 1=LOW_RSSI 2=DEAUTH 3=DISASSOC
+			 *   4=BCNS_LOST 9=MINTXRATE
+			 * For an AP-initiated deauth the actual 802.11 reason
+			 * lands on the WLC_E_DEAUTH_IND event below.
+			 */
 			LOG_INF("link DOWN  status=%u reason=%u flags=0x%04x",
 				status, reason, ev_flags);
 			data->link_state = BRCMFMAC_LINK_DOWN;
@@ -324,7 +331,7 @@ void brcmfmac_net_rx_event(struct brcmfmac_data *data,
 		break;
 
 	case WLC_E_DISASSOC_IND:
-		LOG_DBG("WLC_E_DISASSOC_IND  reason=%u", reason);
+		LOG_INF("WLC_E_DISASSOC_IND  reason=%u", reason);
 		data->link_state = BRCMFMAC_LINK_DOWN;
 		if (data->iface != NULL) {
 			net_if_dormant_on(data->iface);
@@ -353,7 +360,8 @@ void brcmfmac_net_rx_event(struct brcmfmac_data *data,
 
 	case WLC_E_DEAUTH:
 	case WLC_E_DEAUTH_IND:
-		LOG_DBG("WLC_E_DEAUTH%s  reason=%u",
+		/* `reason` here IS the 802.11 deauth reason code (frame body). */
+		LOG_INF("WLC_E_DEAUTH%s  reason=%u",
 			event_type == WLC_E_DEAUTH_IND ? "_IND" : "", reason);
 		break;
 

@@ -105,6 +105,7 @@
 #define BRCMFMAC_WLC_SET_AUTH           22
 #define BRCMFMAC_WLC_SET_SSID           26
 #define BRCMFMAC_WLC_DISASSOC           52
+#define BRCMFMAC_WLC_SET_PM             86  /* power mgmt: 0=OFF 1=MAX 2=FAST */
 #define BRCMFMAC_WLC_SET_WSEC           134
 #define BRCMFMAC_WLC_SET_WPA_AUTH       165
 #define BRCMFMAC_WLC_GET_VAR            262
