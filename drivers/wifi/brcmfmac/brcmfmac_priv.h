@@ -73,6 +73,15 @@
  */
 #define BRCMFMAC_HOSTINTMASK            (0x000000F0u | (1u << 29))
 
+/* Individual SDPCMD intstatus bits (subset of I_HMB_SW_MASK).
+ * Linux names from sdio.c: I_HMB_SW0..SW3 map to FC_STATE, FC_CHANGE,
+ * FRAME_IND, HOST_INT respectively.
+ */
+#define BRCMFMAC_I_HMB_FC_STATE     (1u << 4)    /* HMB_SW0 — chip xoff'd  */
+#define BRCMFMAC_I_HMB_FC_CHANGE    (1u << 5)    /* HMB_SW1 — fc transition*/
+#define BRCMFMAC_I_HMB_FRAME_IND    (1u << 6)    /* HMB_SW2 — frame avail  */
+#define BRCMFMAC_I_HMB_HOST_INT     (1u << 7)    /* HMB_SW3 — hostmail data*/
+
 /* BCMA wrapper-register offsets (within wrapbase). */
 #define BCMA_IOCTL                      0x0408
 #define BCMA_IOCTL_CLK                  0x0001

@@ -64,6 +64,20 @@ static struct k_thread brcmfmac_rx_thread;
  */
 static atomic_t brcmf_isr_fires;
 
+/* SDPCM per-frame flow-control state.
+ *
+ * The chip puts a flow-control byte at sw->flow in every SDPCM header it
+ * sends. Each bit corresponds to an access category (BE/BK/VO/VI); a set
+ * bit means "host should stop sending traffic on this AC." Mirrors Linux
+ * brcmf_sdio_hdparse + TX gate at sdio.c:2911.
+ *
+ * Simplification vs Linux: we collapse all ACs to a single xoff/xon
+ * boolean. Any non-zero sw->flow stops all host TX; zero re-enables.
+ * Fine-grained per-AC was overkill for the current single-iface workload.
+ */
+static atomic_t brcmf_fcstate;		/* 0 = ok to send, 1 = chip xoff'd */
+static uint8_t  brcmf_flowcontrol;	/* last sw->flow byte seen */
+
 static void brcmfmac_handle_ctrl(struct brcmfmac_data *data,
 				 struct cdc_hdr *rcdc, uint16_t outlen)
 {
@@ -156,10 +170,11 @@ static void brcmfmac_rx_thread_fn(void *p1, void *p2, void *p3)
 	while (1) {
 		rx_iters++;
 		if ((rx_iters & 0x3FF) == 0) {
-			LOG_INF("rx stats: t=%lldms iters=%u isr=%ld valid=%u ist=0x%x",
+			LOG_INF("rx stats: t=%lldms iters=%u isr=%ld valid=%u ist=0x%x txseq=%u txmax=%u",
 				k_uptime_get(), rx_iters,
 				(long)atomic_get(&brcmf_isr_fires), rx_valid,
-				rx_ist_acc);
+				rx_ist_acc, data->sdpcm_txseq,
+				data->sdpcm_tx_max);
 			rx_ist_acc = 0;
 		}
 
@@ -259,6 +274,21 @@ static void brcmfmac_rx_thread_fn(void *p1, void *p2, void *p3)
 			data->sdpcm_tx_max = new_max;
 			k_sem_give(&data->tx_credit_sem);
 			rx_valid++;
+
+			/* SDPCM per-frame flow-control byte. Mirrors Linux
+			 * brcmf_sdio_hdparse: when the chip's host-RX queue
+			 * fills it sets bits in sw->flow telling host to stop
+			 * sending. Without this we overrun the chip's WLAN TX
+			 * queue and trip a multi-second internal recovery.
+			 */
+			uint8_t new_fc = sw->flow;
+			if (brcmf_flowcontrol != new_fc) {
+				bool now_xoff = new_fc != 0;
+				brcmf_flowcontrol = new_fc;
+				atomic_set(&brcmf_fcstate, now_xoff ? 1 : 0);
+				LOG_DBG("fc: %s flow=0x%02x",
+					now_xoff ? "xoff" : "xon", new_fc);
+			}
 		}
 
 		/* Phase 2: if the frame spans more than one block, read the
@@ -507,25 +537,34 @@ int brcmfmac_bcdc_tx_frame(struct brcmfmac_data *data, uint8_t chan,
 	struct sdpcm_frame_hdr *fh = (void *)frame;
 	struct sdpcm_sw_hdr *sw = (void *)(frame + sizeof(*fh));
 
-	/* Wait for SDPCM tx-credit (mirrors Linux brcmfmac/sdio.c::data_ok).
-	 * Chip's tx_max is updated from every incoming SDPCM header in the
-	 * RX thread. The 8-bit underflow trick: when txseq has overtaken
-	 * tx_max, (tx_max - txseq) is >= 0x80, so masking with 0x80 catches
-	 * both "no credits" and "negative delta" in one check.
+	/* Wait for SDPCM tx-credit AND chip-side flow control (mirrors
+	 * Linux brcmfmac/sdio.c::data_ok + brcmu_pktq_mlen(..., ~flowcontrol)).
 	 *
-	 * Up to ~100 ms total wait (5 × 20 ms). If we still have no credits
-	 * after that, return -EAGAIN so the caller (net stack) can drop or
-	 * requeue.
+	 * Two independent gates:
+	 *   (1) credit window: chip's tx_max - txseq must be > 0 (8-bit wrap
+	 *       trick: if txseq has overtaken tx_max, (tx_max - txseq) is
+	 *       >= 0x80, so a 0x80 mask catches both "no credits" and "neg
+	 *       delta" in one check).
+	 *   (2) flow control: chip's last sw->flow byte must be zero. When
+	 *       chip's host-RX queue fills it sets bits here telling host to
+	 *       hold. The rx-thread updates brcmf_fcstate from every RX
+	 *       SDPCM header.
+	 *
+	 * Up to 100 ms total wait (5 × 20 ms). If we still can't send after
+	 * that, return -EAGAIN so the caller can drop or requeue.
 	 */
 	for (int retry = 0; retry < 5; retry++) {
 		uint8_t delta = (uint8_t)(data->sdpcm_tx_max - data->sdpcm_txseq);
+		bool have_credit = (delta != 0 && (delta & 0x80) == 0);
+		bool xoff = atomic_get(&brcmf_fcstate) != 0;
 
-		if (delta != 0 && (delta & 0x80) == 0) {
+		if (have_credit && !xoff) {
 			break;
 		}
 		if (k_sem_take(&data->tx_credit_sem, K_MSEC(20)) != 0) {
-			LOG_WRN("tx_frame: credit timeout (txseq=%u tx_max=%u)",
-				data->sdpcm_txseq, data->sdpcm_tx_max);
+			LOG_WRN("tx_frame: credit/fc timeout (txseq=%u tx_max=%u fcstate=%d)",
+				data->sdpcm_txseq, data->sdpcm_tx_max,
+				atomic_get(&brcmf_fcstate));
 			return -EAGAIN;
 		}
 	}
