@@ -5,11 +5,26 @@
  *
  * Broadcom BCM2835 / BCM2710 / BCM2837 Arasan SDHCI host controller.
  *
- * Polled (no IRQ) implementation of the six sdhc.h device-API methods:
- * reset, set_io (clock + width + power), request (cmd + PIO data),
+ * IRQ-driven implementation of the six sdhc.h device-API methods:
+ * reset, set_io (clock + width + power), request (cmd + DMA data),
  * get_card_present, get_host_props, card_busy. Targets the EMMC port
  * that's wired to the on-module CYW43439 wireless chip on Pi 3 / Pi
  * Zero 2 W.
+ *
+ * Completion path:
+ *   - CMD_COMPLETE + DATA_END are SIGNAL_ENABLE'd and demuxed in
+ *     sdhc_bcm2835_isr; the request thread sleeps on cmd_done /
+ *     data_done sems and reads captured INT_STATUS for errors.
+ *   - Data bytes move through the BUFFER FIFO via the external BCM
+ *     DMA engine (DREQ-handshaked). DMA-side completion has its own
+ *     dma_done sem from the DMA core callback.
+ *   - SDIO async CARD_INT (DAT1-low) keeps its existing
+ *     enable-interrupt callback path.
+ *
+ * No polled fallback: if any completion sem times out the call
+ * returns -ETIMEDOUT with the offending INT_STATUS / PRESENT_STATE
+ * logged. We surface errors rather than mask them with a backup
+ * busy-wait.
  *
  * Three silicon facts shape this driver:
  *
@@ -36,10 +51,10 @@
  *       * PRESET_VALUE_BROKEN    -- preset registers don't work; we
  *           configure clock/voltage explicitly.
  *
- * IRQ-driven completion (and SDIO async events via CARD_INT) is left
- * for a future commit; polling is plenty for SDIO control traffic and
- * keeps bring-up debuggable. R1b / R5b (busy-after-response) are
- * deferred for the same reason.
+ * R1b / R5b (busy-after-response) are not yet implemented: we'd need
+ * to wait on DAT0 going high after the response, either by enabling
+ * the SDHCI busy-IRQ (some controllers signal it via DATA_END) or by
+ * polling PRESENT_STATE briefly. Not needed for CMD53 / SDIO data.
  *
  * References (open as you read this file):
  *   - Linux: drivers/mmc/host/sdhci-iproc.c    -- the quirk source
@@ -209,6 +224,17 @@ struct sdhc_bcm2835_data {
 	struct dma_block_config dma_block;
 	struct dma_config dma_cfg;
 
+	/* IRQ-driven CMD/DATA completion. Replaces the bring-up polled
+	 * wait_int() path. The ISR captures INT_STATUS bits matching
+	 * cmd_mask / data_mask, ACKs them by W1C, and gives the sem.
+	 * Only one CMD53 is in flight at a time on this controller, so a
+	 * single state slot is enough.
+	 */
+	struct k_sem cmd_done;
+	struct k_sem data_done;
+	uint32_t cmd_status;	/* captured INT_STATUS bits (success + errors) */
+	uint32_t data_status;
+
 	/* SDIO in-band interrupt callback (set via .enable_interrupt). The
 	 * brcmfmac driver uses this to wake its RX thread when the chip
 	 * asserts DAT1 (CARD_INT). Mirrors Linux's sdhci card-irq path.
@@ -220,9 +246,8 @@ struct sdhc_bcm2835_data {
 /* Forward decl: error recovery in request() needs to reset the cmd line. */
 static int sdhc_bcm2835_soft_reset(const struct device *dev, uint32_t mask);
 
-/* Forward decl: IRQ_CONNECT in init() references it; body is below the
- * polled request path (alongside the .enable_interrupt / .disable_interrupt
- * implementations).
+/* Forward decl: IRQ_CONNECT in init() references it; body is below
+ * (alongside the .enable_interrupt / .disable_interrupt implementations).
  */
 static void sdhc_bcm2835_isr(const struct device *dev);
 
@@ -235,50 +260,6 @@ static void sdhc_bcm2835_isr(const struct device *dev);
  */
 #define BCM2835_SDHCI_CMD_TIMEOUT_MS	5000
 
-/* Spin until the requested PRESENT_STATE.*_INHIBIT bits clear, with a
- * timeout. The card / controller has to actually finish whatever it was
- * doing before we can issue a new command.
- */
-static int sdhc_bcm2835_wait_inhibit(const struct device *dev, uint32_t mask,
-				     int timeout_ms)
-{
-	uintptr_t base = DEVICE_MMIO_GET(dev);
-	int64_t deadline = k_uptime_get() + timeout_ms;
-
-	while (sys_read32(base + SDHCI_PRESENT_STATE) & mask) {
-		if (k_uptime_get() > deadline) {
-			return -ETIMEDOUT;
-		}
-		k_busy_wait(10);
-	}
-	return 0;
-}
-
-/* Spin until INT_STATUS has either a success bit or an error bit set,
- * or we time out. Returns the raw int-status value (caller decides).
- * Does not ack -- the caller W1Cs the bits it actually consumed so a
- * pending unrelated interrupt isn't dropped on the floor.
- */
-static uint32_t sdhc_bcm2835_wait_int(const struct device *dev,
-				      uint32_t success_mask, uint32_t error_mask,
-				      int timeout_ms)
-{
-	uintptr_t base = DEVICE_MMIO_GET(dev);
-	int64_t deadline = k_uptime_get() + timeout_ms;
-	uint32_t status;
-
-	while (true) {
-		status = sys_read32(base + SDHCI_INT_STATUS);
-		if (status & (success_mask | error_mask)) {
-			return status;
-		}
-		if (k_uptime_get() > deadline) {
-			return 0;	/* caller treats 0 as timeout */
-		}
-		k_busy_wait(10);
-	}
-}
-
 /* Build the full 32-bit CMDTM word -- TRANSFER_MODE in the low 16 bits,
  * COMMAND in the high 16. Writing this 32-bit word fires the command;
  * the BCM 32-bit-only access requirement makes the natural composition
@@ -286,9 +267,8 @@ static uint32_t sdhc_bcm2835_wait_int(const struct device *dev,
  *
  * We deliberately don't support R1b yet: the controller waits for DAT0
  * to clear after a busy response, which can hang indefinitely if the
- * card never deasserts busy. R1b becomes a small extension once we
- * have IRQ-driven completion; for now polled R1 is enough for SDIO
- * control traffic.
+ * card never deasserts busy. SDIO data traffic (CMD53) uses R5, not
+ * R5b -- so R1b isn't on the hot path.
  */
 static int sdhc_bcm2835_build_cmd(const struct sdhc_command *cmd,
 				  const struct sdhc_data *data, uint32_t *cmdtm)
@@ -482,27 +462,22 @@ static int sdhc_bcm2835_transfer_data(const struct device *dev,
 	size_t total = (size_t)data->blocks * data->block_size;
 	uint32_t int_status;
 
-	int_status = sdhc_bcm2835_wait_int(dev, SDHCI_INT_DATA_END,
-					   SDHCI_INT_DATA_ERROR_MASK,
-					   timeout_ms);
-	if (int_status == 0) {
+	if (k_sem_take(&drvdata->data_done, K_MSEC(timeout_ms)) != 0) {
 		LOG_ERR("data %s: DATA_END timeout (pstate=0x%08x)",
 			is_read ? "read" : "write",
 			sys_read32(base + SDHCI_PRESENT_STATE));
 		dma_stop(cfg->dma_dev, drvdata->dma_channel);
 		return -ETIMEDOUT;
 	}
+	int_status = drvdata->data_status;
 	if (int_status & SDHCI_INT_DATA_ERROR_MASK) {
 		LOG_ERR("data %s end: int_status=0x%08x (pstate=0x%08x)",
 			is_read ? "read" : "write", int_status,
 			sys_read32(base + SDHCI_PRESENT_STATE));
-		sys_write32(int_status & SDHCI_INT_DATA_ERROR_MASK,
-			    base + SDHCI_INT_STATUS);
 		(void)sdhc_bcm2835_soft_reset(dev, SDHCI_CTRL1_RESET_DATA);
 		dma_stop(cfg->dma_dev, drvdata->dma_channel);
 		return -EIO;
 	}
-	sys_write32(SDHCI_INT_DATA_END, base + SDHCI_INT_STATUS);
 
 	/* DMA-side completion. DATA_END fires when the SDHCI moves the last
 	 * byte across the FIFO; the DMA engine has at most one burst still
@@ -550,9 +525,9 @@ static int sdhc_bcm2835_request(const struct device *dev,
 				struct sdhc_data *data)
 {
 	uintptr_t base = DEVICE_MMIO_GET(dev);
+	struct sdhc_bcm2835_data *drvdata = dev->data;
 	uint32_t cmdtm;
 	uint32_t int_status;
-	uint32_t inhibit_mask;
 	int cmd_timeout_ms;
 	int data_timeout_ms;
 	bool is_read;
@@ -580,35 +555,25 @@ static int sdhc_bcm2835_request(const struct device *dev,
 	data_timeout_ms = (data && data->timeout_ms) ? data->timeout_ms
 						     : cmd_timeout_ms;
 
-	inhibit_mask = SDHCI_PSTATE_CMD_INHIBIT;
-	if (data != NULL) {
-		inhibit_mask |= SDHCI_PSTATE_DATA_INHIBIT;
-	}
-	ret = sdhc_bcm2835_wait_inhibit(dev, inhibit_mask, cmd_timeout_ms);
-	if (ret != 0) {
-		return ret;
-	}
-
-	/* Clear any stale CMD/DATA-side interrupt bits so wait_int doesn't
-	 * latch onto a previous request's completion.
-	 *
-	 * The BCM Arasan has a documented clock-domain-crossing bug
-	 * (sdhci-iproc.c: "may lose the content of successive writes to
-	 * the same register within two SD-card clock cycles of each
-	 * other"). Linux's bcm2835_mmc_writel wraps every register write
-	 * with `udelay((2*1000000)/max(host->clock, 400000) + 1)` = 6 us
-	 * at 400 kHz. Our k_busy_wait(10) is comfortably > 4 SDCLK cycles
-	 * at the 400 kHz initialisation clock and harmless at higher
-	 * post-init rates.
+	/* Reset the completion sems before firing so a stale give from the
+	 * previous request (e.g. interleaved with a DAT0 busy ISR) can't
+	 * race ahead of the new k_sem_take. PSTATE inhibit bits are
+	 * guaranteed clear by IRQ ordering -- previous request returned
+	 * only after CMD_COMPLETE (+ DATA_END if applicable) acked, which
+	 * is also when the controller clears CMD_INHIBIT / DATA_INHIBIT.
+	 * No defensive poll: if inhibit is somehow stuck, the new CMD53
+	 * will time out and surface the error rather than mask it with a
+	 * silent wait_inhibit fallback.
 	 */
-	sys_write32(0xFFFFFFFF, base + SDHCI_INT_STATUS);
-	k_busy_wait(10);
+	k_sem_reset(&drvdata->cmd_done);
+	if (data != NULL) {
+		k_sem_reset(&drvdata->data_done);
+	}
 
 	if (data != NULL) {
 		uint32_t blksizecnt = (data->block_size & 0x3FF) |
 				      ((uint32_t)data->blocks << 16);
 		sys_write32(blksizecnt, base + SDHCI_BLKSIZECNT);
-		k_busy_wait(10);
 
 		/* Arm the external DMA channel BEFORE the command fires; the
 		 * controller starts moving bytes through the BUFFER FIFO as
@@ -621,16 +586,21 @@ static int sdhc_bcm2835_request(const struct device *dev,
 	}
 
 	sys_write32(cmd->arg, base + SDHCI_ARG1);
-	k_busy_wait(10);
 	sys_write32(cmdtm, base + SDHCI_CMDTM);	/* fires command */
 
-	int_status = sdhc_bcm2835_wait_int(dev, SDHCI_INT_CMD_COMPLETE,
-					   SDHCI_INT_CMD_ERROR_MASK,
-					   cmd_timeout_ms);
-
-	if (int_status == 0) {
+	if (k_sem_take(&drvdata->cmd_done, K_MSEC(cmd_timeout_ms)) != 0) {
+		LOG_ERR("CMD%u arg=0x%08x: ISR-completion timeout (pstate=0x%08x int_status=0x%08x)",
+			cmd->opcode, cmd->arg,
+			sys_read32(base + SDHCI_PRESENT_STATE),
+			sys_read32(base + SDHCI_INT_STATUS));
+		(void)sdhc_bcm2835_soft_reset(dev, SDHCI_CTRL1_RESET_CMD);
+		if (data != NULL) {
+			(void)sdhc_bcm2835_soft_reset(dev,
+						      SDHCI_CTRL1_RESET_DATA);
+		}
 		return -ETIMEDOUT;
 	}
+	int_status = drvdata->cmd_status;
 
 	if (int_status & SDHCI_INT_CMD_ERROR_MASK) {
 		uint32_t cmd_err = int_status & SDHCI_INT_CMD_ERROR_MASK;
@@ -652,8 +622,6 @@ static int sdhc_bcm2835_request(const struct device *dev,
 				cmd->opcode, cmd->arg, int_status,
 				sys_read32(base + SDHCI_PRESENT_STATE));
 		}
-		sys_write32(int_status & SDHCI_INT_CMD_ERROR_MASK,
-			    base + SDHCI_INT_STATUS);
 		/* Reset the CMD state machine to recover from the error.
 		 * Only reset the DATA state machine if this command had a
 		 * data phase; CMD-only commands (CMD0/3/5/7/8/52) don't
@@ -675,7 +643,6 @@ static int sdhc_bcm2835_request(const struct device *dev,
 	}
 
 	sdhc_bcm2835_read_response(dev, cmd);
-	sys_write32(SDHCI_INT_CMD_COMPLETE, base + SDHCI_INT_STATUS);
 
 	if (data != NULL) {
 		ret = sdhc_bcm2835_transfer_data(dev, data, is_read,
@@ -1078,6 +1045,8 @@ static int sdhc_bcm2835_init(const struct device *dev)
 		return -ENODEV;
 	}
 	k_sem_init(&drvdata->dma_done, 0, 1);
+	k_sem_init(&drvdata->cmd_done, 0, 1);
+	k_sem_init(&drvdata->data_done, 0, 1);
 	ret = dma_request_channel(cfg->dma_dev, NULL);
 	if (ret < 0) {
 		LOG_ERR("%s: dma_request_channel failed: %d", dev->name, ret);
@@ -1141,17 +1110,22 @@ static int sdhc_bcm2835_init(const struct device *dev)
 	}
 
 	/* INT_ENABLE controls which bits get LATCHED into INT_STATUS (per
-	 * SDHCI spec, independent of IRQ generation). The polled request()
-	 * path consumes those bits directly. CMD_COMPLETE/DATA_END/the PIO
-	 * buffer-ready bits/all CMD/DATA error bits + BUS_POWER_ERR. Mirrors
-	 * Linux's bcm2835_mmc_set_transfer_irqs.
+	 * SDHCI spec, independent of IRQ generation). SIGNAL_ENABLE
+	 * controls which bits PROPAGATE to the ARM IRQ line.
 	 *
-	 * SIGNAL_ENABLE controls which bits PROPAGATE to the ARM IRQ line.
-	 * We leave it at 0 here; the only consumer that needs IRQs today is
-	 * SDIO CARD_INT (via brcmfmac), and it flips that bit on dynamically
-	 * via sdhc_enable_interrupt(SDHC_INT_SDIO). Keeping the polled bits
-	 * out of SIGNAL_ENABLE avoids the ISR re-firing for them while
-	 * request() is mid-poll on the same status word.
+	 * CMD_COMPLETE / DATA_END plus their error masks are both LATCHED
+	 * and SIGNALED -- the request thread sleeps on cmd_done / data_done
+	 * sems and the ISR captures status + gives the sem. Replaces the
+	 * old polled wait_int() path.
+	 *
+	 * CARD_INT is the SDIO async event from the chip; brcmfmac flips
+	 * its bit on dynamically via sdhc_enable_interrupt(SDHC_INT_SDIO).
+	 * Off at init because we don't want it firing before brcmfmac is
+	 * ready to handle it.
+	 *
+	 * BUF_READ_READY / BUF_WRITE_READY are latched (in case a future
+	 * PIO fallback wants to consume them) but not signaled -- data
+	 * transfers go through external DMA + DATA_END.
 	 */
 	uintptr_t base = DEVICE_MMIO_GET(dev);
 	uint32_t int_en = SDHCI_INT_CMD_COMPLETE | SDHCI_INT_DATA_END |
@@ -1161,8 +1135,11 @@ static int sdhc_bcm2835_init(const struct device *dev)
 			  SDHCI_INT_DATA_TIMEOUT | SDHCI_INT_DATA_CRC |
 			  SDHCI_INT_DATA_END_BIT |
 			  BIT(23);	/* BUS_POWER_ERR */
+	uint32_t sig_en = SDHCI_INT_CMD_COMPLETE | SDHCI_INT_DATA_END |
+			  SDHCI_INT_CMD_ERROR_MASK |
+			  SDHCI_INT_DATA_ERROR_MASK;
 	sys_write32(int_en, base + SDHCI_INT_ENABLE);
-	sys_write32(0,      base + SDHCI_SIGNAL_ENABLE);
+	sys_write32(sig_en, base + SDHCI_SIGNAL_ENABLE);
 
 	struct sdhc_io ios = {
 		.clock = SDMMC_CLOCK_400KHZ,
@@ -1180,11 +1157,11 @@ static int sdhc_bcm2835_init(const struct device *dev)
 	sdhc_bcm2835_selftest(dev);
 #endif
 
-	/* Wire the Arasan IRQ line. Card-int is NOT enabled at boot --
+	/* Wire the Arasan IRQ line. CARD_INT is NOT enabled at boot --
 	 * brcmfmac flips it on via sdhc_enable_interrupt(SDHC_INT_SDIO)
-	 * once it's ready to handle RX wakes. Other status bits stay
-	 * latched (per the polled request() path) but won't fire IRQs
-	 * unless their SIGNAL_ENABLE bit is also set, which it isn't.
+	 * once it's ready to handle RX wakes. CMD_COMPLETE / DATA_END
+	 * (+ their error masks) ARE enabled here: they drive the
+	 * request-thread completion path via cmd_done / data_done.
 	 */
 	IRQ_CONNECT(DT_INST_IRQN(0), DT_INST_IRQ(0, priority),
 		    sdhc_bcm2835_isr, DEVICE_DT_INST_GET(0), 0);
@@ -1193,30 +1170,57 @@ static int sdhc_bcm2835_init(const struct device *dev)
 	return 0;
 }
 
-/* SDIO in-band interrupt path -------------------------------------------- */
+/* SDHCI interrupt path --------------------------------------------------- */
 
-/* ISR demuxes INT_STATUS for the SDIO CARD_INT (DAT1-low) bit only. All
- * other bits (CMD_COMPLETE, DATA_END, etc.) are still handled by the polled
- * request() path -- the ISR leaves them latched so the polled reader can
- * see them.
+/* ISR demuxes INT_STATUS into three concerns:
  *
- * CARD_INT is level-sensitive on DAT1: with INT_ENABLE[CARD_INT] set,
- * INT_STATUS[CARD_INTERRUPT] continuously tracks DAT1 and cannot be W1C'd.
- * Mask BOTH INT_ENABLE and SIGNAL_ENABLE here -- with INT_ENABLE off the
- * STATUS bit stops tracking, so when the callback later calls
- * sdhc_enable_interrupt() the controller does one fresh DAT1 sample:
- * IRQ re-fires only if the chip is *currently* driving DAT1 low.
- * Masking SIGNAL_ENABLE alone is not enough -- a transient DAT1 low
- * between cycles (e.g. CCCR-IENx-driven from F2 with no chip-side
- * SDPCMD_INTSTATUS bit set) gates the STATUS bit through the next
- * sdhc_enable_interrupt() call and storms the ISR. Mirrors Linux's
- * sdhci_enable_sdio_irq_nolock(host, false) -- drivers/mmc/host/sdhci.c.
+ *   (a) CMD-completion bits (CMD_COMPLETE + CMD_ERROR_MASK). W1C-acked
+ *       here, status captured in drvdata->cmd_status, cmd_done sem given;
+ *       the request thread reads response + checks the captured status.
+ *
+ *   (b) DATA-completion bits (DATA_END + DATA_ERROR_MASK). Same pattern
+ *       via data_status / data_done. Mirrors Linux's split between
+ *       sdhci_cmd_irq and sdhci_data_irq in drivers/mmc/host/sdhci.c.
+ *
+ *   (c) SDIO CARD_INT (DAT1-low, level-sensitive). Special masking
+ *       dance because INT_STATUS[CARD_INTERRUPT] continuously tracks
+ *       DAT1 and cannot be W1C-acked. We mask BOTH INT_ENABLE and
+ *       SIGNAL_ENABLE -- with INT_ENABLE off the STATUS bit stops
+ *       tracking, so when the callback later calls
+ *       sdhc_enable_interrupt() the controller does one fresh DAT1
+ *       sample: IRQ re-fires only if the chip is *currently* driving
+ *       DAT1 low. Masking SIGNAL_ENABLE alone is not enough -- a
+ *       transient DAT1 low between cycles (e.g. CCCR-IENx-driven from
+ *       F2 with no chip-side SDPCMD_INTSTATUS bit set) gates the STATUS
+ *       bit through the next sdhc_enable_interrupt() call and storms
+ *       the ISR. Mirrors Linux's sdhci_enable_sdio_irq_nolock(host,
+ *       false).
+ *
+ * Edge-triggered W1C bits (CMD/DATA) are acked BEFORE the sem_give so
+ * the IRQ can't re-fire on the same condition while the request thread
+ * runs. CARD_INT keeps its level-sensitive dance.
  */
 static void sdhc_bcm2835_isr(const struct device *dev)
 {
 	struct sdhc_bcm2835_data *drvdata = dev->data;
 	uintptr_t base = DEVICE_MMIO_GET(dev);
 	uint32_t status = sys_read32(base + SDHCI_INT_STATUS);
+	uint32_t cmd_bits  = status & (SDHCI_INT_CMD_COMPLETE  |
+				       SDHCI_INT_CMD_ERROR_MASK);
+	uint32_t data_bits = status & (SDHCI_INT_DATA_END      |
+				       SDHCI_INT_DATA_ERROR_MASK);
+
+	if (cmd_bits != 0) {
+		sys_write32(cmd_bits, base + SDHCI_INT_STATUS);
+		drvdata->cmd_status = cmd_bits;
+		k_sem_give(&drvdata->cmd_done);
+	}
+
+	if (data_bits != 0) {
+		sys_write32(data_bits, base + SDHCI_INT_STATUS);
+		drvdata->data_status = data_bits;
+		k_sem_give(&drvdata->data_done);
+	}
 
 	if (status & SDHCI_INT_CARD_INT) {
 		uint32_t int_en = sys_read32(base + SDHCI_INT_ENABLE);
