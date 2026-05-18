@@ -57,6 +57,13 @@ LOG_MODULE_DECLARE(brcmfmac, CONFIG_WIFI_LOG_LEVEL);
 K_KERNEL_STACK_DEFINE(brcmfmac_rx_stack, CONFIG_WIFI_BRCMFMAC_RX_THREAD_STACK_SIZE);
 static struct k_thread brcmfmac_rx_thread;
 
+/* Bisection instrumentation (2026-05-17): IRQ rate + RX-thread iter rate
+ * to disambiguate ISR-storm vs sem-wait-scheduling vs upper-stack
+ * starvation as the cause of the DHCP failure when brcmfmac switches
+ * from k_msleep polling to k_sem_take IRQ wakes.
+ */
+static atomic_t brcmf_isr_fires;
+
 static void brcmfmac_handle_ctrl(struct brcmfmac_data *data,
 				 struct cdc_hdr *rcdc, uint16_t outlen)
 {
@@ -116,24 +123,21 @@ static void brcmfmac_card_int_cb(const struct device *sdhc_dev, int reason,
 	struct brcmfmac_data *data = (struct brcmfmac_data *)user_data;
 
 	if (reason == SDHC_INT_SDIO) {
+		atomic_inc(&brcmf_isr_fires);
 		k_sem_give(&data->rx_irq_sem);
 	}
 }
 
-/* Block until the chip wakes us via CARD_INT, or until the safety-net
- * timeout. Re-arms the SDHC card-int line (each ISR fire auto-masks
- * SIGNAL_ENABLE[CARD_INT]) first; the chip side keeps DAT1 deasserted
- * via the SDPCMD intstatus W1C ack done in the main loop above.
- *
- * Safety-net is short (10 ms) -- under normal operation the IRQ is what
- * wakes us, but small frames during early boot (DHCP, ARP) can race
- * with our IRQ-arm window; the poll keeps us responsive.
+/* Bisection step 2 (2026-05-17): IRQ wake with the tightest safety-net
+ * rung (K_MSEC(1)). Confirmed during the WIP session that K_MSEC(2) let
+ * DHCP complete and K_MSEC(10)/100 did not; starting the ladder at 1 ms
+ * to establish the lower bound. Step 3 climbs to 2/5/10.
  */
 static void brcmfmac_rx_wait(struct brcmfmac_data *data)
 {
 	(void)sdhc_enable_interrupt(data->card.sdhc, brcmfmac_card_int_cb,
 				    SDHC_INT_SDIO, data);
-	(void)k_sem_take(&data->rx_irq_sem, K_MSEC(10));
+	(void)k_sem_take(&data->rx_irq_sem, K_MSEC(1));
 }
 
 static void brcmfmac_rx_thread_fn(void *p1, void *p2, void *p3)
@@ -143,10 +147,55 @@ static void brcmfmac_rx_thread_fn(void *p1, void *p2, void *p3)
 	ARG_UNUSED(p3);
 
 	static uint8_t rx_buf[BRCMFMAC_BCDC_RX_BUF] __aligned(4);
+	static uint32_t rx_iters;
+	static uint32_t rx_valid;
+	static uint32_t rx_ist_acc;  /* OR of masked SDPCMD_INTSTATUS this window */
 
 	LOG_INF("rx thread started");
 
 	while (1) {
+		rx_iters++;
+		if ((rx_iters & 0x3FF) == 0) {
+			LOG_INF("rx stats: t=%lldms iters=%u isr=%ld valid=%u ist=0x%x",
+				k_uptime_get(), rx_iters,
+				(long)atomic_get(&brcmf_isr_fires), rx_valid,
+				rx_ist_acc);
+			rx_ist_acc = 0;
+		}
+
+		/* Ack the chip-side SDPCMD intstatus BEFORE the speculative
+		 * F2 read. Matches Linux's sdio_irq_thread /
+		 * brcmf_sdio_intr_rstatus ordering: clear the latched HMB_SW
+		 * bits as soon as the host has been notified, so DAT1 can
+		 * deassert and the SDHC card-int line doesn't re-fire on an
+		 * empty F2 (which would otherwise storm the ISR every time
+		 * brcmfmac_rx_wait re-arms SIGNAL_ENABLE[CARD_INT]).
+		 */
+		{
+			const struct bcm_core *sdio_core =
+				brcmfmac_chip_core_find(data, BCMA_CORE_SDIO_DEV);
+			if (sdio_core != NULL) {
+				uint32_t ist = 0;
+
+				if (brcmfmac_sdio_backplane_read32(
+					    data,
+					    sdio_core->base + SDPCMD_INTSTATUS,
+					    &ist) == 0) {
+					uint32_t masked =
+						ist & BRCMFMAC_HOSTINTMASK;
+
+					rx_ist_acc |= masked;
+					if (masked != 0) {
+						(void)brcmfmac_sdio_backplane_write32(
+							data,
+							sdio_core->base +
+								SDPCMD_INTSTATUS,
+							masked);
+					}
+				}
+			}
+		}
+
 		/* Phase 1: read one block to learn the frame size.
 		 *
 		 * The CYW43439 F2 FIFO only yields the bytes it actually has
@@ -209,32 +258,7 @@ static void brcmfmac_rx_thread_fn(void *p1, void *p2, void *p3)
 			}
 			data->sdpcm_tx_max = new_max;
 			k_sem_give(&data->tx_credit_sem);
-		}
-
-		/* Ack the chip-side SDPCMD intstatus so DAT1 deasserts once
-		 * we've drained the matching FIFO data. Without this the chip
-		 * keeps the host-int line asserted (HMB_SW2 / HMB_SW3 latched)
-		 * and the SDHC ISR re-fires in a tight loop. Mirrors Linux's
-		 * brcmf_sdio_dpc, which writes back the same bits it read
-		 * (the SDPCMD intstatus register is W1C).
-		 */
-		{
-			const struct bcm_core *sdio_core =
-				brcmfmac_chip_core_find(data, BCMA_CORE_SDIO_DEV);
-			if (sdio_core != NULL) {
-				uint32_t ist = 0;
-
-				if (brcmfmac_sdio_backplane_read32(
-					    data,
-					    sdio_core->base + SDPCMD_INTSTATUS,
-					    &ist) == 0 &&
-				    (ist & BRCMFMAC_HOSTINTMASK) != 0) {
-					(void)brcmfmac_sdio_backplane_write32(
-						data,
-						sdio_core->base + SDPCMD_INTSTATUS,
-						ist & BRCMFMAC_HOSTINTMASK);
-				}
-			}
+			rx_valid++;
 		}
 
 		/* Phase 2: if the frame spans more than one block, read the
