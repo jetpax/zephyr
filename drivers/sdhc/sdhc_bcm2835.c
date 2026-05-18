@@ -1200,11 +1200,17 @@ static int sdhc_bcm2835_init(const struct device *dev)
  * request() path -- the ISR leaves them latched so the polled reader can
  * see them.
  *
- * CARD_INT is level-sensitive on DAT1: W1C on INT_STATUS won't deassert
- * the line while the chip still has pending events. So instead of clearing
- * the bit, we mask it in SIGNAL_ENABLE here, and the callback is expected
- * to drain the chip and re-enable via sdhc_enable_interrupt(). Matches
- * Zephyr's other SDHC drivers (imx_usdhc.c comment line 147).
+ * CARD_INT is level-sensitive on DAT1: with INT_ENABLE[CARD_INT] set,
+ * INT_STATUS[CARD_INTERRUPT] continuously tracks DAT1 and cannot be W1C'd.
+ * Mask BOTH INT_ENABLE and SIGNAL_ENABLE here -- with INT_ENABLE off the
+ * STATUS bit stops tracking, so when the callback later calls
+ * sdhc_enable_interrupt() the controller does one fresh DAT1 sample:
+ * IRQ re-fires only if the chip is *currently* driving DAT1 low.
+ * Masking SIGNAL_ENABLE alone is not enough -- a transient DAT1 low
+ * between cycles (e.g. CCCR-IENx-driven from F2 with no chip-side
+ * SDPCMD_INTSTATUS bit set) gates the STATUS bit through the next
+ * sdhc_enable_interrupt() call and storms the ISR. Mirrors Linux's
+ * sdhci_enable_sdio_irq_nolock(host, false) -- drivers/mmc/host/sdhci.c.
  */
 static void sdhc_bcm2835_isr(const struct device *dev)
 {
@@ -1213,8 +1219,11 @@ static void sdhc_bcm2835_isr(const struct device *dev)
 	uint32_t status = sys_read32(base + SDHCI_INT_STATUS);
 
 	if (status & SDHCI_INT_CARD_INT) {
+		uint32_t int_en = sys_read32(base + SDHCI_INT_ENABLE);
 		uint32_t sig_en = sys_read32(base + SDHCI_SIGNAL_ENABLE);
 
+		sys_write32(int_en & ~SDHCI_INT_CARD_INT,
+			    base + SDHCI_INT_ENABLE);
 		sys_write32(sig_en & ~SDHCI_INT_CARD_INT,
 			    base + SDHCI_SIGNAL_ENABLE);
 		if (drvdata->sdhc_cb != NULL) {
