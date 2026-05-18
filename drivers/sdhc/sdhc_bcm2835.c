@@ -208,10 +208,23 @@ struct sdhc_bcm2835_data {
 	int dma_status;		/* set by callback; 0 = success */
 	struct dma_block_config dma_block;
 	struct dma_config dma_cfg;
+
+	/* SDIO in-band interrupt callback (set via .enable_interrupt). The
+	 * brcmfmac driver uses this to wake its RX thread when the chip
+	 * asserts DAT1 (CARD_INT). Mirrors Linux's sdhci card-irq path.
+	 */
+	sdhc_interrupt_cb_t sdhc_cb;
+	void *sdhc_cb_user_data;
 };
 
 /* Forward decl: error recovery in request() needs to reset the cmd line. */
 static int sdhc_bcm2835_soft_reset(const struct device *dev, uint32_t mask);
+
+/* Forward decl: IRQ_CONNECT in init() references it; body is below the
+ * polled request path (alongside the .enable_interrupt / .disable_interrupt
+ * implementations).
+ */
+static void sdhc_bcm2835_isr(const struct device *dev);
 
 /* Default command timeout when the caller leaves cmd->timeout_ms zero.
  * Linux uses 10s for non-data commands. On BCM2835 the hardware
@@ -1127,14 +1140,18 @@ static int sdhc_bcm2835_init(const struct device *dev)
 		return ret;
 	}
 
-	/* INT_ENABLE / SIGNAL_ENABLE: CMD_COMPLETE, DATA_END, the
-	 * PIO buffer-ready signals, and all CMD/DATA error bits. Both
-	 * registers carry the same value because this controller doesn't
-	 * latch INT_STATUS bits unless the matching SIGNAL_ENABLE bit is
-	 * set, even when the request path is polled. BUF_READ_READY and
-	 * BUF_WRITE_READY are mandatory for PIO data phases -- mirrors
-	 * Linux's bcm2835_mmc_set_transfer_irqs: pio_irqs =
-	 * SDHCI_INT_DATA_AVAIL | SDHCI_INT_SPACE_AVAIL.
+	/* INT_ENABLE controls which bits get LATCHED into INT_STATUS (per
+	 * SDHCI spec, independent of IRQ generation). The polled request()
+	 * path consumes those bits directly. CMD_COMPLETE/DATA_END/the PIO
+	 * buffer-ready bits/all CMD/DATA error bits + BUS_POWER_ERR. Mirrors
+	 * Linux's bcm2835_mmc_set_transfer_irqs.
+	 *
+	 * SIGNAL_ENABLE controls which bits PROPAGATE to the ARM IRQ line.
+	 * We leave it at 0 here; the only consumer that needs IRQs today is
+	 * SDIO CARD_INT (via brcmfmac), and it flips that bit on dynamically
+	 * via sdhc_enable_interrupt(SDHC_INT_SDIO). Keeping the polled bits
+	 * out of SIGNAL_ENABLE avoids the ISR re-firing for them while
+	 * request() is mid-poll on the same status word.
 	 */
 	uintptr_t base = DEVICE_MMIO_GET(dev);
 	uint32_t int_en = SDHCI_INT_CMD_COMPLETE | SDHCI_INT_DATA_END |
@@ -1145,7 +1162,7 @@ static int sdhc_bcm2835_init(const struct device *dev)
 			  SDHCI_INT_DATA_END_BIT |
 			  BIT(23);	/* BUS_POWER_ERR */
 	sys_write32(int_en, base + SDHCI_INT_ENABLE);
-	sys_write32(int_en, base + SDHCI_SIGNAL_ENABLE);
+	sys_write32(0,      base + SDHCI_SIGNAL_ENABLE);
 
 	struct sdhc_io ios = {
 		.clock = SDMMC_CLOCK_400KHZ,
@@ -1163,6 +1180,92 @@ static int sdhc_bcm2835_init(const struct device *dev)
 	sdhc_bcm2835_selftest(dev);
 #endif
 
+	/* Wire the Arasan IRQ line. Card-int is NOT enabled at boot --
+	 * brcmfmac flips it on via sdhc_enable_interrupt(SDHC_INT_SDIO)
+	 * once it's ready to handle RX wakes. Other status bits stay
+	 * latched (per the polled request() path) but won't fire IRQs
+	 * unless their SIGNAL_ENABLE bit is also set, which it isn't.
+	 */
+	IRQ_CONNECT(DT_INST_IRQN(0), DT_INST_IRQ(0, priority),
+		    sdhc_bcm2835_isr, DEVICE_DT_INST_GET(0), 0);
+	irq_enable(DT_INST_IRQN(0));
+
+	return 0;
+}
+
+/* SDIO in-band interrupt path -------------------------------------------- */
+
+/* ISR demuxes INT_STATUS for the SDIO CARD_INT (DAT1-low) bit only. All
+ * other bits (CMD_COMPLETE, DATA_END, etc.) are still handled by the polled
+ * request() path -- the ISR leaves them latched so the polled reader can
+ * see them.
+ *
+ * CARD_INT is level-sensitive on DAT1: W1C on INT_STATUS won't deassert
+ * the line while the chip still has pending events. So instead of clearing
+ * the bit, we mask it in SIGNAL_ENABLE here, and the callback is expected
+ * to drain the chip and re-enable via sdhc_enable_interrupt(). Matches
+ * Zephyr's other SDHC drivers (imx_usdhc.c comment line 147).
+ */
+static void sdhc_bcm2835_isr(const struct device *dev)
+{
+	struct sdhc_bcm2835_data *drvdata = dev->data;
+	uintptr_t base = DEVICE_MMIO_GET(dev);
+	uint32_t status = sys_read32(base + SDHCI_INT_STATUS);
+
+	if (status & SDHCI_INT_CARD_INT) {
+		uint32_t sig_en = sys_read32(base + SDHCI_SIGNAL_ENABLE);
+
+		sys_write32(sig_en & ~SDHCI_INT_CARD_INT,
+			    base + SDHCI_SIGNAL_ENABLE);
+		if (drvdata->sdhc_cb != NULL) {
+			drvdata->sdhc_cb(dev, SDHC_INT_SDIO,
+					 drvdata->sdhc_cb_user_data);
+		}
+	}
+}
+
+static int sdhc_bcm2835_enable_interrupt(const struct device *dev,
+					 sdhc_interrupt_cb_t callback,
+					 int sources, void *user_data)
+{
+	struct sdhc_bcm2835_data *drvdata = dev->data;
+	uintptr_t base = DEVICE_MMIO_GET(dev);
+
+	if (sources & ~SDHC_INT_SDIO) {
+		/* Only CARD_INT plumbing today; card insert/remove would need
+		 * extra wiring (the Pi has no detect line for the SDIO slot).
+		 */
+		return -ENOTSUP;
+	}
+
+	drvdata->sdhc_cb = callback;
+	drvdata->sdhc_cb_user_data = user_data;
+
+	if (sources & SDHC_INT_SDIO) {
+		uint32_t int_en = sys_read32(base + SDHCI_INT_ENABLE);
+		uint32_t sig_en = sys_read32(base + SDHCI_SIGNAL_ENABLE);
+
+		sys_write32(int_en | SDHCI_INT_CARD_INT,
+			    base + SDHCI_INT_ENABLE);
+		sys_write32(sig_en | SDHCI_INT_CARD_INT,
+			    base + SDHCI_SIGNAL_ENABLE);
+	}
+	return 0;
+}
+
+static int sdhc_bcm2835_disable_interrupt(const struct device *dev, int sources)
+{
+	uintptr_t base = DEVICE_MMIO_GET(dev);
+
+	if (sources & SDHC_INT_SDIO) {
+		uint32_t int_en = sys_read32(base + SDHCI_INT_ENABLE);
+		uint32_t sig_en = sys_read32(base + SDHCI_SIGNAL_ENABLE);
+
+		sys_write32(int_en & ~SDHCI_INT_CARD_INT,
+			    base + SDHCI_INT_ENABLE);
+		sys_write32(sig_en & ~SDHCI_INT_CARD_INT,
+			    base + SDHCI_SIGNAL_ENABLE);
+	}
 	return 0;
 }
 
@@ -1173,6 +1276,8 @@ static DEVICE_API(sdhc, sdhc_bcm2835_api) = {
 	.get_card_present = sdhc_bcm2835_get_card_present,
 	.reset = sdhc_bcm2835_reset,
 	.card_busy = sdhc_bcm2835_card_busy,
+	.enable_interrupt = sdhc_bcm2835_enable_interrupt,
+	.disable_interrupt = sdhc_bcm2835_disable_interrupt,
 };
 
 #define SDHC_BCM2835_INIT(inst)							\

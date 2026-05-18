@@ -23,6 +23,7 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/drivers/sdhc.h>
 #include <zephyr/sd/sd_spec.h>
 #include <zephyr/sd/sdio.h>
 
@@ -103,6 +104,38 @@ static const uint8_t *brcmfmac_rx_body(struct sdpcm_sw_hdr *sw,
 	return (const uint8_t *)sw + (hdr_len - sizeof(struct sdpcm_frame_hdr));
 }
 
+/* SDHC SDIO_INT callback: chip asserted DAT1 (CARD_INT). Wake the RX
+ * thread. Runs in ISR context; keep it minimal. The SDHC driver auto-
+ * masks SIGNAL_ENABLE[CARD_INT] before invoking the callback, so we
+ * re-arm via sdhc_enable_interrupt() in brcmfmac_rx_wait() below.
+ */
+static void brcmfmac_card_int_cb(const struct device *sdhc_dev, int reason,
+				 const void *user_data)
+{
+	ARG_UNUSED(sdhc_dev);
+	struct brcmfmac_data *data = (struct brcmfmac_data *)user_data;
+
+	if (reason == SDHC_INT_SDIO) {
+		k_sem_give(&data->rx_irq_sem);
+	}
+}
+
+/* Block until the chip wakes us via CARD_INT, or until the safety-net
+ * timeout. Re-arms the SDHC card-int line (each ISR fire auto-masks
+ * SIGNAL_ENABLE[CARD_INT]) first; the chip side keeps DAT1 deasserted
+ * via the SDPCMD intstatus W1C ack done in the main loop above.
+ *
+ * Safety-net is short (10 ms) -- under normal operation the IRQ is what
+ * wakes us, but small frames during early boot (DHCP, ARP) can race
+ * with our IRQ-arm window; the poll keeps us responsive.
+ */
+static void brcmfmac_rx_wait(struct brcmfmac_data *data)
+{
+	(void)sdhc_enable_interrupt(data->card.sdhc, brcmfmac_card_int_cb,
+				    SDHC_INT_SDIO, data);
+	(void)k_sem_take(&data->rx_irq_sem, K_MSEC(10));
+}
+
 static void brcmfmac_rx_thread_fn(void *p1, void *p2, void *p3)
 {
 	struct brcmfmac_data *data = p1;
@@ -140,7 +173,7 @@ static void brcmfmac_rx_thread_fn(void *p1, void *p2, void *p3)
 					 rx_buf, BRCMFMAC_F2_BLOCK_SIZE);
 		if (ret != 0) {
 			LOG_DBG("rx thread: F2 read failed: %d", ret);
-			k_msleep(BRCMFMAC_RX_IDLE_SLEEP_MS);
+			brcmfmac_rx_wait(data);
 			continue;
 		}
 
@@ -150,7 +183,7 @@ static void brcmfmac_rx_thread_fn(void *p1, void *p2, void *p3)
 		uint16_t xor_check = (uint16_t)(fh->len ^ fh->notlen);
 		if (xor_check != 0xFFFFu) {
 			/* No valid frame queued -- chip's F2 returned junk. */
-			k_msleep(BRCMFMAC_RX_IDLE_SLEEP_MS);
+			brcmfmac_rx_wait(data);
 			continue;
 		}
 		if (fh->len < sizeof(*fh) + sizeof(*sw)) {
@@ -158,8 +191,50 @@ static void brcmfmac_rx_thread_fn(void *p1, void *p2, void *p3)
 			 * signaling. Linux's brcmfmac handles these silently.
 			 */
 			LOG_DBG("rx thread: short frame (len=%u)", fh->len);
-			k_msleep(BRCMFMAC_RX_IDLE_SLEEP_MS);
+			brcmfmac_rx_wait(data);
 			continue;
+		}
+
+		/* Update tx-window from the chip. Mirrors Linux's
+		 * brcmf_sdio_hdparse: every valid SDPCM header carries the
+		 * chip's current tx_seq_max in sw->credit. Clamp to seq+2 if
+		 * the window is implausibly far ahead (>0x40 of our txseq) --
+		 * Linux does the same to defend against firmware bugs. Then
+		 * wake any TX path waiting on credits.
+		 */
+		{
+			uint8_t new_max = sw->credit;
+			if ((uint8_t)(new_max - data->sdpcm_txseq) > 0x40) {
+				new_max = data->sdpcm_txseq + 2;
+			}
+			data->sdpcm_tx_max = new_max;
+			k_sem_give(&data->tx_credit_sem);
+		}
+
+		/* Ack the chip-side SDPCMD intstatus so DAT1 deasserts once
+		 * we've drained the matching FIFO data. Without this the chip
+		 * keeps the host-int line asserted (HMB_SW2 / HMB_SW3 latched)
+		 * and the SDHC ISR re-fires in a tight loop. Mirrors Linux's
+		 * brcmf_sdio_dpc, which writes back the same bits it read
+		 * (the SDPCMD intstatus register is W1C).
+		 */
+		{
+			const struct bcm_core *sdio_core =
+				brcmfmac_chip_core_find(data, BCMA_CORE_SDIO_DEV);
+			if (sdio_core != NULL) {
+				uint32_t ist = 0;
+
+				if (brcmfmac_sdio_backplane_read32(
+					    data,
+					    sdio_core->base + SDPCMD_INTSTATUS,
+					    &ist) == 0 &&
+				    (ist & BRCMFMAC_HOSTINTMASK) != 0) {
+					(void)brcmfmac_sdio_backplane_write32(
+						data,
+						sdio_core->base + SDPCMD_INTSTATUS,
+						ist & BRCMFMAC_HOSTINTMASK);
+				}
+			}
 		}
 
 		/* Phase 2: if the frame spans more than one block, read the
@@ -209,7 +284,7 @@ static void brcmfmac_rx_thread_fn(void *p1, void *p2, void *p3)
 			if (ret != 0) {
 				LOG_WRN("rx: phase-2 read failed (len=%u, ret=%d)",
 					fh->len, ret);
-				k_msleep(BRCMFMAC_RX_IDLE_SLEEP_MS);
+				brcmfmac_rx_wait(data);
 				continue;
 			}
 		}
@@ -317,6 +392,75 @@ int brcmfmac_bcdc_init(struct brcmfmac_data *data)
 	k_sem_init(&data->pending.done, 0, 1);
 	data->pending.active = false;
 
+	/* Tell the chip which intstatus bits should assert DAT1. Without this
+	 * the chip's SDIO core stays silent on the bus even when it has frames
+	 * queued -- our SDHC CARD_INT path would never see an assert, and the
+	 * RX thread would sleep at its safety-net timeout forever. Linux does
+	 * the same write in brcmf_sdio_init right after F2 is up.
+	 */
+	{
+		const struct bcm_core *sdio_core =
+			brcmfmac_chip_core_find(data, BCMA_CORE_SDIO_DEV);
+
+		if (sdio_core != NULL) {
+			int rc2 = brcmfmac_sdio_backplane_write32(
+				data, sdio_core->base + SDPCMD_HOSTINTMASK,
+				BRCMFMAC_HOSTINTMASK);
+			if (rc2 != 0) {
+				LOG_WRN("hostintmask write failed: %d (CARD_INT path will be slow)",
+					rc2);
+			} else {
+				LOG_INF("chip hostintmask = 0x%08x",
+					BRCMFMAC_HOSTINTMASK);
+			}
+		}
+	}
+
+	/* Enable the SDIO card's per-function interrupt output via CCCR IENx
+	 * (F0 register 0x04). Bit 0 = master enable (IENM); bit N = function N
+	 * IRQ enable. Without this the chip's SDIO core can have HMB bits set
+	 * but won't actually pull DAT1 low to interrupt the host. Mirrors
+	 * Linux's brcmf_sdiod_intr_register (brcmfmac/bcmsdh.c:144-147), which
+	 * enables FUNC0 | FUNC1 | FUNC2: the chip's SDPCMD core sits on F1, so
+	 * HMB frame-ready signals are F1-level IRQs -- enabling F2 alone
+	 * leaves DAT1 silent even with HOSTINTMASK + intstatus set.
+	 */
+	{
+		uint8_t ienx = 0;
+		int rc2 = sdio_read_byte(&data->card.func0,
+					 SDIO_CCCR_INT_EN, &ienx);
+		if (rc2 == 0) {
+			ienx |= 0x01;                       /* IENM master */
+			ienx |= 1u << SDIO_FUNC_NUM_1;      /* F1 (SDPCMD/HMB) */
+			ienx |= 1u << SDIO_FUNC_NUM_2;      /* F2 (data path) */
+			rc2 = sdio_write_byte(&data->card.func0,
+					      SDIO_CCCR_INT_EN, ienx);
+		}
+		if (rc2 != 0) {
+			LOG_WRN("CCCR IENx setup failed: %d (CARD_INT will not fire)",
+				rc2);
+		} else {
+			LOG_INF("CCCR IENx = 0x%02x (master + F1 SDPCMD + F2 data)",
+				ienx);
+		}
+	}
+
+	/* SDPCM tx-credit accounting (mirrors Linux brcmfmac/sdio.c).
+	 * Initial window of 4 lets the first 4 outgoing frames fly before
+	 * we need the chip to report its tx_max in an RX SDPCM header.
+	 */
+	data->sdpcm_txseq = 0;
+	data->sdpcm_tx_max = 4;
+	k_sem_init(&data->tx_credit_sem, 0, 1);
+
+	/* SDIO in-band IRQ -- replaces the old 1 ms RX poll. The SDHC
+	 * driver auto-masks SIGNAL_ENABLE[CARD_INT] each time the ISR
+	 * fires; brcmfmac_rx_wait() re-arms via sdhc_enable_interrupt()
+	 * (idempotent). First call from the rx thread also performs the
+	 * initial enable.
+	 */
+	k_sem_init(&data->rx_irq_sem, 0, 1);
+
 	k_thread_create(&brcmfmac_rx_thread, brcmfmac_rx_stack,
 			K_KERNEL_STACK_SIZEOF(brcmfmac_rx_stack),
 			brcmfmac_rx_thread_fn, data, NULL, NULL,
@@ -338,6 +482,29 @@ int brcmfmac_bcdc_tx_frame(struct brcmfmac_data *data, uint8_t chan,
 {
 	struct sdpcm_frame_hdr *fh = (void *)frame;
 	struct sdpcm_sw_hdr *sw = (void *)(frame + sizeof(*fh));
+
+	/* Wait for SDPCM tx-credit (mirrors Linux brcmfmac/sdio.c::data_ok).
+	 * Chip's tx_max is updated from every incoming SDPCM header in the
+	 * RX thread. The 8-bit underflow trick: when txseq has overtaken
+	 * tx_max, (tx_max - txseq) is >= 0x80, so masking with 0x80 catches
+	 * both "no credits" and "negative delta" in one check.
+	 *
+	 * Up to ~100 ms total wait (5 × 20 ms). If we still have no credits
+	 * after that, return -EAGAIN so the caller (net stack) can drop or
+	 * requeue.
+	 */
+	for (int retry = 0; retry < 5; retry++) {
+		uint8_t delta = (uint8_t)(data->sdpcm_tx_max - data->sdpcm_txseq);
+
+		if (delta != 0 && (delta & 0x80) == 0) {
+			break;
+		}
+		if (k_sem_take(&data->tx_credit_sem, K_MSEC(20)) != 0) {
+			LOG_WRN("tx_frame: credit timeout (txseq=%u tx_max=%u)",
+				data->sdpcm_txseq, data->sdpcm_tx_max);
+			return -EAGAIN;
+		}
+	}
 
 	fh->len = total;
 	fh->notlen = (uint16_t)~total;

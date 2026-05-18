@@ -63,6 +63,15 @@
 
 /* SDIO core register offset within data base. */
 #define SDPCMD_INTSTATUS                0x20     /* W1C ack-all = 0xFFFFFFFF */
+#define SDPCMD_HOSTINTMASK              0x24     /* which intstatus bits raise DAT1 (host-IRQ) */
+
+/* Chip-side host-int mask (mirrors Linux HOSTINTMASK in brcmfmac/sdio.c):
+ *   I_HMB_SW_MASK = 0x000000f0  -- mailbox SW interrupts 0..3 (incl. FRAME_IND)
+ *   I_CHIPACTIVE  = 0x20000000  -- chip transitioned from doze to active
+ * Without this, the chip processes events but never asserts DAT1, so the
+ * SDHC CARD_INT path stays silent and the brcmfmac RX thread sleeps forever.
+ */
+#define BRCMFMAC_HOSTINTMASK            (0x000000F0u | (1u << 29))
 
 /* BCMA wrapper-register offsets (within wrapbase). */
 #define BCMA_IOCTL                      0x0408
@@ -357,7 +366,10 @@ struct brcmfmac_data {
 
 	/* BCDC protocol state. */
 	bool f2_ready;
-	uint8_t sdpcm_txseq;
+	uint8_t sdpcm_txseq;     /* next outgoing SDPCM seq (8-bit wrap) */
+	uint8_t sdpcm_tx_max;    /* chip-reported tx-window upper bound */
+	struct k_sem tx_credit_sem;  /* signaled on every RX SDPCM hdr parse */
+	struct k_sem rx_irq_sem;     /* signaled by SDHC SDIO_INT callback */
 	uint16_t bcdc_reqid;
 	struct k_mutex bcdc_mutex;
 	struct brcmfmac_pending_ioctl pending;
