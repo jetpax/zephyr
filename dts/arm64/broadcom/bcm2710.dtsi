@@ -103,8 +103,14 @@
 		};
 
 		rng: rng@3f104000 {
-			compatible = "brcm,iproc-rng200";
-			reg = <0x3f104000 0x28>;
+			/*
+			 * BCM2710 / BCM2837 / BCM2835 (Pi 1/2/3/Zero family)
+			 * carries the simple bcm2835-rng — NOT the iProc RNG200
+			 * (which is BCM2711 / Pi 4 only). Register block is 16
+			 * bytes (CTRL/STATUS/DATA/INT_MASK), not 0x28.
+			 */
+			compatible = "brcm,bcm2835-rng";
+			reg = <0x3f104000 0x10>;
 			status = "okay";
 		};
 
