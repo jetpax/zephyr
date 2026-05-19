@@ -104,7 +104,7 @@ static int brcmfmac_probe_sdio(const struct device *dev)
 		LOG_ERR("sdio_set_block_size(F1, 64) failed: %d", ret);
 		return ret;
 	}
-	LOG_INF("F1 claimed (max_blk=%u)", data->backplane.cis.max_blk_size);
+	LOG_DBG("F1 claimed (max_blk=%u)", data->backplane.cis.max_blk_size);
 	return 0;
 }
 
@@ -230,7 +230,7 @@ static int brcmfmac_init(const struct device *dev)
 		if (rret != 0) {
 			LOG_WRN("pm2_sleep_ret=2000 set failed: %d (best-effort)", rret);
 		}
-		LOG_INF("post-up tuning: roam_off=1 bcn_timeout=4s pm=FAST pm2_sleep_ret=2000ms");
+		LOG_DBG("post-up tuning: roam_off=1 bcn_timeout=4s pm=FAST pm2_sleep_ret=2000ms");
 	}
 
 	data->probed = true;

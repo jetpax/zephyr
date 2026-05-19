@@ -170,12 +170,12 @@ static void brcmfmac_rx_thread_fn(void *p1, void *p2, void *p3)
 	static uint32_t rx_valid;
 	static uint32_t rx_ist_acc;  /* OR of masked SDPCMD_INTSTATUS this window */
 
-	LOG_INF("rx thread started");
+	LOG_DBG("rx thread started");
 
 	while (1) {
 		rx_iters++;
 		if ((rx_iters & 0x3FF) == 0) {
-			LOG_INF("rx stats: t=%lldms iters=%u isr=%ld valid=%u ist=0x%x txseq=%u txmax=%u",
+			LOG_DBG("rx stats: t=%lldms iters=%u isr=%ld valid=%u ist=0x%x txseq=%u txmax=%u",
 				k_uptime_get(), rx_iters,
 				(long)atomic_get(&brcmf_isr_fires), rx_valid,
 				rx_ist_acc, data->sdpcm_txseq,
@@ -415,7 +415,7 @@ static int brcmfmac_bcdc_enable_f2(struct brcmfmac_data *data)
 			return ret;
 		}
 		if (reg & BIT(SDIO_FUNC_NUM_2)) {
-			LOG_INF("F2 IOR up after %lld ms",
+			LOG_DBG("F2 IOR up after %lld ms",
 				(long long)(k_uptime_get() - t0));
 			return 0;
 		}
@@ -469,7 +469,7 @@ int brcmfmac_bcdc_init(struct brcmfmac_data *data)
 				LOG_WRN("hostintmask write failed: %d (CARD_INT path will be slow)",
 					rc2);
 			} else {
-				LOG_INF("chip hostintmask = 0x%08x",
+				LOG_DBG("chip hostintmask = 0x%08x",
 					BRCMFMAC_HOSTINTMASK);
 			}
 		}
@@ -499,7 +499,7 @@ int brcmfmac_bcdc_init(struct brcmfmac_data *data)
 			LOG_WRN("CCCR IENx setup failed: %d (CARD_INT will not fire)",
 				rc2);
 		} else {
-			LOG_INF("CCCR IENx = 0x%02x (master + F1 SDPCMD + F2 data)",
+			LOG_DBG("CCCR IENx = 0x%02x (master + F1 SDPCMD + F2 data)",
 				ienx);
 		}
 	}
@@ -550,7 +550,7 @@ int brcmfmac_bcdc_init(struct brcmfmac_data *data)
 	k_thread_name_set(&brcmfmac_tx_thread, "brcmfmac_tx");
 
 	data->f2_ready = true;
-	LOG_INF("F2 claimed (block_size=%u), rx+tx threads up",
+	LOG_DBG("F2 claimed (block_size=%u), rx+tx threads up",
 		BRCMFMAC_F2_BLOCK_SIZE);
 	return 0;
 }

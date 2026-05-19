@@ -305,7 +305,7 @@ int brcmfmac_sdio_fw_upload(struct brcmfmac_data *data)
 		LOG_ERR("fw verify failed: %d", ret);
 		return ret;
 	}
-	LOG_INF("fw verify OK in %lld ms", (long long)(k_uptime_get() - t1));
+	LOG_DBG("fw verify OK in %lld ms", (long long)(k_uptime_get() - t1));
 	return 0;
 }
 
@@ -318,7 +318,7 @@ int brcmfmac_sdio_nvram_upload(struct brcmfmac_data *data)
 		LOG_ERR("nvram_strip failed: %d", stripped);
 		return stripped;
 	}
-	LOG_INF("nvram strip: %u -> %d bytes (incl. token footer)",
+	LOG_DBG("nvram strip: %u -> %d bytes (incl. token footer)",
 		brcmfmac_nvram_len, stripped);
 
 	const uint32_t ramsize = 0x80000u;   /* SOCRAM = 512 KiB on BCM43430A1 */
@@ -332,7 +332,7 @@ int brcmfmac_sdio_nvram_upload(struct brcmfmac_data *data)
 		return ret;
 	}
 	int64_t t1 = k_uptime_get();
-	LOG_INF("nvram upload OK @ chip 0x%08x in %lld ms",
+	LOG_DBG("nvram upload OK @ chip 0x%08x in %lld ms",
 		nvram_addr, (long long)(t1 - t0));
 
 	ret = brcmfmac_sdio_verify_memory(data, nvram_addr, nvram_buf,
@@ -341,6 +341,6 @@ int brcmfmac_sdio_nvram_upload(struct brcmfmac_data *data)
 		LOG_ERR("nvram verify failed: %d", ret);
 		return ret;
 	}
-	LOG_INF("nvram verify OK in %lld ms", (long long)(k_uptime_get() - t1));
+	LOG_DBG("nvram verify OK in %lld ms", (long long)(k_uptime_get() - t1));
 	return 0;
 }

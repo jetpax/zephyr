@@ -161,7 +161,7 @@ int brcmfmac_chip_erom_scan(struct brcmfmac_data *data)
 		LOG_ERR("erom_scan: read eromptr failed: %d", ret);
 		return ret;
 	}
-	LOG_INF("erom_scan: eromptr=0x%08x", erom_addr);
+	LOG_DBG("erom_scan: eromptr=0x%08x", erom_addr);
 
 	data->num_cores = 0;
 	uint8_t desc_type = 0;
@@ -215,12 +215,12 @@ int brcmfmac_chip_erom_scan(struct brcmfmac_data *data)
 		data->cores[data->num_cores].id = id;
 		data->cores[data->num_cores].base = base;
 		data->cores[data->num_cores].wrapbase = wrap;
-		LOG_INF("erom_scan: core[%u] id=0x%03x base=0x%08x wrap=0x%08x",
+		LOG_DBG("erom_scan: core[%u] id=0x%03x base=0x%08x wrap=0x%08x",
 			data->num_cores, id, base, wrap);
 		data->num_cores++;
 	}
 
-	LOG_INF("erom_scan: discovered %u cores", data->num_cores);
+	LOG_DBG("erom_scan: discovered %u cores", data->num_cores);
 	return 0;
 }
 
@@ -358,7 +358,7 @@ int brcmfmac_chip_pmu_setup(struct brcmfmac_data *data)
 		LOG_ERR("ALP/HT never available (CHIPCLKCSR=0x%02x)", clkval);
 		return -ETIMEDOUT;
 	}
-	LOG_INF("CHIPCLKCSR=0x%02x (%s%s)", clkval,
+	LOG_DBG("CHIPCLKCSR=0x%02x (%s%s)", clkval,
 		(clkval & SBSDIO_ALP_AVAIL) ? "ALP " : "",
 		(clkval & SBSDIO_HT_AVAIL) ? "HT" : "");
 
@@ -398,14 +398,14 @@ int brcmfmac_chip_set_passive(struct brcmfmac_data *data)
 		return -ENODEV;
 	}
 
-	LOG_INF("set_passive: halt ARM CM3 (wrap=0x%08x)", arm->wrapbase);
+	LOG_DBG("set_passive: halt ARM CM3 (wrap=0x%08x)", arm->wrapbase);
 	int ret = ai_coredisable(data, arm->wrapbase, 0, 0);
 	if (ret != 0) {
 		LOG_ERR("set_passive: CM3 disable failed: %d", ret);
 		return ret;
 	}
 
-	LOG_INF("set_passive: reset D11 PHY (wrap=0x%08x)", d11->wrapbase);
+	LOG_DBG("set_passive: reset D11 PHY (wrap=0x%08x)", d11->wrapbase);
 	ret = ai_resetcore(data, d11->wrapbase,
 			   D11_BCMA_IOCTL_PHYRESET | D11_BCMA_IOCTL_PHYCLOCKEN,
 			   D11_BCMA_IOCTL_PHYCLOCKEN,
@@ -415,7 +415,7 @@ int brcmfmac_chip_set_passive(struct brcmfmac_data *data)
 		return ret;
 	}
 
-	LOG_INF("set_passive: reset SOCRAM (wrap=0x%08x base=0x%08x)",
+	LOG_DBG("set_passive: reset SOCRAM (wrap=0x%08x base=0x%08x)",
 		sr->wrapbase, sr->base);
 	ret = ai_resetcore(data, sr->wrapbase, 0, 0, 0);
 	if (ret != 0) {
@@ -425,13 +425,13 @@ int brcmfmac_chip_set_passive(struct brcmfmac_data *data)
 
 	(void)brcmfmac_sdio_backplane_write32(data, sr->base + SOCRAM_BANKIDX_OFFSET, 3);
 	(void)brcmfmac_sdio_backplane_write32(data, sr->base + SOCRAM_BANKPDA_OFFSET, 0);
-	LOG_INF("set_passive: bank-3 remap disabled");
+	LOG_DBG("set_passive: bank-3 remap disabled");
 
 	if (!ai_iscoreup(data, sr->wrapbase)) {
 		LOG_ERR("set_passive: SOCRAM did not come up");
 		return -EIO;
 	}
-	LOG_INF("set_passive: SOCRAM is up");
+	LOG_DBG("set_passive: SOCRAM is up");
 	return 0;
 }
 
@@ -448,7 +448,7 @@ int brcmfmac_chip_set_active(struct brcmfmac_data *data)
 		return -ENODEV;
 	}
 
-	LOG_INF("set_active: clear SDIO core intstatus");
+	LOG_DBG("set_active: clear SDIO core intstatus");
 	int ret = brcmfmac_sdio_backplane_write32(data,
 						  sdio_dev->base + SDPCMD_INTSTATUS,
 						  0xFFFFFFFFu);
@@ -457,14 +457,14 @@ int brcmfmac_chip_set_active(struct brcmfmac_data *data)
 		return ret;
 	}
 
-	LOG_INF("set_active: release ARM CM3");
+	LOG_DBG("set_active: release ARM CM3");
 	ret = ai_resetcore(data, arm->wrapbase, 0, 0, 0);
 	if (ret != 0) {
 		LOG_ERR("set_active: ARM resetcore failed: %d", ret);
 		return ret;
 	}
 
-	LOG_INF("set_active: request HT clock");
+	LOG_DBG("set_active: request HT clock");
 	ret = sdio_write_byte(&data->backplane, SBSDIO_FUNC1_CHIPCLKCSR,
 			      SBSDIO_HT_AVAIL_REQ);
 	if (ret != 0) {
@@ -492,7 +492,7 @@ int brcmfmac_chip_set_active(struct brcmfmac_data *data)
 			clkcsr, (long long)t_wait);
 		return -ETIMEDOUT;
 	}
-	LOG_INF("set_active: HT_AVAIL after %lld ms (CHIPCLKCSR=0x%02x)",
+	LOG_DBG("set_active: HT_AVAIL after %lld ms (CHIPCLKCSR=0x%02x)",
 		(long long)t_wait, clkcsr);
 
 	uint32_t chipid;
@@ -501,7 +501,7 @@ int brcmfmac_chip_set_active(struct brcmfmac_data *data)
 		LOG_ERR("set_active: post-boot chipid read failed: %d", ret);
 		return ret;
 	}
-	LOG_INF("set_active: post-boot chipid = 0x%08x (chip alive, fw running)",
+	LOG_DBG("set_active: post-boot chipid = 0x%08x (chip alive, fw running)",
 		chipid);
 	return 0;
 }
