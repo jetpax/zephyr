@@ -358,6 +358,32 @@ struct brcmfmac_pending_ioctl {
 	struct k_sem done;
 };
 
+/* TX glomming: queue net frames in a fixed-size ring, drain them in
+ * batches via one CMD53 per burst. Mirrors Linux brcmfmac's brcmf_sdio_txpkt
+ * pattern. Chip's `bus:txglom=7` confirms it accepts glommed SDPCM frames.
+ *
+ * Sizing: 16 slots × 1600 B = 25.6 KB ring; 12 KB single glom buffer.
+ * Up to 8 frames packed per CMD53 (gated by available SDPCM tx-credits
+ * at flush time -- partial batches go out promptly if credits are tight).
+ */
+#define BRCMFMAC_TX_RING_SLOTS       16
+#define BRCMFMAC_TX_SLOT_SIZE        1600
+/* TODO 2026-05-18: re-enable glom>1 once the txglom wire format is correct.
+ * Linux's brcmf_sdio_txpkt_prep (sdio.c:2264-2265) requires the FIRST frame's
+ * hw-length-tag to be the TOTAL chain length when bus->txglom is set; our
+ * current code put per-frame lengths in each fh, which made the chip drop
+ * everything but the first frame and the test fell to 0.1 Mb/s. Keep MAX=1
+ * to validate the ring+tx-thread infrastructure; iterate the wire format
+ * next session.
+ */
+#define BRCMFMAC_TX_GLOM_MAX_FRAMES  1
+#define BRCMFMAC_TX_GLOM_BUF_SIZE    2048
+
+struct brcmfmac_tx_slot {
+	uint16_t len;   /* 0 = empty */
+	uint8_t  data[BRCMFMAC_TX_SLOT_SIZE] __aligned(4);
+};
+
 struct brcmfmac_data {
 	struct sd_card card;
 	struct sdio_func backplane;     /* F1 */
@@ -403,6 +429,20 @@ struct brcmfmac_data {
 	uint8_t chip_mac[6];
 
 	bool probed;
+
+	/* TX glom ring: SPSC (iface_send produces, tx-thread consumes).
+	 * head/tail are atomics so producer/consumer don't need a lock.
+	 * Slot 0 .. head-1 are filled (mod N); tail .. head-1 are pending.
+	 */
+	struct brcmfmac_tx_slot tx_ring[BRCMFMAC_TX_RING_SLOTS];
+	atomic_t tx_ring_head;
+	atomic_t tx_ring_tail;
+	struct k_sem tx_pending_sem;
+
+	/* tx-thread-private glom assembly buffer. Holds the next CMD53's
+	 * worth of chained SDPCM frames before issuing the F2 write.
+	 */
+	uint8_t tx_glom_buf[BRCMFMAC_TX_GLOM_BUF_SIZE] __aligned(4);
 };
 
 /* === SDIO backplane primitives (brcmfmac_sdio.c) === */

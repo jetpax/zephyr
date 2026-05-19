@@ -266,6 +266,62 @@ static const struct brcmfmac_config brcmfmac_config_0 = {
 
 static struct brcmfmac_data brcmfmac_data_0;
 
+/* Diagnostic: read the chip's "counters" iovar and log the words we care
+ * about for the post-burst tx-credit investigation. Word indices identified
+ * 2026-05-18 by counter-delta sweep (see project memory) and are stable
+ * across reboots for the BCM43430A1 7.45.96.s1 firmware on the AP we use.
+ *
+ *   word 1  = txframe    (frames offered to PHY)
+ *   word 2  = txbyte     (bytes offered to PHY)
+ *   word 3  = txretrans  (per-frame retransmissions on air)
+ *   word 4  = txerror    (frames that errored out -- no ack after retry)
+ *   word 14 = (txphyerr / txnobuf -- chip-side TX queue / PHY failure)
+ *   word 18 = rxerror
+ *   word 20 = rxnobuf    (chip's host-RX FIFO overflow)
+ *
+ * Not safe from ISR (does a CMD53 round-trip). Call from a thread.
+ */
+void brcmfmac_counters_dump(const char *label)
+{
+	static uint8_t buf[1500];
+	int got = brcmfmac_bcdc_iovar_get(&brcmfmac_data_0, "counters",
+					  buf, sizeof(buf));
+	if (got < 0) {
+		LOG_ERR("counters[%s]: iovar_get failed: %d",
+			label ? label : "?", got);
+		return;
+	}
+	if (got < 84) {
+		LOG_ERR("counters[%s]: short read: %d bytes",
+			label ? label : "?", got);
+		return;
+	}
+
+	const uint32_t *w = (const uint32_t *)buf;
+	LOG_INF("counters[%s]: txframe=%u txbyte=%u txretrans=%u txerror=%u "
+		"w14=%u rxerror=%u rxnobuf=%u (resp=%d B)",
+		label ? label : "?",
+		w[1], w[2], w[3], w[4], w[14], w[18], w[20], got);
+}
+
+/* Public iovar interface — exposed for outside callers (MP user module,
+ * test code) that want to introspect or tweak the chip without reaching
+ * into driver-private state. `dev` is the brcmfmac net device, typically
+ * obtained via `net_if_get_device(net_if_get_first_wifi())`. Both paths
+ * do a CMD53 round-trip via BCDC — not safe from ISR.
+ */
+int brcmfmac_iovar_get(const struct device *dev, const char *name,
+		       uint8_t *buf, uint16_t len)
+{
+	return brcmfmac_bcdc_iovar_get(dev->data, name, buf, len);
+}
+
+int brcmfmac_iovar_set(const struct device *dev, const char *name,
+		       const uint8_t *value, uint16_t value_len)
+{
+	return brcmfmac_bcdc_iovar_set(dev->data, name, value, value_len);
+}
+
 NET_DEVICE_DT_INST_DEFINE(0, brcmfmac_init, NULL,
 			  &brcmfmac_data_0, &brcmfmac_config_0,
 			  CONFIG_WIFI_INIT_PRIORITY, &brcmfmac_api,

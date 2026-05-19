@@ -72,7 +72,6 @@ int brcmfmac_iface_send(const struct device *dev, struct net_pkt *pkt)
 {
 	struct brcmfmac_data *data = dev->data;
 	size_t pkt_len = net_pkt_get_len(pkt);
-	static uint8_t tx_buf[BRCMFMAC_ETH_FRAME_BUF_SIZE] __aligned(4);
 
 	if (!data->probed || !data->f2_ready) {
 		return -ENETDOWN;
@@ -82,40 +81,61 @@ int brcmfmac_iface_send(const struct device *dev, struct net_pkt *pkt)
 			     + sizeof(struct sdpcm_sw_hdr)
 			     + sizeof(struct bdc_hdr);
 
-	if (hdr_len + pkt_len > sizeof(tx_buf)) {
-		LOG_ERR("iface_send: oversize (%zu+%zu > %zu)",
-			hdr_len, pkt_len, sizeof(tx_buf));
+	if (hdr_len + pkt_len > BRCMFMAC_TX_SLOT_SIZE) {
+		LOG_ERR("iface_send: oversize (%zu+%zu > %u)",
+			hdr_len, pkt_len, (unsigned)BRCMFMAC_TX_SLOT_SIZE);
 		return -EMSGSIZE;
 	}
 
-	if (net_pkt_read(pkt, tx_buf + hdr_len, pkt_len) < 0) {
-		LOG_ERR("iface_send: net_pkt_read failed");
-		return -EIO;
+	/* Claim the next ring slot. iface_send is the sole producer, so head
+	 * is owned by us; tail is owned by the tx-thread. If head+1 == tail
+	 * the ring is full -- wait briefly for the consumer to drain.
+	 */
+	int head = atomic_get(&data->tx_ring_head);
+	int next = (head + 1) % BRCMFMAC_TX_RING_SLOTS;
+	for (int retry = 0; next == atomic_get(&data->tx_ring_tail); retry++) {
+		if (retry >= 20) {
+			return -ENOBUFS;
+		}
+		k_sleep(K_MSEC(1));
 	}
 
-	const uint8_t *l2 = tx_buf + hdr_len;
-	LOG_DBG("TX  len=%zu  dst=%02x:%02x:%02x:%02x:%02x:%02x  type=0x%02x%02x",
-		pkt_len,
-		l2[0], l2[1], l2[2], l2[3], l2[4], l2[5],
-		l2[12], l2[13]);
+	struct brcmfmac_tx_slot *slot = &data->tx_ring[head];
 
-	struct bdc_hdr *bdc = (void *)(tx_buf + sizeof(struct sdpcm_frame_hdr)
-					      + sizeof(struct sdpcm_sw_hdr));
+	/* Build SDPCM sw_hdr + BDC hdr in-place. fh->len/notlen + sw->seq
+	 * are filled by the tx-thread at flush time when it knows the
+	 * batch's seq numbers.
+	 */
+	struct sdpcm_sw_hdr *sw =
+		(struct sdpcm_sw_hdr *)(slot->data + sizeof(struct sdpcm_frame_hdr));
+	sw->seq = 0;
+	sw->chan = SDPCM_CHAN_DATA;
+	sw->nextlen = 0;
+	sw->hdrlen = sizeof(struct sdpcm_frame_hdr) + sizeof(struct sdpcm_sw_hdr);
+	sw->flow = 0;
+	sw->credit = 0;
+	sw->reserved[0] = 0;
+	sw->reserved[1] = 0;
+
+	struct bdc_hdr *bdc =
+		(struct bdc_hdr *)(slot->data + sizeof(struct sdpcm_frame_hdr)
+				   + sizeof(struct sdpcm_sw_hdr));
 	bdc->flags = BDC_PROTO_VER << BDC_PROTO_VER_SHIFT;
 	bdc->priority = 0;
 	bdc->flags2 = 0;
 	bdc->data_offset = 0;
 
-	uint16_t total = (uint16_t)(hdr_len + pkt_len);
-
-	k_mutex_lock(&data->bcdc_mutex, K_FOREVER);
-	int ret = brcmfmac_bcdc_tx_frame(data, SDPCM_CHAN_DATA, tx_buf, total);
-	k_mutex_unlock(&data->bcdc_mutex);
-
-	if (ret != 0) {
-		LOG_ERR("iface_send: F2 TX failed: %d", ret);
+	if (net_pkt_read(pkt, slot->data + hdr_len, pkt_len) < 0) {
+		LOG_ERR("iface_send: net_pkt_read failed");
 		return -EIO;
 	}
+	slot->len = (uint16_t)(hdr_len + pkt_len);
+
+	/* Publish to consumer + wake it. The tx-thread drains the ring
+	 * and issues one glommed CMD53 per batch.
+	 */
+	atomic_set(&data->tx_ring_head, next);
+	k_sem_give(&data->tx_pending_sem);
 	return 0;
 }
 

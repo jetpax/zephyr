@@ -57,6 +57,11 @@ LOG_MODULE_DECLARE(brcmfmac, CONFIG_WIFI_LOG_LEVEL);
 K_KERNEL_STACK_DEFINE(brcmfmac_rx_stack, CONFIG_WIFI_BRCMFMAC_RX_THREAD_STACK_SIZE);
 static struct k_thread brcmfmac_rx_thread;
 
+K_KERNEL_STACK_DEFINE(brcmfmac_tx_stack, 4096);
+static struct k_thread brcmfmac_tx_thread;
+
+static void brcmfmac_tx_thread_fn(void *p1, void *p2, void *p3);
+
 /* Bisection instrumentation (2026-05-17): IRQ rate + RX-thread iter rate
  * to disambiguate ISR-storm vs sem-wait-scheduling vs upper-stack
  * starvation as the cause of the DHCP failure when brcmfmac switches
@@ -521,8 +526,31 @@ int brcmfmac_bcdc_init(struct brcmfmac_data *data)
 			CONFIG_WIFI_BRCMFMAC_RX_THREAD_PRIO, 0, K_NO_WAIT);
 	k_thread_name_set(&brcmfmac_rx_thread, "brcmfmac_rx");
 
+	/* TX glom ring + worker. iface_send copies each net frame into a
+	 * pre-allocated slot and signals tx_pending_sem; the tx-thread
+	 * drains the ring, packs up to N frames into tx_glom_buf, and
+	 * issues one CMD53 per burst.
+	 */
+	atomic_set(&data->tx_ring_head, 0);
+	atomic_set(&data->tx_ring_tail, 0);
+	k_sem_init(&data->tx_pending_sem, 0, 1);
+	for (int i = 0; i < BRCMFMAC_TX_RING_SLOTS; i++) {
+		data->tx_ring[i].len = 0;
+	}
+
+	/* TX thread at one priority LOWER than RX (CONFIG_WIFI_BRCMFMAC_RX_THREAD_PRIO + 1).
+	 * RX must preempt TX so that credit-grant SDPCM headers are parsed
+	 * promptly; with both at the same priority and timeslicing off (Zephyr
+	 * default), a back-to-back-CMD53 TX loop starves RX and credits stall.
+	 */
+	k_thread_create(&brcmfmac_tx_thread, brcmfmac_tx_stack,
+			K_KERNEL_STACK_SIZEOF(brcmfmac_tx_stack),
+			brcmfmac_tx_thread_fn, data, NULL, NULL,
+			CONFIG_WIFI_BRCMFMAC_RX_THREAD_PRIO + 1, 0, K_NO_WAIT);
+	k_thread_name_set(&brcmfmac_tx_thread, "brcmfmac_tx");
+
 	data->f2_ready = true;
-	LOG_INF("F2 claimed (block_size=%u), rx thread up",
+	LOG_INF("F2 claimed (block_size=%u), rx+tx threads up",
 		BRCMFMAC_F2_BLOCK_SIZE);
 	return 0;
 }
@@ -585,6 +613,109 @@ int brcmfmac_bcdc_tx_frame(struct brcmfmac_data *data, uint8_t chan,
 	return sdio_write_addr(&data->radio, BRCMFMAC_F2_FIFO_ADDR, frame, padded);
 }
 
+/* TX glom worker. iface_send pushes pre-built SDPCM frames into the ring
+ * (slot->data already has sw_hdr + bdc_hdr + payload at the right offsets;
+ * only fh->len/notlen and sw->seq are filled in here under bcdc_mutex).
+ *
+ * Pack up to BRCMFMAC_TX_GLOM_MAX_FRAMES frames into tx_glom_buf, gated by:
+ *   - chip's SDPCM tx-credit window (same delta check as bcdc_tx_frame)
+ *   - chip's per-frame xoff (brcmf_fcstate)
+ *   - glom buffer size (12 KB)
+ *
+ * Then one F2 CMD53 for the entire batch. If no credit/xoff at all, wait on
+ * tx_credit_sem and retry (the rx thread signals it on every chip credit
+ * update). If credit allows only a partial batch, send what we have now.
+ */
+static void brcmfmac_tx_thread_fn(void *p1, void *p2, void *p3)
+{
+	struct brcmfmac_data *data = p1;
+
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	for (;;) {
+		(void)k_sem_take(&data->tx_pending_sem, K_FOREVER);
+
+		while (atomic_get(&data->tx_ring_tail) !=
+		       atomic_get(&data->tx_ring_head)) {
+
+			k_mutex_lock(&data->bcdc_mutex, K_FOREVER);
+
+			uint16_t glom_len = 0;
+			uint8_t frame_count = 0;
+
+			while (frame_count < BRCMFMAC_TX_GLOM_MAX_FRAMES) {
+				int tail = atomic_get(&data->tx_ring_tail);
+				int head = atomic_get(&data->tx_ring_head);
+				if (tail == head) {
+					break;
+				}
+
+				struct brcmfmac_tx_slot *slot = &data->tx_ring[tail];
+				uint16_t padded = (slot->len + 3) & ~3u;
+
+				if (glom_len + padded > BRCMFMAC_TX_GLOM_BUF_SIZE) {
+					break;
+				}
+
+				uint8_t delta = (uint8_t)(data->sdpcm_tx_max -
+							  data->sdpcm_txseq);
+				bool have_credit = (delta != 0 &&
+						    (delta & 0x80) == 0);
+				bool xoff = atomic_get(&brcmf_fcstate) != 0;
+
+				if (!have_credit || xoff) {
+					break;
+				}
+
+				struct sdpcm_frame_hdr *fh =
+					(struct sdpcm_frame_hdr *)slot->data;
+				struct sdpcm_sw_hdr *sw =
+					(struct sdpcm_sw_hdr *)(slot->data + sizeof(*fh));
+
+				fh->len = slot->len;
+				fh->notlen = (uint16_t)~slot->len;
+				sw->seq = data->sdpcm_txseq++;
+
+				memcpy(data->tx_glom_buf + glom_len, slot->data, slot->len);
+				if (padded > slot->len) {
+					memset(data->tx_glom_buf + glom_len + slot->len,
+					       0, padded - slot->len);
+				}
+				glom_len += padded;
+				frame_count++;
+
+				atomic_set(&data->tx_ring_tail,
+					   (tail + 1) % BRCMFMAC_TX_RING_SLOTS);
+			}
+
+			if (frame_count > 0) {
+				int rc = sdio_write_addr(&data->radio,
+							 BRCMFMAC_F2_FIFO_ADDR,
+							 data->tx_glom_buf,
+							 glom_len);
+				if (rc != 0) {
+					LOG_ERR("tx_glom: F2 TX failed: %d (count=%u len=%u)",
+						rc, frame_count, glom_len);
+				}
+			}
+
+			k_mutex_unlock(&data->bcdc_mutex);
+
+			if (frame_count == 0) {
+				/* Ring non-empty but no credit / xoff. Wait. */
+				if (k_sem_take(&data->tx_credit_sem,
+					       K_MSEC(100)) != 0) {
+					LOG_WRN("tx_glom: 100ms credit timeout (txseq=%u tx_max=%u fcstate=%ld)",
+						data->sdpcm_txseq,
+						data->sdpcm_tx_max,
+						(long)atomic_get(&brcmf_fcstate));
+				}
+			}
+		}
+	}
+}
+
 int brcmfmac_bcdc_query_dcmd(struct brcmfmac_data *data, uint32_t cmd,
 			     const uint8_t *tx_payload, uint16_t tx_len,
 			     uint8_t *rx_buf, uint16_t rx_capacity)
@@ -598,7 +729,13 @@ int brcmfmac_bcdc_query_dcmd(struct brcmfmac_data *data, uint32_t cmd,
 		return rc;
 	}
 
-	static uint8_t tx_buf[256] __aligned(4);
+	/* Sized to hold the largest GET response payload we care about
+	 * inline: chip's "counters" struct (~840 B on this fw rev) and
+	 * "fwcap" (~150 B). cdc.len doubles as the chip-side TX-room
+	 * indicator, so the wire frame must be sized to rx_capacity, not
+	 * tx_len -- see comment below.
+	 */
+	static uint8_t tx_buf[2048] __aligned(4);
 
 	const size_t hdr_len = sizeof(struct sdpcm_frame_hdr)
 			     + sizeof(struct sdpcm_sw_hdr)
