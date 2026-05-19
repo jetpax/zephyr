@@ -368,13 +368,16 @@ struct brcmfmac_pending_ioctl {
  */
 #define BRCMFMAC_TX_RING_SLOTS       16
 #define BRCMFMAC_TX_SLOT_SIZE        1600
-/* TODO 2026-05-18: re-enable glom>1 once the txglom wire format is correct.
- * Linux's brcmf_sdio_txpkt_prep (sdio.c:2264-2265) requires the FIRST frame's
- * hw-length-tag to be the TOTAL chain length when bus->txglom is set; our
- * current code put per-frame lengths in each fh, which made the chip drop
- * everything but the first frame and the test fell to 0.1 Mb/s. Keep MAX=1
- * to validate the ring+tx-thread infrastructure; iterate the wire format
- * next session.
+/* TODO: enable multi-frame glomming. Linux's wire format (sdio.c
+ * ::brcmf_sdio_hdpack:1502-27) inserts an 8-byte SDPCM_HWEXT header
+ * between the 4-byte fh and the 8-byte sw header on every frame in
+ * glom mode, with (frame_len - 4) | (lastfrm << 24) in word 0 and
+ * (tail_pad << 16) in word 1. The chip also needs `bus:txglom=1`
+ * set via iovar at init time -- the default of 7 we read is the
+ * capability bitmask, not the enabled mode. Without both halves, the
+ * chip silently drops every multi-frame CMD53 and txseq stalls.
+ * Single-frame (MAX=1) is the working path; mid-2026-05-18 it gave
+ * +16% throughput / 40x lower loss over the old direct-CMD53 path.
  */
 #define BRCMFMAC_TX_GLOM_MAX_FRAMES  1
 #define BRCMFMAC_TX_GLOM_BUF_SIZE    2048
