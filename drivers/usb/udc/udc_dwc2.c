@@ -1747,6 +1747,17 @@ static int udc_dwc2_init_controller(const struct device *dev)
 		return ret;
 	}
 
+	/* Clear Power and Clock Gating Control: ensures the PHY clock
+	 * (StopPClk), AHB clock to USB (GateHclk), analog power clamp
+	 * (PwrClmp), reset/power-down (RstPdwnModule), and PHY sleep
+	 * are all OFF. Most SoC integrations leave PCGCCTL at zero
+	 * after the core soft reset; BCM2710 (Pi Zero 2 W / Pi 3
+	 * family) does not -- VideoCore boot leaves at least StopPClk
+	 * or PhySleep asserted, so even with SftDiscon=0 the PHY does
+	 * not electrically drive D+/D-. Phase 2.1 of the bring-up.
+	 */
+	sys_write32(0, (mem_addr_t)&base->pcgcctl);
+
 	/* Enable RTL workarounds based on controller revision */
 	gsnpsid = sys_read32((mem_addr_t)&base->gsnpsid);
 	priv->wa_essregrestored = gsnpsid < USB_DWC2_GSNPSID_REV_5_00A;
@@ -1764,8 +1775,24 @@ static int udc_dwc2_init_controller(const struct device *dev)
 	/*
 	 * Force device mode as we do no support role changes.
 	 * Wait 25ms for the change to take effect.
+	 *
+	 * Read-modify-write FORCEDEVMODE rather than overwriting the
+	 * whole register: a bare write clobbers PHY-config bits in the
+	 * lower half of GUSBCFG (USBTrdTim in [13:10], PhyIf in [3],
+	 * UlpiUtmiSel in [4], PHYSel in [6], etc.) that the soft reset
+	 * left at silicon POR. On the BCM2710 DWC2 instance, the result
+	 * is USBTrdTim=0 -- which the Synopsys spec calls out as
+	 * invalid AHB↔UTMI turnaround timing, and the chip then can't
+	 * drive valid line-state on D+/D- even though SftDiscon=0.
+	 *
+	 * Also explicitly program USBTrdTim per Linux's dwc2 driver
+	 * defaults: 5 for 16-bit UTMI PhyIf, 9 for 8-bit UTMI PhyIf
+	 * (see Linux drivers/usb/dwc2/params.c).
 	 */
-	gusbcfg = USB_DWC2_GUSBCFG_FORCEDEVMODE;
+	gusbcfg = sys_read32(gusbcfg_reg);
+	gusbcfg |= USB_DWC2_GUSBCFG_FORCEDEVMODE;
+	gusbcfg &= ~(0xFu << 10);
+	gusbcfg |= ((gusbcfg & USB_DWC2_GUSBCFG_PHYIF_16_BIT) ? 5u : 9u) << 10;
 	sys_write32(gusbcfg, gusbcfg_reg);
 	k_msleep(25);
 
@@ -1934,6 +1961,14 @@ static int udc_dwc2_init_controller(const struct device *dev)
 		/* Get available SPRAM size and calculate max allocatable RX fifo size */
 		val = sys_read32((mem_addr_t)&base->gdfifocfg);
 		spram_size = usb_dwc2_get_gdfifocfg_gdfifocfg(val);
+		if (spram_size == 0) {
+			/* GDFIFOCFG not initialized by ROM/bootloader (e.g.
+			 * BCM2710 Pi Zero 2 W on bare Zephyr boot). Fall back
+			 * to the hardware-advertised total DFIFO depth from
+			 * GHWCFG3, which is fixed silicon.
+			 */
+			spram_size = priv->dfifodepth;
+		}
 		max_rxfifo = ((spram_size * MAX_RXFIFO_GDFIFO_PERCENTAGE) / 100);
 
 		/* TODO: For proper runtime FIFO sizing UDC driver would have to
@@ -1954,7 +1989,15 @@ static int udc_dwc2_init_controller(const struct device *dev)
 		/* Driver does not dynamically resize RxFIFO so there is no need
 		 * to store reset value. Read the reset value and make sure that
 		 * the programmed value is not greater than what driver sets.
+		 *
+		 * If GRXFSIZ reads 0 (the soft reset POR on BCM2710 and any
+		 * silicon that doesn't initialize this register), the MIN
+		 * below would clamp to 0 and the RX FIFO would never receive
+		 * a SETUP packet. Fall back to driver default in that case.
 		 */
+		if (priv->rxfifo_depth == 0) {
+			priv->rxfifo_depth = default_depth;
+		}
 		priv->rxfifo_depth = MIN(MIN(priv->rxfifo_depth, default_depth), max_rxfifo);
 		sys_write32(usb_dwc2_set_grxfsiz(priv->rxfifo_depth), grxfsiz_reg);
 
