@@ -1,0 +1,37 @@
+/*
+ * Zephyr shell over USB CDC ACM on rpi_zero_2w.
+ *
+ * Enables &usb / &mailbox / &firmware (same set as the parallel
+ * usb_cdc_min sample) and declares a single CDC ACM UART child
+ * on the USB controller. The `chosen` block points the shell
+ * subsystem at that UART, so `CONFIG_SHELL=y` plus
+ * `CONFIG_SHELL_BACKEND_SERIAL=y` automatically attaches a shell
+ * prompt to /dev/cu.usbmodem* on the host.
+ *
+ * The PL011 console (zephyr,console / zephyr,uart-mcumgr defaults
+ * from the board) keeps its boot-log duty -- chosen is the only
+ * difference here, only re-routing the shell.
+ */
+
+&mailbox {
+	status = "okay";
+};
+
+&firmware {
+	status = "okay";
+};
+
+&usb {
+	status = "okay";
+
+	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+		label = "Zephyr USB CDC-ACM shell";
+	};
+};
+
+/ {
+	chosen {
+		zephyr,shell-uart = &cdc_acm_uart0;
+	};
+};
