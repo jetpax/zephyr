@@ -197,7 +197,7 @@ static int brcmfmac_sdio_verify_memory(struct brcmfmac_data *data,
 				       uint32_t chip_addr,
 				       const uint8_t *expected, uint32_t size)
 {
-	static uint8_t readback[1024];
+	static uint8_t readback[1024] __aligned(CONFIG_DCACHE_LINE_SIZE);
 	uint32_t verified = 0;
 
 	while (size > 0) {
@@ -311,7 +311,7 @@ int brcmfmac_sdio_fw_upload(struct brcmfmac_data *data)
 
 int brcmfmac_sdio_nvram_upload(struct brcmfmac_data *data)
 {
-	static uint8_t nvram_buf[1024];
+	static uint8_t nvram_buf[1024] __aligned(CONFIG_DCACHE_LINE_SIZE);
 	int stripped = brcmfmac_sdio_nvram_strip(brcmfmac_nvram, brcmfmac_nvram_len,
 						nvram_buf, sizeof(nvram_buf));
 	if (stripped < 0) {
