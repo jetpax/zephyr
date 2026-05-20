@@ -102,6 +102,43 @@
 			status = "okay";
 		};
 
+		/*
+		 * ARM <-> VideoCore mailbox. Single hardware FIFO pair
+		 * shared by 16 channels; the property-tag protocol (firmware
+		 * node below) sits on channel 8. Bus 0x7e00b880 → ARM
+		 * 0x3f00b880; 0x40-byte register window covers MAIL0/MAIL1
+		 * read/status/config/write.
+		 *
+		 * Shares the 64 KB MMU page at 0x3f00b000 with the ARMC IRQ
+		 * controller above; both use K_MEM_CACHE_NONE so the
+		 * arch_mem_map attr-match constraint is satisfied (see
+		 * feedback memory feedback_zephyr_mmio_attrs_match_for_64kb_
+		 * page_cotenants).
+		 *
+		 * Default disabled; board / sample overlay opts in.
+		 */
+		mailbox: mailbox@3f00b880 {
+			compatible = "brcm,bcm2835-mbox";
+			reg = <0x3f00b880 0x40>;
+			#mbox-cells = <0>;
+			status = "disabled";
+		};
+
+		/*
+		 * VideoCore firmware property-tag interface. Virtual node
+		 * with no MMIO of its own -- the driver builds property
+		 * request buffers and sends them via &mailbox channel 8.
+		 *
+		 * Used during peripheral bring-up to flip on SoC power
+		 * islands the VC start.elf leaves off (USB analog PHY,
+		 * SDHCI on some configs, etc.).
+		 */
+		firmware: firmware {
+			compatible = "brcm,bcm2835-firmware";
+			mboxes = <&mailbox>;
+			status = "disabled";
+		};
+
 		rng: rng@3f104000 {
 			/*
 			 * BCM2710 / BCM2837 / BCM2835 (Pi 1/2/3/Zero family)
@@ -332,6 +369,62 @@
 			 * Board overlay must also enable &dma. */
 			dmas = <&dma 11>;
 			dma-names = "rx-tx";
+			status = "disabled";
+		};
+
+		/*
+		 * Synopsys DesignWare USB 2.0 OTG controller. Single DWC2
+		 * instance per SoC across the BCM2835/2836/2837/2710 family;
+		 * wired straight to the micro-USB "USB" connector (the data-
+		 * capable one, NOT the "PWR" port). OTG-capable but we drive
+		 * it device-only for CDC-ACM serial -- runtime role switching
+		 * to host mode is out of scope (no uhc_dwc2.c upstream and
+		 * Pi Zero 2 W has only one controller, so any switch kills
+		 * the CDC-ACM REPL anyway).
+		 *
+		 * Bus address 0x7e980000 → ARM-physical 0x3f980000.
+		 *
+		 * Interrupt: GPU IRQ 9 → bank-1 bit 9 on the ARMC aggregator
+		 * → Zephyr IRQ 73 (BCM2835_BANK1(9)).
+		 *
+		 * GHWCFG1/2/4 values read from live silicon via the
+		 * samples/boards/raspberrypi/rpi_zero_2w_dwc2_probe sample
+		 * (Phase 2.0, 2026-05-18). GSNPSID 0x4f54280a = DWC2 OTG
+		 * v2.80a. Key fields:
+		 *   GHWCFG2 OtgArch=2 (Internal Buffer DMA supported)
+		 *           HSPhyType=1 (UTMI+) FSPhyType=1 (Dedicated)
+		 *           NumDevEp=7 NumHostChan=7 PerioEpSup=1 DynFifo=1
+		 *   GHWCFG3 DfifoDepth=0x0ff0 (4080 32-bit words = 16 KiB)
+		 *   GHWCFG4 UTMI_PHY_DATA_WIDTH=0 (8-bit) DedFifoEn=1
+		 *           NumInEps=7 + EP0 = 8 total
+		 *           OTG filters: Iddig/VbusValid/AValid/BValid/
+		 *                        SessionEnd all enabled
+		 *
+		 * Probe also captured GINTSTS.CurMod=0: chip defaults to
+		 * device mode out of VideoCore boot when nothing is plugged
+		 * into the OTG port (ID floats). No host→device role flip
+		 * needed at init.
+		 *
+		 * Compatible is vendor-string-first plus snps,dwc2 fallback
+		 * (the modern idiomatic pattern -- ESP32, NRF, Synaptics
+		 * all follow it). The vendor string triggers inclusion of
+		 * `drivers/usb/udc/udc_dwc2_brcm_bcm2835_usb.h`, which
+		 * declares HS-PHY capability via the `.caps` quirk hook --
+		 * the generic driver reads GHWCFG2.HSPhyType but doesn't
+		 * propagate it into `data->caps.hs`, so without this hook
+		 * the device only advertises FS speeds.
+		 *
+		 * Default disabled -- board overlay opts in.
+		 */
+		usb: zephyr_udc0: usb@3f980000 {
+			compatible = "brcm,bcm2835-usb", "snps,dwc2";
+			reg = <0x3f980000 0x10000>;
+			interrupts = <BCM2835_IRQ_USB IRQ_TYPE_LEVEL 0>;
+			num-in-eps = <8>;
+			num-out-eps = <8>;
+			ghwcfg1 = <0x00000000>;
+			ghwcfg2 = <0x228ddd50>;
+			ghwcfg4 = <0x1ff00020>;
 			status = "disabled";
 		};
 	};

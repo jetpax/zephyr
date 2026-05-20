@@ -50,6 +50,10 @@
 #define BCM2835_IRQ_TIMER1          BCM2835_BANK1(1)
 #define BCM2835_IRQ_TIMER2          BCM2835_BANK1(2)
 #define BCM2835_IRQ_TIMER3          BCM2835_BANK1(3)
+/* USB OTG (Synopsys DWC2). GPU IRQ 9 per the BCM2835 ARM Peripherals
+ * datasheet ch. 7 "ARM peripherals interrupts table".
+ */
+#define BCM2835_IRQ_USB             BCM2835_BANK1(9)  /* DWC2 USB OTG */
 /* DMA channel IRQs: channels 0..10 have dedicated lines at PEND1 bits
  * 16..26; channels 11..14 share bit 27. (PEND1 bit 28, the "any DMA
  * channel" line, is not exposed.)
