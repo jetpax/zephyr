@@ -13,4 +13,11 @@ config SYS_CLOCK_HW_CYCLES_PER_SEC
 	# firmware before kernel handoff. (BCM2711 uses 54 MHz.)
 	default 19200000
 
+config DCACHE_LINE_SIZE
+	# Cortex-A53 L1 D-cache line size is 64 bytes (ARMv8-A standard).
+	# Required by the USB device stack (include/zephyr/drivers/usb/usb_buf.h
+	# uses CONFIG_DCACHE_LINE_SIZE for DMA-safe buffer alignment); also
+	# correct for any future cache-management work on this SoC.
+	default 64
+
 endif
