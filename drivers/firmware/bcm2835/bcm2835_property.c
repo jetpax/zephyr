@@ -32,6 +32,7 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
 #include <zephyr/cache.h>
 #include <zephyr/device.h>
@@ -46,6 +47,7 @@
 LOG_MODULE_REGISTER(bcm2835_firmware, CONFIG_BCM2835_FIRMWARE_LOG_LEVEL);
 
 /* Tag IDs (from RPi firmware mailbox property interface wiki). */
+#define RPI_FW_TAG_GET_BOARD_SERIAL 0x00010004U
 #define RPI_FW_TAG_SET_POWER_STATE  0x00028001U
 
 /* Top-level request/response codes. */
@@ -170,6 +172,36 @@ int bcm2835_property_set_power_state(uint32_t device_id, bool on)
 	if (err == 0) {
 		LOG_INF("device %u power -> %s (state=0x%08x)",
 			device_id, on ? "ON" : "OFF", req_buf[6]);
+	}
+
+	k_mutex_unlock(&req_buf_lock);
+	return err;
+}
+
+int bcm2835_property_get_board_serial(uint8_t *out)
+{
+	int err;
+
+	if (out == NULL) {
+		return -EINVAL;
+	}
+	if (!fw_ready()) {
+		return -ENODEV;
+	}
+
+	(void)k_mutex_lock(&req_buf_lock, K_FOREVER);
+
+	/* GET_BOARD_SERIAL has no request payload — VC writes 2 u32
+	 * of serial into the value-buffer slot. Zero the slot so a
+	 * firmware that does inspect it sees a clean request.
+	 */
+	req_buf[5] = 0;
+	req_buf[6] = 0;
+
+	err = property_call_locked(RPI_FW_TAG_GET_BOARD_SERIAL, 2);
+	if (err == 0) {
+		memcpy(out, &req_buf[5], 8);
+		LOG_INF("board serial: %08x%08x", req_buf[6], req_buf[5]);
 	}
 
 	k_mutex_unlock(&req_buf_lock);

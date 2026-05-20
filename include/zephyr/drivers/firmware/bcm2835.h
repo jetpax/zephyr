@@ -48,6 +48,24 @@ extern "C" {
  */
 int bcm2835_property_set_power_state(uint32_t device_id, bool on);
 
+/**
+ * @brief Fetch the 64-bit board serial number from VideoCore OTP.
+ *
+ * Each Raspberry Pi has a unique 64-bit serial number burned into
+ * one-time-programmable storage at factory; queried via the
+ * GET_BOARD_SERIAL property tag (0x00010004). Returned as 8 raw
+ * bytes in the wire-format order (low u32 first, high u32 second —
+ * matches the on-RAM layout VC writes).
+ *
+ * @param out  Caller-allocated 8-byte buffer; receives the serial.
+ *
+ * @retval 0        Serial number written into @p out.
+ * @retval -EINVAL  @p out is NULL.
+ * @retval -ENODEV  Firmware driver not enabled / not initialised.
+ * @retval -EIO     Mailbox transport error or firmware-reported failure.
+ */
+int bcm2835_property_get_board_serial(uint8_t *out);
+
 #ifdef __cplusplus
 }
 #endif
