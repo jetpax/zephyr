@@ -1,0 +1,29 @@
+# Copyright (c) 2026 jetpax
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Raspberry Pi VideoCore firmware property-tag interface.
+
+  Sits on top of the BCM2835 mailbox (channel 8, MBOX_CHAN_PROPERTY).
+  Exposes the SoC-config RPC surface: power-domain on/off, clock
+  rate get/set, board revision, MAC address, temperature, etc.
+
+  Bound to its mailbox controller via the standard `mboxes` property;
+  the Zephyr Pi mailbox binding uses no cell data (channel is fixed
+  at 8 inside the firmware driver, since the property-tag protocol
+  is a single-channel thing).
+
+  Matches Linux's drivers/firmware/raspberrypi.c.
+
+compatible: "brcm,bcm2835-firmware"
+
+include: [base.yaml]
+
+properties:
+  mboxes:
+    required: true
+    description: |
+      Reference to the BCM2835 mailbox controller. Cell count = 0
+      (mailbox node must declare `#mbox-cells = <0>`) — the
+      property-tag protocol is channel-fixed at 8 inside this driver,
+      so no per-consumer channel cell is needed.

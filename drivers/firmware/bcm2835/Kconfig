@@ -1,0 +1,53 @@
+# Copyright (c) 2026 jetpax
+# SPDX-License-Identifier: Apache-2.0
+
+config BCM2835_MBOX
+	bool "Broadcom BCM2835 ARM <-> VideoCore mailbox"
+	default y
+	depends on DT_HAS_BRCM_BCM2835_MBOX_ENABLED
+	help
+	  Polled transport for the BCM2835-family mailbox (single
+	  hardware FIFO pair, 16 channels multiplexed in the low 4 bits
+	  of each message word). Required by CONFIG_BCM2835_FIRMWARE.
+
+if BCM2835_MBOX
+
+config BCM2835_MBOX_INIT_PRIORITY
+	int "BCM2835 mailbox driver init priority"
+	default 30
+	help
+	  POST_KERNEL init priority. Must run before any consumer
+	  (firmware property driver, currently 35; USB CDC ACM via
+	  vendor pre_enable hook, default 99).
+
+module = BCM2835_MBOX
+module-str = bcm2835_mbox
+source "subsys/logging/Kconfig.template.log_config"
+
+endif # BCM2835_MBOX
+
+config BCM2835_FIRMWARE
+	bool "Raspberry Pi VideoCore firmware property-tag interface"
+	default y
+	depends on DT_HAS_BRCM_BCM2835_FIRMWARE_ENABLED
+	depends on BCM2835_MBOX
+	select CACHE_MANAGEMENT
+	help
+	  VideoCore firmware RPC over channel 8 of the BCM2835 mailbox.
+	  Exposes helpers like bcm2835_property_set_power_state() for
+	  SoC power-domain control, used during USB / SDIO / I2C
+	  bring-up to turn on peripheral power islands the VC start.elf
+	  leaves off.
+
+	  Selects CACHE_MANAGEMENT because the request buffer is shared
+	  with VC firmware and needs explicit flush / invalidate around
+	  each call (see feedback memory
+	  feedback_zephyr_sys_cache_needs_cache_management).
+
+if BCM2835_FIRMWARE
+
+module = BCM2835_FIRMWARE
+module-str = bcm2835_firmware
+source "subsys/logging/Kconfig.template.log_config"
+
+endif # BCM2835_FIRMWARE

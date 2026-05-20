@@ -1,0 +1,41 @@
+# Copyright (c) 2026 jetpax
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Broadcom BCM2835-family ARM <-> VideoCore mailbox.
+
+  Single hardware FIFO pair (MAIL0 read / MAIL1 write) shared by all
+  16 channels. Channel number is encoded in the low 4 bits of each
+  message word; the upper 28 bits carry the channel-specific payload
+  (typically the bus address of a 16-byte-aligned request buffer).
+
+  Layout matches Linux's drivers/mailbox/bcm2835-mailbox.c. Same
+  controller IP across BCM2835/36/37/2710/2711 (Pi 1 / 2 / 3 / Zero
+  family / 4).
+
+compatible: "brcm,bcm2835-mbox"
+
+include: [base.yaml]
+
+mbox-cells: []
+# No cell data per consumer reference — channel is fixed at 8 by the
+# property-tag firmware driver, and the mailbox driver itself doesn't
+# expose other channels for now. Consumers write `mboxes = <&mailbox>;`
+# (no cells).
+
+properties:
+  reg:
+    required: true
+
+  "#mbox-cells":
+    type: int
+    required: true
+    const: 0
+
+  interrupts:
+    required: false
+    description: |
+      Mailbox-has-data IRQ on the ARMC aggregator. Optional — the
+      Zephyr driver runs polled and does not connect an ISR; the
+      property is allowed so future IRQ work can land without a
+      binding change.
