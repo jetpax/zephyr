@@ -1,0 +1,18 @@
+# Copyright (c) 2026 jetpax
+# SPDX-License-Identifier: Apache-2.0
+
+config HWINFO_BCM2835
+	bool "BCM283x device ID via VideoCore firmware"
+	default y
+	depends on SOC_BCM2710
+	depends on BCM2835_FIRMWARE
+	select HWINFO_HAS_DRIVER
+	help
+	  Implement hwinfo_get_device_id() by issuing the GET_BOARD_SERIAL
+	  property tag (0x00010004) to the VideoCore firmware. Returns
+	  the 8-byte OTP serial number every Pi has burned in at factory.
+	  Used by the USB device stack to fill the iSerialNumber string
+	  descriptor, by MCUboot for device-unique entropy, etc.
+
+	  Pulls in CONFIG_BCM2835_FIRMWARE (and therefore CONFIG_BCM2835_MBOX
+	  and CONFIG_CACHE_MANAGEMENT) as dependencies.
