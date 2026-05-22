@@ -208,6 +208,7 @@ static int brcmfmac_init(const struct device *dev)
 		const uint32_t bcn_timeout = 4;     /* seconds without beacons */
 		const uint32_t pm_mode     = 2;     /* PM_FAST */
 		const uint32_t pm2_sleep   = 2000;  /* ms */
+		const uint32_t allmulti    = 1;     /* pass multicast to host */
 		int rret;
 
 		rret = brcmfmac_bcdc_iovar_set(data, "roam_off",
@@ -230,7 +231,18 @@ static int brcmfmac_init(const struct device *dev)
 		if (rret != 0) {
 			LOG_WRN("pm2_sleep_ret=2000 set failed: %d (best-effort)", rret);
 		}
-		LOG_DBG("post-up tuning: roam_off=1 bcn_timeout=4s pm=FAST pm2_sleep_ret=2000ms");
+		/* allmulti=1: pass all multicast frames up to the host. The
+		 * chip otherwise hardware-filters multicast, so 224.0.0.251
+		 * (mDNS) never reaches the Zephyr net stack -- DHCP works only
+		 * because it is broadcast. Zephyr's IGMP layer still filters
+		 * to the joined groups; this just opens the chip-side gate.
+		 */
+		rret = brcmfmac_bcdc_iovar_set(data, "allmulti",
+					       (const uint8_t *)&allmulti, 4);
+		if (rret != 0) {
+			LOG_WRN("allmulti=1 set failed: %d (best-effort)", rret);
+		}
+		LOG_DBG("post-up tuning: roam_off=1 bcn_timeout=4s pm=FAST pm2_sleep_ret=2000ms allmulti=1");
 	}
 
 	data->probed = true;
