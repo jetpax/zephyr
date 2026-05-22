@@ -66,6 +66,21 @@ int bcm2835_property_set_power_state(uint32_t device_id, bool on);
  */
 int bcm2835_property_get_board_serial(uint8_t *out);
 
+/**
+ * @brief Read the SoC temperature via the VideoCore firmware.
+ *
+ * Issues a GET_TEMPERATURE property tag (0x00030006) for sensor 0 --
+ * the same source as `vcgencmd measure_temp`.
+ *
+ * @param out_millideg  Receives the SoC temperature in millidegrees Celsius.
+ *
+ * @retval 0        Temperature written into @p out_millideg.
+ * @retval -EINVAL  @p out_millideg is NULL.
+ * @retval -ENODEV  Firmware driver not enabled / not initialised.
+ * @retval -EIO     Mailbox transport error or firmware-reported failure.
+ */
+int bcm2835_property_get_temperature(int32_t *out_millideg);
+
 #ifdef __cplusplus
 }
 #endif

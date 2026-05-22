@@ -49,6 +49,7 @@ LOG_MODULE_REGISTER(bcm2835_firmware, CONFIG_BCM2835_FIRMWARE_LOG_LEVEL);
 /* Tag IDs (from RPi firmware mailbox property interface wiki). */
 #define RPI_FW_TAG_GET_BOARD_SERIAL 0x00010004U
 #define RPI_FW_TAG_SET_POWER_STATE  0x00028001U
+#define RPI_FW_TAG_GET_TEMPERATURE  0x00030006U
 
 /* Top-level request/response codes. */
 #define RPI_FW_REQUEST              0x00000000U
@@ -202,6 +203,37 @@ int bcm2835_property_get_board_serial(uint8_t *out)
 	if (err == 0) {
 		memcpy(out, &req_buf[5], 8);
 		LOG_INF("board serial: %08x%08x", req_buf[6], req_buf[5]);
+	}
+
+	k_mutex_unlock(&req_buf_lock);
+	return err;
+}
+
+int bcm2835_property_get_temperature(int32_t *out_millideg)
+{
+	int err;
+
+	if (out_millideg == NULL) {
+		return -EINVAL;
+	}
+	if (!fw_ready()) {
+		return -ENODEV;
+	}
+
+	(void)k_mutex_lock(&req_buf_lock, K_FOREVER);
+
+	/* GET_TEMPERATURE value buffer is {u32 sensor_id, u32 temp}.
+	 * Request sensor 0; VC writes the temperature (millidegrees C)
+	 * back into the second word.
+	 */
+	req_buf[5] = 0;
+	req_buf[6] = 0;
+
+	err = property_call_locked(RPI_FW_TAG_GET_TEMPERATURE, 2);
+	if (err == 0) {
+		*out_millideg = (int32_t)req_buf[6];
+		/* DBG, not INF: this tag is polled for the status bar. */
+		LOG_DBG("SoC temperature: %d millideg C", *out_millideg);
 	}
 
 	k_mutex_unlock(&req_buf_lock);
