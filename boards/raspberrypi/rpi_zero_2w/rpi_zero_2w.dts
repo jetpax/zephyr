@@ -19,6 +19,10 @@
 		zephyr,sram = &sram0;
 		zephyr,entropy = &rng;
 	};
+
+	aliases {
+		die-temp0 = &vc_thermal;
+	};
 };
 
 &uart1 {
