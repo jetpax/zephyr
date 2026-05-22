@@ -81,6 +81,32 @@ int bcm2835_property_get_board_serial(uint8_t *out);
  */
 int bcm2835_property_get_temperature(int32_t *out_millideg);
 
+/*
+ * VideoCore clock IDs (for the GET_CLOCK_RATE tag). Values match the
+ * RPi firmware mailbox property interface; ARM is the Cortex-A CPU
+ * clock.
+ */
+#define BCM2835_CLOCK_ARM 0x00000003U
+
+/**
+ * @brief Read a VideoCore-managed clock rate.
+ *
+ * Issues a GET_CLOCK_RATE property tag (0x00030002) for the given
+ * clock ID. Returns the configured rate in Hz -- for BCM2835_CLOCK_ARM
+ * this is the Cortex-A53 core frequency (the same value `vcgencmd
+ * measure_clock arm` reports).
+ *
+ * @param clock_id  One of BCM2835_CLOCK_* above.
+ * @param out_hz    Receives the clock rate in Hz (0 if the clock does
+ *                  not exist or is not running).
+ *
+ * @retval 0        Rate written into @p out_hz.
+ * @retval -EINVAL  @p out_hz is NULL.
+ * @retval -ENODEV  Firmware driver not enabled / not initialised.
+ * @retval -EIO     Mailbox transport error or firmware-reported failure.
+ */
+int bcm2835_property_get_clock_rate(uint32_t clock_id, uint32_t *out_hz);
+
 #ifdef __cplusplus
 }
 #endif

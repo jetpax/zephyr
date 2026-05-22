@@ -49,6 +49,7 @@ LOG_MODULE_REGISTER(bcm2835_firmware, CONFIG_BCM2835_FIRMWARE_LOG_LEVEL);
 /* Tag IDs (from RPi firmware mailbox property interface wiki). */
 #define RPI_FW_TAG_GET_BOARD_SERIAL 0x00010004U
 #define RPI_FW_TAG_SET_POWER_STATE  0x00028001U
+#define RPI_FW_TAG_GET_CLOCK_RATE   0x00030002U
 #define RPI_FW_TAG_GET_TEMPERATURE  0x00030006U
 
 /* Top-level request/response codes. */
@@ -234,6 +235,35 @@ int bcm2835_property_get_temperature(int32_t *out_millideg)
 		*out_millideg = (int32_t)req_buf[6];
 		/* DBG, not INF: this tag is polled for the status bar. */
 		LOG_DBG("SoC temperature: %d millideg C", *out_millideg);
+	}
+
+	k_mutex_unlock(&req_buf_lock);
+	return err;
+}
+
+int bcm2835_property_get_clock_rate(uint32_t clock_id, uint32_t *out_hz)
+{
+	int err;
+
+	if (out_hz == NULL) {
+		return -EINVAL;
+	}
+	if (!fw_ready()) {
+		return -ENODEV;
+	}
+
+	(void)k_mutex_lock(&req_buf_lock, K_FOREVER);
+
+	/* GET_CLOCK_RATE value buffer is {u32 clock_id, u32 rate}.
+	 * Request the clock; VC writes the rate (Hz) into the second word.
+	 */
+	req_buf[5] = clock_id;
+	req_buf[6] = 0;
+
+	err = property_call_locked(RPI_FW_TAG_GET_CLOCK_RATE, 2);
+	if (err == 0) {
+		*out_hz = req_buf[6];
+		LOG_DBG("clock %u rate: %u Hz", clock_id, *out_hz);
 	}
 
 	k_mutex_unlock(&req_buf_lock);
