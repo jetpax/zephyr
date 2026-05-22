@@ -609,8 +609,8 @@ int brcmfmac_mgmt_disconnect(const struct device *dev, struct net_if *iface)
 
 /* === wifi_mgmt_ops.iface_status ============================================
  *
- * Minimal: state + ssid + security from last connect(). Channel/rssi/bssid
- * would need an extra IOCTL round-trip; punt until a caller needs them.
+ * state + ssid + security from last connect(), plus rssi via a
+ * WLC_GET_RSSI round-trip when the link is up. Channel stubbed to 0.
  */
 int brcmfmac_mgmt_iface_status(const struct device *dev, struct net_if *iface,
 			       struct wifi_iface_status *status)
@@ -642,13 +642,43 @@ int brcmfmac_mgmt_iface_status(const struct device *dev, struct net_if *iface,
 		break;
 	}
 
+	if (data->link_state == BRCMFMAC_LINK_UP) {
+		/* WLC_GET_BSSID returns the associated AP's BSSID. */
+		uint8_t bssid[6] = { 0 };
+		int rc_bssid = brcmfmac_bcdc_query_dcmd(
+				data, BRCMFMAC_WLC_GET_BSSID, NULL, 0,
+				bssid, sizeof(bssid));
+		if (rc_bssid >= (int)sizeof(bssid)) {
+			memcpy(status->bssid, bssid, sizeof(status->bssid));
+		}
+
+		/* WLC_GET_RSSI fills a scb_val_t { int32 val; u8 ea[6] } and
+		 * returns the RSSI in val. The request buffer must be the
+		 * full sizeof(scb_val_t) -- 12 bytes: the 10 logical bytes
+		 * rounded up to the struct's 4-byte alignment. The firmware
+		 * length-checks the request and rejects a 10-byte buffer with
+		 * BCME_BADARG; the tail padding is not optional. A zeroed ea
+		 * selects the connected AP (matches Linux brcmfmac).
+		 */
+		uint8_t scb_val[12] = { 0 };
+		int rc = brcmfmac_bcdc_query_dcmd(
+				data, BRCMFMAC_WLC_GET_RSSI,
+				scb_val, sizeof(scb_val),
+				scb_val, sizeof(scb_val));
+		if (rc >= 4) {
+			int32_t rssi;
+
+			memcpy(&rssi, scb_val, sizeof(rssi));
+			status->rssi = (int8_t)rssi;
+		}
+	}
+
 	if (data->connected_ssid_len > 0 &&
 	    data->connected_ssid_len <= sizeof(status->ssid)) {
 		memcpy(status->ssid, data->connected_ssid,
 		       data->connected_ssid_len);
 		status->ssid_len = data->connected_ssid_len;
 	}
-	memcpy(status->bssid, data->chip_mac, sizeof(status->bssid));
 
 	return 0;
 }
