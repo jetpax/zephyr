@@ -1,0 +1,15 @@
+# Copyright (c) 2026 jetpax
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Raspberry Pi BCM2835/2710 SoC temperature sensor.
+
+  The SoC die temperature is read through the VideoCore firmware
+  GET_TEMPERATURE property tag -- the same source as `vcgencmd
+  measure_temp`. The sensor owns no registers of its own, so it is
+  modelled as a child of the VideoCore firmware node. Exposes
+  SENSOR_CHAN_DIE_TEMP.
+
+compatible: "raspberrypi,bcm2835-vc-thermal"
+
+include: base.yaml

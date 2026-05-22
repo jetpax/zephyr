@@ -137,6 +137,16 @@
 			compatible = "brcm,bcm2835-firmware";
 			mboxes = <&mailbox>;
 			status = "disabled";
+
+			/*
+			 * SoC temperature sensor, read via the firmware
+			 * GET_TEMPERATURE property tag (vcgencmd measure_temp
+			 * source). Board / sample overlay opts in.
+			 */
+			vc_thermal: vc-thermal {
+				compatible = "raspberrypi,bcm2835-vc-thermal";
+				status = "disabled";
+			};
 		};
 
 		rng: rng@3f104000 {
