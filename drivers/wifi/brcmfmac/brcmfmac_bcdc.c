@@ -590,9 +590,9 @@ int brcmfmac_bcdc_tx_frame(struct brcmfmac_data *data, uint8_t chan,
 			break;
 		}
 		if (k_sem_take(&data->tx_credit_sem, K_MSEC(20)) != 0) {
-			LOG_WRN("tx_frame: credit/fc timeout (txseq=%u tx_max=%u fcstate=%d)",
+			LOG_WRN("tx_frame: credit/fc timeout (txseq=%u tx_max=%u fcstate=%ld)",
 				data->sdpcm_txseq, data->sdpcm_tx_max,
-				atomic_get(&brcmf_fcstate));
+				(long)atomic_get(&brcmf_fcstate));
 			return -EAGAIN;
 		}
 	}
