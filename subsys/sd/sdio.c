@@ -141,11 +141,16 @@ static int sdio_io_rw_extended(struct sd_card *card,
 	cmd.response_type = (SD_RSP_TYPE_R5 | SD_SPI_RSP_TYPE_R5);
 	cmd.timeout_ms = CONFIG_SD_CMD_TIMEOUT;
 	if (blocks == 0) {
-		/* Byte mode */
+		/* Byte mode: 9-bit byte count, 0 = 512 (already handled). */
 		cmd.arg |= (block_size == 512) ? 0 : block_size;
 	} else {
-		/* Block mode */
-		cmd.arg |= BIT(SDIO_EXTEND_CMD_ARG_BLK_SHIFT) | blocks;
+		/* Block mode: 9-bit block count, 0 = 512. The mask matters
+		 * because `blocks` arrives unbounded from the caller; for
+		 * blocks==512 the raw value 0x200 would otherwise set bit 9
+		 * of arg, which is the LSB of the register-address field.
+		 * Mask to 9 bits: 1..511 encode as themselves, 512 -> 0.
+		 */
+		cmd.arg |= BIT(SDIO_EXTEND_CMD_ARG_BLK_SHIFT) | (blocks & 0x1FF);
 	}
 
 	data.block_size = block_size;
