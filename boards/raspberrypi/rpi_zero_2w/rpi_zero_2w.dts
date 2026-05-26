@@ -8,6 +8,7 @@
 
 #include <broadcom/bcm2710.dtsi>
 #include <broadcom/bcm2711-pinctrl.dtsi>
+#include <zephyr/dt-bindings/gpio/gpio.h>
 
 / {
 	model = "Raspberry Pi Zero 2 W";
@@ -65,6 +66,13 @@
 	};
 };
 
+/* GPIO bank 1 (GPIO 28..45). Pin 41 carries WL_REG_ON for the
+ * on-module wireless chip; enabling the bank makes the line
+ * available to the brcmfmac driver.
+ */
+&gpio1 {
+	status = "okay";
+};
 &dma {
 	status = "okay";
 };
@@ -77,4 +85,10 @@
 	pinctrl-names = "default";
 	pinctrl-0 = <&emmc_gpio34>;
 	status = "okay";
+
+	brcmfmac: brcmfmac {
+		compatible = "brcm,bcm43xxx-sdio";
+		wifi-reg-on-gpios = <&gpio1 13 GPIO_ACTIVE_HIGH>;
+		status = "okay";
+	};
 };
