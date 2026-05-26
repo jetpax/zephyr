@@ -23,6 +23,10 @@
 	aliases {
 		die-temp0 = &vc_thermal;
 	};
+
+	aliases {
+		sdhc0 = &sdhost;
+	};
 };
 
 &uart1 {
@@ -40,4 +44,19 @@
  */
 &spi0 {
 	status = "okay";
+};
+
+/* Legacy SDHost controller -> external microSD card slot. The slot
+ * is a board-level fact (PCB pad, GPIO 48..53 ALT0 routing is fixed),
+ * so the enablement and sdmmc-disk child live in the board DTS.
+ */
+&sdhost {
+	pinctrl-names = "default";
+	pinctrl-0 = <&sdhost_gpio48>;
+	status = "okay";
+
+	sdmmc {
+		compatible = "zephyr,sdmmc-disk";
+		disk-name = "SD";
+	};
 };
