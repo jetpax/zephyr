@@ -1,0 +1,28 @@
+/*
+ * rpi_zero_2w HDMI smoke test overlay.
+ *
+ * Enables the property-tag mailbox chain and the VideoCore framebuffer
+ * child node; points zephyr,display at it so the generic display API
+ * resolves the right device.
+ */
+
+/ {
+	chosen {
+		zephyr,display = &vc_fb;
+	};
+};
+
+&mailbox {
+	status = "okay";
+};
+
+&firmware {
+	status = "okay";
+};
+
+&vc_fb {
+	/* No width / height: let the driver auto-detect from VC's EDID
+	 * negotiation -- bars fill the monitor's native mode.
+	 */
+	status = "okay";
+};

@@ -1,0 +1,10 @@
+sample:
+  name: rpi_zero_2w HDMI smoke test
+  description: Verifies VideoCore-firmware framebuffer output over HDMI
+tests:
+  sample.boards.raspberrypi.rpi_zero_2w_hdmi_smoke:
+    platform_allow:
+      - rpi_zero_2w
+    tags:
+      - display
+      - raspberrypi
