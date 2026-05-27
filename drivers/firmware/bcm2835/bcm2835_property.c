@@ -51,6 +51,13 @@ LOG_MODULE_REGISTER(bcm2835_firmware, CONFIG_BCM2835_FIRMWARE_LOG_LEVEL);
 #define RPI_FW_TAG_SET_POWER_STATE  0x00028001U
 #define RPI_FW_TAG_GET_CLOCK_RATE   0x00030002U
 #define RPI_FW_TAG_GET_TEMPERATURE  0x00030006U
+#define RPI_FW_TAG_FB_ALLOCATE      0x00040001U
+#define RPI_FW_TAG_FB_GET_PHYS_WH   0x00040003U
+#define RPI_FW_TAG_FB_GET_PITCH     0x00040008U
+#define RPI_FW_TAG_FB_SET_PHYS_WH   0x00048003U
+#define RPI_FW_TAG_FB_SET_VIRT_WH   0x00048004U
+#define RPI_FW_TAG_FB_SET_DEPTH     0x00048005U
+#define RPI_FW_TAG_FB_SET_PIXEL_ORDER 0x00048006U
 
 /* Top-level request/response codes. */
 #define RPI_FW_REQUEST              0x00000000U
@@ -80,8 +87,12 @@ LOG_MODULE_REGISTER(bcm2835_firmware, CONFIG_BCM2835_FIRMWARE_LOG_LEVEL);
  * log thread, and the next LOG_INF call dispatched a corrupted
  * thread entry pointer into .rodata (PXN fault on EL1 instruction
  * fetch).
+ *
+ * 64 words / 256 bytes / 4 cache lines: large enough to hold the
+ * framebuffer-setup tag chain (6 tags + outer header + end tag = 30
+ * words / 120 bytes) with headroom for any future chained requests.
  */
-#define REQ_BUF_WORDS  16U
+#define REQ_BUF_WORDS  64U
 static uint32_t req_buf[REQ_BUF_WORDS] __aligned(64);
 BUILD_ASSERT(REQ_TAG_WORDS <= REQ_BUF_WORDS,
 	     "tag won't fit in cache-line-sized buffer");
@@ -266,6 +277,171 @@ int bcm2835_property_get_clock_rate(uint32_t clock_id, uint32_t *out_hz)
 		LOG_DBG("clock %u rate: %u Hz", clock_id, *out_hz);
 	}
 
+	k_mutex_unlock(&req_buf_lock);
+	return err;
+}
+
+int bcm2835_property_fb_get_size(uint32_t *width, uint32_t *height)
+{
+	int err;
+
+	if (width == NULL || height == NULL) {
+		return -EINVAL;
+	}
+	if (!fw_ready()) {
+		return -ENODEV;
+	}
+
+	(void)k_mutex_lock(&req_buf_lock, K_FOREVER);
+
+	/* GET_PHYSICAL_WIDTH_HEIGHT: request payload is empty; VC writes
+	 * the current scanout {W, H} into the value buffer. Single-tag
+	 * GET calls don't suffer the SET-clamping issue that forced the
+	 * FB-setup tags into one chained request.
+	 */
+	req_buf[5] = 0;
+	req_buf[6] = 0;
+
+	err = property_call_locked(RPI_FW_TAG_FB_GET_PHYS_WH, 2);
+	if (err == 0) {
+		*width = req_buf[5];
+		*height = req_buf[6];
+		LOG_INF("vc display size: %u x %u", *width, *height);
+	}
+
+	k_mutex_unlock(&req_buf_lock);
+	return err;
+}
+
+/*
+ * Framebuffer setup -- atomic, single chained property call.
+ *
+ * VC owns HDMI output: the GPU brings up the PHY based on config.txt at
+ * boot, scans out a framebuffer continuously, and lets the ARM side
+ * request/configure that buffer via the property interface. The
+ * configuration tags must arrive as a single chained request -- VC
+ * processes each property call atomically, and SET_VIRT_WH / SET_DEPTH
+ * are silently clamped to minimums when they arrive in a call separate
+ * from ALLOCATE_BUFFER (observed 2026-05-27: 6 separate calls landed
+ * VC at virt=2x2, depth=16 even though phys was accepted at 640x480).
+ *
+ * Matches Linux drivers/video/fbdev/bcm2708_fb.c and u-boot
+ * drivers/video/bcm2835.c, both of which chain.
+ *
+ * Chain layout (offsets in u32 words from req_buf base):
+ *
+ *   [0]  total bytes
+ *   [1]  request code
+ *   [2..6]   SET_PHYS_WH  : id, buf=8, req=8, W, H
+ *   [7..11]  SET_VIRT_WH  : id, buf=8, req=8, W, H
+ *   [12..15] SET_DEPTH    : id, buf=4, req=4, bpp
+ *   [16..19] SET_PIXEL_ORDER: id, buf=4, req=4, order
+ *   [20..24] ALLOCATE_BUFFER: id, buf=8, req=4, alignment, (size after)
+ *   [25..28] GET_PITCH    : id, buf=4, req=0, (pitch after)
+ *   [29] END_TAG
+ *
+ * VC writes responses back into the same words: phys at [5..6], virt at
+ * [10..11], depth at [15], order at [19], FB base + size at [23..24],
+ * pitch at [28].
+ */
+
+int bcm2835_property_fb_setup(uint32_t *width, uint32_t *height,
+			      uint32_t *depth, uint32_t *pixel_order,
+			      uint32_t alignment,
+			      uintptr_t *fb_bus, uint32_t *fb_size,
+			      uint32_t *pitch)
+{
+	uint32_t reply;
+	int err;
+
+	if (width == NULL || height == NULL || depth == NULL ||
+	    pixel_order == NULL || fb_bus == NULL || fb_size == NULL ||
+	    pitch == NULL) {
+		return -EINVAL;
+	}
+	if (!fw_ready()) {
+		return -ENODEV;
+	}
+
+	(void)k_mutex_lock(&req_buf_lock, K_FOREVER);
+
+	/* Outer wrapper -- total bytes filled in below. */
+	req_buf[1] = RPI_FW_REQUEST;
+
+	/* SET_PHYS_WH (req=8, resp=8, value_buf=8). */
+	req_buf[2] = RPI_FW_TAG_FB_SET_PHYS_WH;
+	req_buf[3] = 8U;
+	req_buf[4] = 8U;
+	req_buf[5] = *width;
+	req_buf[6] = *height;
+
+	/* SET_VIRT_WH (req=8, resp=8, value_buf=8). */
+	req_buf[7] = RPI_FW_TAG_FB_SET_VIRT_WH;
+	req_buf[8] = 8U;
+	req_buf[9] = 8U;
+	req_buf[10] = *width;
+	req_buf[11] = *height;
+
+	/* SET_DEPTH (req=4, resp=4, value_buf=4). */
+	req_buf[12] = RPI_FW_TAG_FB_SET_DEPTH;
+	req_buf[13] = 4U;
+	req_buf[14] = 4U;
+	req_buf[15] = *depth;
+
+	/* SET_PIXEL_ORDER (req=4, resp=4, value_buf=4). */
+	req_buf[16] = RPI_FW_TAG_FB_SET_PIXEL_ORDER;
+	req_buf[17] = 4U;
+	req_buf[18] = 4U;
+	req_buf[19] = *pixel_order;
+
+	/* ALLOCATE_BUFFER (req=4 alignment, resp=8 {base,size}, value_buf=8). */
+	req_buf[20] = RPI_FW_TAG_FB_ALLOCATE;
+	req_buf[21] = 8U;
+	req_buf[22] = 4U;
+	req_buf[23] = alignment;
+	req_buf[24] = 0U;
+
+	/* GET_PITCH (req=0, resp=4, value_buf=4). */
+	req_buf[25] = RPI_FW_TAG_FB_GET_PITCH;
+	req_buf[26] = 4U;
+	req_buf[27] = 0U;
+	req_buf[28] = 0U;
+
+	req_buf[29] = RPI_FW_END_TAG;
+
+	req_buf[0] = 30U * sizeof(uint32_t);
+
+	sys_cache_data_flush_range(req_buf, sizeof(req_buf));
+
+	err = bcm2835_mbox_call(fw_mbox, BCM2835_MBOX_CHAN_PROPERTY,
+				(uint32_t)(uintptr_t)req_buf, &reply);
+	if (err < 0) {
+		LOG_ERR("fb mbox call failed: %d", err);
+		goto unlock;
+	}
+
+	sys_cache_data_invd_range(req_buf, sizeof(req_buf));
+
+	if (req_buf[1] != RPI_FW_RESPONSE_SUCCESS) {
+		LOG_ERR("VC rejected fb chain, status 0x%08x", req_buf[1]);
+		err = -EIO;
+		goto unlock;
+	}
+
+	*width = req_buf[10];          /* virt W -- what the FB actually is */
+	*height = req_buf[11];         /* virt H */
+	*depth = req_buf[15];
+	*pixel_order = req_buf[19];
+	*fb_bus = req_buf[23];
+	*fb_size = req_buf[24];
+	*pitch = req_buf[28];
+
+	LOG_INF("fb: phys=%u x %u virt=%u x %u %u bpp %s base=0x%08x size=%u pitch=%u",
+		req_buf[5], req_buf[6], *width, *height, *depth,
+		*pixel_order ? "RGB" : "BGR",
+		(uint32_t)*fb_bus, *fb_size, *pitch);
+
+unlock:
 	k_mutex_unlock(&req_buf_lock);
 	return err;
 }

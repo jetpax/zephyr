@@ -1,0 +1,42 @@
+# Copyright (c) 2026 jetpax
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Raspberry Pi BCM2835/2710 VideoCore-firmware framebuffer.
+
+  On the Pi, the VideoCore GPU owns HDMI output -- the GPU drives the
+  PHY (configured via config.txt at boot), the HVS, and the scanout.
+  The ARM side asks the GPU for a framebuffer via the property-tag
+  mailbox interface and writes pixels into the returned memory.
+
+  Modelled as a child of the VideoCore firmware node (the parent does
+  not own any MMIO of its own; the framebuffer lives in VC-managed
+  shared DRAM whose address is only known at runtime).
+
+  When `width` and `height` are zero (or omitted), the driver reads
+  VC's current scanout dimensions -- the resolution VC negotiated
+  with the monitor's EDID at boot -- and asks for a framebuffer of
+  that size. This is the typical setup for HDMI, where the native
+  resolution depends on the attached monitor.
+
+  Exposes the Zephyr display driver API at PIXEL_FORMAT_ARGB_8888.
+
+compatible: "brcm,bcm2835-fb"
+
+include: base.yaml
+
+properties:
+  width:
+    type: int
+    default: 0
+    description: |
+      Framebuffer width in pixels. 0 (default) means "auto-detect
+      from VC's current display configuration" -- typically the
+      monitor's preferred native mode.
+
+  height:
+    type: int
+    default: 0
+    description: |
+      Framebuffer height in pixels. 0 (default) means "auto-detect"
+      (see `width`).

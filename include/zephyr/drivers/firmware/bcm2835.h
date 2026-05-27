@@ -107,6 +107,72 @@ int bcm2835_property_get_temperature(int32_t *out_millideg);
  */
 int bcm2835_property_get_clock_rate(uint32_t clock_id, uint32_t *out_hz);
 
+/*
+ * Framebuffer pixel order constants (the value of the SET_PIXEL_ORDER
+ * tag). At depth=32 + RGB, pixels are stored as u32 0xAARRGGBB --
+ * little-endian memory order [B, G, R, A] -- matching DRM_FORMAT_ARGB8888
+ * and Zephyr's PIXEL_FORMAT_ARGB_8888.
+ */
+#define BCM2835_FB_PIXEL_ORDER_BGR 0U
+#define BCM2835_FB_PIXEL_ORDER_RGB 1U
+
+/**
+ * @brief Read VideoCore's current display dimensions.
+ *
+ * Returns the resolution VC negotiated with the monitor's EDID at
+ * boot (driven by the `hdmi_*` settings in config.txt and the EDID
+ * the monitor advertises). Returns 0 x 0 if no display is detected.
+ *
+ * Used by the framebuffer driver to auto-select a native mode when
+ * DT doesn't specify an explicit width / height.
+ *
+ * @param width   Receives the current display width in pixels.
+ * @param height  Receives the current display height in pixels.
+ *
+ * @retval 0        Size read; @p width / @p height hold the result.
+ * @retval -EINVAL  @p width or @p height is NULL.
+ * @retval -ENODEV  Firmware driver not enabled / not initialised.
+ * @retval -EIO     Mailbox transport error or firmware-reported failure.
+ */
+int bcm2835_property_fb_get_size(uint32_t *width, uint32_t *height);
+
+/**
+ * @brief Configure and allocate the VideoCore framebuffer in one atomic call.
+ *
+ * Issues a single chained property request that sets the physical and
+ * virtual size, depth, and pixel order; allocates the buffer; and
+ * reads the actual row pitch back. VC requires these tags to arrive
+ * in a single request -- when split across multiple calls, VC silently
+ * clamps virt to 2x2 and depth to a minimum.
+ *
+ * All in/out arguments are updated with the values VC actually applied,
+ * which may differ from what was requested if the firmware clamped (for
+ * instance, to a mode the connected monitor supports).
+ *
+ * @param width        in/out: requested width; actual on return.
+ * @param height       in/out: requested height; actual on return.
+ * @param depth        in/out: requested bpp (16, 24, 32); actual on return.
+ * @param pixel_order  in/out: BCM2835_FB_PIXEL_ORDER_BGR or _RGB; actual.
+ * @param alignment    Buffer alignment in bytes (256 is conventional).
+ * @param fb_bus       Receives the VC-bus framebuffer base address.
+ *                     The ARM physical address is `*fb_bus & 0x3FFFFFFF`.
+ * @param fb_size      Receives the buffer size in bytes.
+ * @param pitch        Receives the row pitch in bytes (may exceed width*BPP
+ *                     if VC padded for alignment).
+ *
+ * @retval 0        Configured and allocated.
+ * @retval -EINVAL  Any pointer argument is NULL.
+ * @retval -ENODEV  Firmware driver not enabled / not initialised.
+ * @retval -EIO     Mailbox transport error or firmware-reported failure
+ *                  (also returned if HDMI is not active -- check that
+ *                  `hdmi_force_hotplug=1` is set in config.txt).
+ */
+int bcm2835_property_fb_setup(uint32_t *width, uint32_t *height,
+			      uint32_t *depth, uint32_t *pixel_order,
+			      uint32_t alignment,
+			      uintptr_t *fb_bus, uint32_t *fb_size,
+			      uint32_t *pitch);
+
 #ifdef __cplusplus
 }
 #endif
