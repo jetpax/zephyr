@@ -14,14 +14,17 @@
 #include <zephyr/drivers/uart.h>
 #include <zephyr/shell/shell.h>
 #include <zephyr/shell/shell_uart.h>
+#include <zephyr/fs/fs.h>
 #include <zephyr/net/net_if.h>
+#include <zephyr/net/net_ip.h>
 #include <zephyr/net/wifi_mgmt.h>
 #include <zephyr/usb/usbd.h>
+#include <version.h>
 #include <sample_usbd.h>
 #include <stdio.h>
 #include <string.h>
 
-#define PIZZA_VERSION "v0.1-preview"
+#define PIZZA_VERSION "v0.2.1-preview"
 
 /*
  * Two-line header lines reused everywhere a "hello" is needed.
@@ -33,7 +36,8 @@
  * explicit cursor positioning.
  */
 #define BANNER_TITLE \
-	"\x1b[1;32mPiZZa " PIZZA_VERSION " -- Zephyr on the Raspberry Pi Zero 2 W\x1b[0m\r\n"
+	"\x1b[1;32mPiZZa " PIZZA_VERSION " -- Zephyr v" KERNEL_VERSION_STRING \
+	" on Raspberry Pi Zero 2 W\x1b[0m\r\n"
 #define BANNER_HELP "Type 'help' for more information.\r\n"
 
 /* Boot-time and shell-command form: no screen clear, no fake prompt. */
@@ -176,9 +180,104 @@ static const char nf_color_bar[] =
 "\x1b[40m   \x1b[41m   \x1b[42m   \x1b[43m   "
 "\x1b[44m   \x1b[45m   \x1b[46m   \x1b[47m   \x1b[0m";
 
+/* Snapshot the dynamic facts (temperature, uptime, IPv4) into stack
+ * buffers up front so the rendering pass is pure formatting.
+ */
+static void pizza_snapshot_temp(char *buf, size_t len)
+{
+	const struct device *thermal =
+		DEVICE_DT_GET_ANY(raspberrypi_bcm2835_vc_thermal);
+	struct sensor_value t;
+
+	if (thermal == NULL || !device_is_ready(thermal) ||
+	    sensor_sample_fetch(thermal) != 0 ||
+	    sensor_channel_get(thermal, SENSOR_CHAN_DIE_TEMP, &t) != 0) {
+		strncpy(buf, "(n/a)", len);
+		buf[len - 1] = '\0';
+		return;
+	}
+	snprintf(buf, len, "%d.%02d C", t.val1,
+		 t.val2 < 0 ? -t.val2 / 10000 : t.val2 / 10000);
+}
+
+static void pizza_snapshot_uptime(char *buf, size_t len)
+{
+	uint64_t s_total = k_uptime_get() / 1000;
+	uint32_t d = s_total / 86400U;
+	uint32_t h = (s_total / 3600U) % 24U;
+	uint32_t m = (s_total / 60U) % 60U;
+	uint32_t s = s_total % 60U;
+
+	snprintf(buf, len, "%ud %uh %um %us", d, h, m, s);
+}
+
+static void pizza_snapshot_storage(char *buf, size_t len)
+{
+	struct fs_statvfs st;
+	int rc = fs_statvfs("/SD:", &st);
+
+	if (rc < 0) {
+		snprintf(buf, len, "(SD not mounted: %d)", rc);
+		return;
+	}
+
+	uint64_t total_bytes = (uint64_t)st.f_bsize * (uint64_t)st.f_blocks;
+	uint64_t free_bytes  = (uint64_t)st.f_bsize * (uint64_t)st.f_bfree;
+	uint32_t total_mib   = (uint32_t)(total_bytes / (1024ULL * 1024ULL));
+	uint32_t free_mib    = (uint32_t)(free_bytes  / (1024ULL * 1024ULL));
+
+	if (total_mib >= 1024U) {
+		snprintf(buf, len,
+			 "%u.%u / %u.%u GiB free @ /SD:",
+			 free_mib / 1024U,
+			 ((free_mib  % 1024U) * 10U) / 1024U,
+			 total_mib / 1024U,
+			 ((total_mib % 1024U) * 10U) / 1024U);
+	} else {
+		snprintf(buf, len, "%u / %u MiB free @ /SD:",
+			 free_mib, total_mib);
+	}
+}
+
+static void pizza_snapshot_ipv4(char *buf, size_t len)
+{
+	struct net_if *iface = net_if_get_first_wifi();
+	struct net_in_addr *addr;
+
+	if (iface == NULL) {
+		strncpy(buf, "(no Wi-Fi iface)", len);
+		buf[len - 1] = '\0';
+		return;
+	}
+	addr = net_if_ipv4_get_global_addr(iface, NET_ADDR_PREFERRED);
+	if (addr == NULL || addr->s_addr == 0U) {
+		strncpy(buf, "(not connected)", len);
+		buf[len - 1] = '\0';
+		return;
+	}
+	if (net_addr_ntop(AF_INET, addr, buf, len) == NULL) {
+		strncpy(buf, "(format error)", len);
+		buf[len - 1] = '\0';
+	}
+}
+
 static int cmd_pizza_about(const struct shell *sh, size_t argc, char **argv)
 {
 	ARG_UNUSED(argc); ARG_UNUSED(argv);
+
+	char temp_buf[24];
+	char uptime_buf[32];
+	char ip_buf[NET_IPV4_ADDR_LEN + 24];
+	char mem_buf[24];
+	char storage_buf[40];
+
+	pizza_snapshot_temp(temp_buf, sizeof(temp_buf));
+	pizza_snapshot_uptime(uptime_buf, sizeof(uptime_buf));
+	pizza_snapshot_ipv4(ip_buf, sizeof(ip_buf));
+	pizza_snapshot_storage(storage_buf, sizeof(storage_buf));
+	snprintf(mem_buf, sizeof(mem_buf), "%llu MiB",
+		 (unsigned long long)(DT_REG_SIZE(DT_CHOSEN(zephyr_sram)) /
+				      (1024ULL * 1024ULL)));
 
 	/* Logo. Cursor ends 13 rows below where it started. */
 	shell_fprintf(sh, SHELL_NORMAL, "%s", nf_logo);
@@ -186,27 +285,26 @@ static int cmd_pizza_about(const struct shell *sh, size_t argc, char **argv)
 	/* Snap back to top-right of the logo for the info column. */
 	shell_fprintf(sh, SHELL_NORMAL, "\x1b[13A\x1b[%dC", NF_LOGO_WIDTH);
 
-	/*
-	 * Blank line in the title slot -- the CDC-connect banner already
-	 * carries "PiZZa <ver> -- Zephyr on the Raspberry Pi Zero 2 W"
-	 * up top, so we don't repeat it here.
-	 */
-	shell_fprintf(sh, SHELL_NORMAL, "\r\n\x1b[%dC", NF_LOGO_WIDTH);
-
 #define IL(label, value) shell_fprintf(sh, SHELL_NORMAL, \
 	"\x1b[1;31m%-9s\x1b[0;37m: %s\r\n\x1b[%dC", (label), (value), NF_LOGO_WIDTH)
-	IL("SoC",     "Broadcom BCM2710 (Cortex-A53 quad, ARMv8-A AArch64)");
-	IL("Wi-Fi",   "CYW43439 SDIO (brcmfmac driver)");
-	IL("Console", "USB CDC ACM (you're here)");
-	IL("Logs",    "PL011 / mini-UART on GPIO 14/15");
-	IL("Project", "https://github.com/jetpax/PiZZa");
-	IL("RFC",     "https://github.com/zephyrproject-rtos/zephyr/issues/109880");
+	IL("SoC",      "Broadcom BCM2710 (Cortex-A53 quad, ARMv8-A AArch64)");
+	IL("Memory",   mem_buf);
+	IL("Storage",  storage_buf);
+	IL("Wi-Fi",    "CYW43439 SDIO (brcmfmac driver)");
+	IL("Local IP", ip_buf);
+	IL("Console",  "USB CDC ACM (you're here)");
+	IL("Logs",     "PL011 / mini-UART on GPIO 14/15");
+	IL("Temp",     temp_buf);
+	IL("Uptime",   uptime_buf);
+	IL("Project",  "https://github.com/jetpax/PiZZa");
 #undef IL
 
 	/* Blank line + ANSI colour bar (still aligned right of the logo). */
 	shell_fprintf(sh, SHELL_NORMAL, "\r\n\x1b[%dC%s\r\n", NF_LOGO_WIDTH, nf_color_bar);
 
-	/* Push cursor below the logo so the next prompt doesn't land mid-logo. */
+	/* Push cursor below the logo so the next prompt doesn't land
+	 * mid-logo, with a small air gap.
+	 */
 	shell_fprintf(sh, SHELL_NORMAL, "\r\n\r\n\r\n");
 	return 0;
 }

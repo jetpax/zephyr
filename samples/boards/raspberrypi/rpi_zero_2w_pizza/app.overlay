@@ -27,6 +27,33 @@
 	status = "okay";
 };
 
+/*
+ * Auto-mount the external microSD slot as FAT at /SD: (FATFS volume
+ * convention: the path after the leading '/' is the disk-access disk
+ * name). The board DTS registers the disk as "SD"; this fstab plus
+ * CONFIG_FS_FATFS_FSTAB_AUTOMOUNT=y in prj.conf makes the mount
+ * happen at boot. `fs ls /SD:` or `pizza` (storage line) work
+ * immediately after the shell comes up.
+ *
+ * Format-on-mount-fail safety: CONFIG_FILE_SYSTEM_MKFS and
+ * CONFIG_FS_FATFS_MKFS are both off in prj.conf, so a failed mount
+ * cannot accidentally erase the user's SD card. (The per-instance
+ * `no-format` property is rejected by FATFS' BUILD_ASSERT; the
+ * Kconfig-level off-by-default is the supported mechanism.)
+ */
+/ {
+	fstab {
+		compatible = "zephyr,fstab";
+
+		sd_fs: sd {
+			compatible = "zephyr,fstab,fatfs";
+			automount;
+			disk-access;
+			mount-point = "/SD:";
+		};
+	};
+};
+
 &usb {
 	status = "okay";
 
