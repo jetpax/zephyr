@@ -65,20 +65,10 @@ cat > "$BOOTFS/config.txt" <<'EOF'
 # The original Raspberry Pi OS config.txt is preserved as config.txt.orig.
 
 arm_64bit=1
-core_freq=250
-
-# Route the PL011 (uart0) to GPIO 14/15 by moving Bluetooth onto the
-# mini-UART. The PL011 has a 16+6-bit fractional baud divider, far
-# more flexible than the mini-UART's integer-only divisor.
+# enable_uart=1 routes the mini-UART to GPIO 14/15 and locks the core
+# clock so its baud divisor stays valid.
 enable_uart=1
-dtoverlay=disable-bt
-# 1 Mbaud lands on an exact integer divisor at the default 48 MHz
-# PL011 UART_CLK (IBRD=3, FBRD=0 -> 48 MHz / 16 / 3 = 1 MHz exactly).
-# No init_uart_clock override needed. 921600 was tried first but the
-# tio/macOS USB-serial adapter on this host produces ~850 kbps when
-# asked for 921600; 1 Mbaud is unambiguous on both sides.
-init_uart_baud=1000000
-
+core_freq=250
 kernel_address=0x200000
 kernel=zephyr.bin
 EOF
