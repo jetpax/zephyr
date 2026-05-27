@@ -23,28 +23,42 @@
 
 #define PIZZA_VERSION "v0.1-preview"
 
-static const char banner[] =
-"\r\n"
-"    ____  _ ____________     \r\n"
-"   / __ \\(_)__  /__  /___ _  \r\n"
-"  / /_/ / / /_ < /_ </ __ `/ \r\n"
-" / ____/ / /__/ / __/ /_/ /  \r\n"
-"/_/   /_/_/____/____/\\__,_/   PiZZa " PIZZA_VERSION "\r\n"
-"\r\n"
-"  Zephyr on the Raspberry Pi Zero 2 W -- all features enabled.\r\n"
-"  Type 'pizza' for the device summary or 'help' for the full shell.\r\n"
-"\r\n";
+/*
+ * Two-line header lines reused everywhere a "hello" is needed.
+ *   - Bold green title.
+ *   - One-line help nudge.
+ * ASCII art was dropped because of font-kerning rendering quirks (logo
+ * cells aren't strict monospace in some host terminals); the neofetch
+ * `pizza` command keeps the peace logo where the layout is fixed by
+ * explicit cursor positioning.
+ */
+#define BANNER_TITLE \
+	"\x1b[1;32mPiZZa " PIZZA_VERSION " -- Zephyr on the Raspberry Pi Zero 2 W\x1b[0m\r\n"
+#define BANNER_HELP "Type 'help' for more information.\r\n"
+
+/* Boot-time and shell-command form: no screen clear, no fake prompt. */
+static const char banner[] = "\r\n" BANNER_TITLE BANNER_HELP;
+
+/*
+ * CDC-connect form: clear screen, title + help, then a "uart:~$ "
+ * placeholder in bold green that matches the Zephyr shell's real
+ * prompt colour (SHELL_INFO -> SHELL_VT100_COLOR_GREEN). The first
+ * keystroke from the host hands control back to the real shell --
+ * which immediately re-renders ITS prompt in the same colour at the
+ * same position, so the seam is invisible.
+ *
+ * Why fake: the shell's TX path can only be safely driven from the
+ * shell's own thread or from a shell-command callback context. Calls
+ * from the system workqueue block forever (K_FOREVER lock + flush on
+ * a TX queue we just hammered with uart_poll_out).
+ */
+static const char banner_cdc[] =
+	"\x1b[2J\x1b[H" BANNER_TITLE BANNER_HELP "\x1b[1;32muart:~$ \x1b[0m";
 
 static int cmd_pizza_welcome(const struct shell *sh, size_t argc, char **argv)
 {
 	ARG_UNUSED(argc); ARG_UNUSED(argv);
-	printk("[pizza] welcome cmd invoked\n");
-	/*
-	 * ESC[2J  - erase entire screen
-	 * ESC[H   - move cursor to top-left (home)
-	 */
-	shell_fprintf(sh, SHELL_NORMAL, "\x1b[2J\x1b[H%s", banner);
-	printk("[pizza] welcome cmd done\n");
+	shell_fprintf(sh, SHELL_NORMAL, "%s", banner);
 	return 0;
 }
 
@@ -70,12 +84,7 @@ static void welcome_write_banner(void)
 	if (!device_is_ready(cdc)) {
 		return;
 	}
-	/* ESC[2J + ESC[H -> clear screen, home cursor. */
-	static const char clear[] = "\x1b[2J\x1b[H";
-	for (const char *p = clear; *p; p++) {
-		uart_poll_out(cdc, (uint8_t)*p);
-	}
-	for (const char *p = banner; *p; p++) {
+	for (const char *p = banner_cdc; *p; p++) {
 		uart_poll_out(cdc, (uint8_t)*p);
 	}
 }
@@ -141,16 +150,64 @@ int main(void)
  *  `pizza` shell command set
  * ----------------------------------------------------------------- */
 
+/*
+ * Peace-symbol ASCII art -- repurposed from
+ * pizza-fs/lib/sys/utils.py::neofetch() (jetpax = pax = peace).
+ * Rendered in 256-colour purple bold so it pops in tio / xterm.js.
+ */
+#define NF_LOGO_WIDTH  29
+static const char nf_logo[] =
+"\r\n\x1b[38;5;135;1m"
+"        -+#%@@@%#+-      \r\n"
+"      %@@@@@@@@@@@@@%    \r\n"
+"    =@@@%* -@@@- *%@@@=  \r\n"
+"   *@@@     @@@     @@@% \r\n"
+"  +@@%      @@@      %@@+\r\n"
+"  @@@     .#@@@#.     @@@\r\n"
+"  @@@    @@@@@@@@@    @@@\r\n"
+"  *@@# .@@* @@@ *@@. #@@*\r\n"
+"   #@@@@@   @@@   @@@@@# \r\n"
+"    *@@@@_ _@@@_ _@@@@*  \r\n"
+"      #@@@@@@@@@@@@@#    \r\n"
+"        *+%@@@@@%+*      \r\n"
+"\r\n\x1b[0;37m";
+
+static const char nf_color_bar[] =
+"\x1b[40m   \x1b[41m   \x1b[42m   \x1b[43m   "
+"\x1b[44m   \x1b[45m   \x1b[46m   \x1b[47m   \x1b[0m";
+
 static int cmd_pizza_about(const struct shell *sh, size_t argc, char **argv)
 {
 	ARG_UNUSED(argc); ARG_UNUSED(argv);
-	shell_print(sh, "PiZZa %s -- Zephyr on the Raspberry Pi Zero 2 W", PIZZA_VERSION);
-	shell_print(sh, "  SoC      : Broadcom BCM2710 (Cortex-A53 quad, ARMv8-A AArch64)");
-	shell_print(sh, "  Wi-Fi    : CYW43439 SDIO (brcmfmac driver)");
-	shell_print(sh, "  Console  : USB CDC ACM (you're here)");
-	shell_print(sh, "  Logs     : PL011 / mini-UART on GPIO 14/15");
-	shell_print(sh, "  Project  : https://github.com/jetpax/PiZZa");
-	shell_print(sh, "  RFC      : https://github.com/zephyrproject-rtos/zephyr/issues/109880");
+
+	/* Logo. Cursor ends 13 rows below where it started. */
+	shell_fprintf(sh, SHELL_NORMAL, "%s", nf_logo);
+
+	/* Snap back to top-right of the logo for the info column. */
+	shell_fprintf(sh, SHELL_NORMAL, "\x1b[13A\x1b[%dC", NF_LOGO_WIDTH);
+
+	/*
+	 * Blank line in the title slot -- the CDC-connect banner already
+	 * carries "PiZZa <ver> -- Zephyr on the Raspberry Pi Zero 2 W"
+	 * up top, so we don't repeat it here.
+	 */
+	shell_fprintf(sh, SHELL_NORMAL, "\r\n\x1b[%dC", NF_LOGO_WIDTH);
+
+#define IL(label, value) shell_fprintf(sh, SHELL_NORMAL, \
+	"\x1b[1;31m%-9s\x1b[0;37m: %s\r\n\x1b[%dC", (label), (value), NF_LOGO_WIDTH)
+	IL("SoC",     "Broadcom BCM2710 (Cortex-A53 quad, ARMv8-A AArch64)");
+	IL("Wi-Fi",   "CYW43439 SDIO (brcmfmac driver)");
+	IL("Console", "USB CDC ACM (you're here)");
+	IL("Logs",    "PL011 / mini-UART on GPIO 14/15");
+	IL("Project", "https://github.com/jetpax/PiZZa");
+	IL("RFC",     "https://github.com/zephyrproject-rtos/zephyr/issues/109880");
+#undef IL
+
+	/* Blank line + ANSI colour bar (still aligned right of the logo). */
+	shell_fprintf(sh, SHELL_NORMAL, "\r\n\x1b[%dC%s\r\n", NF_LOGO_WIDTH, nf_color_bar);
+
+	/* Push cursor below the logo so the next prompt doesn't land mid-logo. */
+	shell_fprintf(sh, SHELL_NORMAL, "\r\n\r\n\r\n");
 	return 0;
 }
 
