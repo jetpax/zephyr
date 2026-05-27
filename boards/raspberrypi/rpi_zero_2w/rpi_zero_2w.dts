@@ -9,6 +9,7 @@
 #include <broadcom/bcm2710.dtsi>
 #include <broadcom/bcm2711-pinctrl.dtsi>
 #include <zephyr/dt-bindings/gpio/gpio.h>
+#include <zephyr/dt-bindings/i2c/i2c.h>
 
 / {
 	model = "Raspberry Pi Zero 2 W";
@@ -101,6 +102,20 @@
  * board-init shim. See /private/tmp/zephyr_board_config.html.
  */
 &spi0 {
+	status = "okay";
+};
+
+/*
+ * BSC1 ("I2C1") on the 40-pin header — GPIO 2 (SDA) and GPIO 3 (SCL).
+ * Unlike SPI, the I2C pin roles on the header are fixed (no D/C-style
+ * dual-purpose role), so the pinctrl group is wired here at the board
+ * level. clock-frequency defaults to 100 kHz; an overlay can step it
+ * up to 400 kHz for fast-mode devices.
+ */
+&i2c1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c1_gpio2>;
+	clock-frequency = <I2C_BITRATE_STANDARD>;
 	status = "okay";
 };
 
