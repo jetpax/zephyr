@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# Pull in the SAMPLE_USBD_* options used by sample_usbd_init.c (VID, PID,
+# manufacturer/product strings). This Kconfig is required because the
+# sample helper is shared across in-tree USB samples and references those
+# symbols statically.
+source "samples/subsys/usb/common/Kconfig.sample_usbd"
+
+source "Kconfig.zephyr"

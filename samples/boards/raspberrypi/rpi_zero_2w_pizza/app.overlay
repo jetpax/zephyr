@@ -1,0 +1,68 @@
+/*
+ * PiZZa -- all-features overlay for rpi_zero_2w.
+ *
+ * Enables the SoC nodes that the board DTS leaves disabled:
+ *   - &mailbox + &firmware (USB PHY power-on, board serial, die-temp)
+ *   - &vc_thermal (read via firmware GET_TEMPERATURE property tag)
+ *   - &i2s (PCM/I2S; dmas already chained via DMA controller)
+ *   - &usb + a single CDC ACM child for the shell
+ *
+ * Board DTS already enables &emmc (with brcmfmac child), &dma, &spi0,
+ * &sdhost, &rng -- no override needed here.
+ */
+
+&mailbox {
+	status = "okay";
+};
+
+&firmware {
+	status = "okay";
+};
+
+&vc_thermal {
+	status = "okay";
+};
+
+&i2s {
+	status = "okay";
+};
+
+&usb {
+	status = "okay";
+
+	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+		label = "PiZZa shell (USB CDC ACM)";
+	};
+};
+
+/ {
+	chosen {
+		/*
+		 * Route logs to the mini-UART (uart1) on GPIO 14/15. With
+		 * config.txt `enable_uart=1` the firmware routes uart1 to
+		 * those pins at 115200; any USB-serial adapter will read it.
+		 * The board DTS' default `zephyr,console = &uart0` (PL011)
+		 * needs `dtoverlay=disable-bt` in config.txt to be useful,
+		 * which adds friction PiZZa is trying to avoid.
+		 */
+		zephyr,console = &uart1;
+		zephyr,shell-uart = &cdc_acm_uart0;
+	};
+};
+
+/*
+ * Mini-UART (uart1) console setup. The board DTS (pre-commit
+ * 30c10788472 "switch console to PL011 @ 1 Mbaud") had this same
+ * stanza; we restore it sample-locally so the PiZZa image's console
+ * lines up with the canonical config.txt (enable_uart=1, no
+ * dtoverlay=disable-bt). The pinctrl group uart1_gpio14 comes
+ * from dts/arm/broadcom/bcm283x-pinctrl.dtsi (transitively included
+ * from the board's bcm2711-pinctrl.dtsi).
+ */
+&uart1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart1_gpio14>;
+	status = "okay";
+	current-speed = <115200>;
+};
