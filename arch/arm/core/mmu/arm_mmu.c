@@ -29,7 +29,12 @@
 #include <zephyr/kernel/mm.h>
 #include <zephyr/sys/barrier.h>
 
+#if defined(CONFIG_CPU_AARCH32_ARMV6)
+/* ARM1176 is not a CMSIS target; provide the CP15 accessors it lacks. */
+#include "armv6_cp15.h"
+#else
 #include <cmsis_core.h>
+#endif
 
 #include <zephyr/arch/arm/mmu/arm_mmu.h>
 #include "arm_mmu_priv.h"
@@ -852,7 +857,16 @@ int z_arm_mmu_init(void)
 
 	/* Enable the MMU and Cache in SCTLR */
 	reg_val  = __get_SCTLR();
+#if defined(CONFIG_CPU_AARCH32_ARMV6)
+	/*
+	 * ARM1176 has no AFE. XP selects the extended (subpage-disabled) page
+	 * table format, under which the AP[2:0] bits written by this driver
+	 * carry the same meaning as the ARMv7 AFE AP[2:1]+AF encoding.
+	 */
+	reg_val |= ARM_MMU_SCTLR_XP_BIT;
+#else
 	reg_val |= ARM_MMU_SCTLR_AFE_BIT;
+#endif
 	reg_val |= ARM_MMU_SCTLR_ICACHE_ENABLE_BIT;
 	reg_val |= ARM_MMU_SCTLR_DCACHE_ENABLE_BIT;
 	reg_val |= ARM_MMU_SCTLR_MMU_ENABLE_BIT;
