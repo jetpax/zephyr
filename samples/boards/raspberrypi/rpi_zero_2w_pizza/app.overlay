@@ -23,6 +23,13 @@
 	status = "okay";
 };
 
+&vc_fb {
+	/* No width / height: driver auto-detects from VC's EDID
+	 * negotiation -- whatever the attached monitor's native mode is.
+	 */
+	status = "okay";
+};
+
 &i2s {
 	status = "okay";
 };
@@ -75,6 +82,7 @@
 		 */
 		zephyr,console = &uart1;
 		zephyr,shell-uart = &cdc_acm_uart0;
+		zephyr,display = &vc_fb;
 	};
 };
 

@@ -9,6 +9,7 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
+#include <zephyr/drivers/display.h>
 #include <zephyr/drivers/hwinfo.h>
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/drivers/uart.h>
@@ -24,7 +25,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define PIZZA_VERSION "v0.2.1-preview"
+#define PIZZA_VERSION "v0.3"
 
 /*
  * Two-line header lines reused everywhere a "hello" is needed.
@@ -98,16 +99,17 @@ static void welcome_work_fn(struct k_work *work)
 	ARG_UNUSED(work);
 	static int64_t last_fire_ms;
 	int64_t now = k_uptime_get();
+
+	/* USBD fires line-state / line-coding events repeatedly during
+	 * enumeration; debounce so the banner only prints once per host
+	 * port-open.
+	 */
 	if (now - last_fire_ms < 500) {
-		printk("[pizza] welcome debounced (%lld ms since last)\n",
-		       now - last_fire_ms);
 		return;
 	}
 	last_fire_ms = now;
 
-	printk("[pizza] writing banner to CDC...\n");
 	welcome_write_banner();
-	printk("[pizza] banner write complete\n");
 }
 static K_WORK_DELAYABLE_DEFINE(welcome_work, welcome_work_fn);
 
@@ -119,20 +121,23 @@ static void pizza_usbd_msg_cb(struct usbd_context *const ctx,
 	if (msg->type == USBD_MSG_CDC_ACM_CONTROL_LINE_STATE) {
 		uint32_t dtr = 0U;
 		(void)uart_line_ctrl_get(msg->dev, UART_LINE_CTRL_DTR, &dtr);
-		printk("[pizza] CDC line-state: DTR=%u\n", dtr);
 		if (dtr) {
 			k_work_reschedule(&welcome_work, K_MSEC(300));
 		}
 	} else if (msg->type == USBD_MSG_CDC_ACM_LINE_CODING) {
-		printk("[pizza] CDC line-coding (host opened port)\n");
 		k_work_reschedule(&welcome_work, K_MSEC(300));
 	}
 }
+
+static void pizza_display_paint(void);
 
 int main(void)
 {
 	/* First print: mini-UART console (board logs path). */
 	printk("%s", banner);
+
+	/* Splash CMYKWRGB bars on HDMI (no-op when no monitor). */
+	pizza_display_paint();
 
 	/* Bring up USBD with a msg_cb so we react to CDC DTR. */
 	struct usbd_context *usbd = sample_usbd_init_device(pizza_usbd_msg_cb);
@@ -239,6 +244,90 @@ static void pizza_snapshot_storage(char *buf, size_t len)
 	}
 }
 
+static void pizza_snapshot_display(char *buf, size_t len)
+{
+#if DT_HAS_CHOSEN(zephyr_display)
+	const struct device *dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_display));
+	struct display_capabilities caps;
+
+	if (!device_is_ready(dev)) {
+		strncpy(buf, "(no monitor detected)", len);
+		buf[len - 1] = '\0';
+		return;
+	}
+	display_get_capabilities(dev, &caps);
+	snprintf(buf, len, "HDMI %ux%u", caps.x_resolution, caps.y_resolution);
+#else
+	strncpy(buf, "(disabled)", len);
+	buf[len - 1] = '\0';
+#endif
+}
+
+#if DT_HAS_CHOSEN(zephyr_display)
+
+/*
+ * Splash the HDMI scanout with a CMYKWRGB bar pattern at boot. One
+ * scanline is rendered into a static row buffer and repeated for every
+ * line of the framebuffer. Bar count divides screen width by 8; any
+ * rounding remainder lands on the last (Blue) bar.
+ *
+ * 1920 covers every Pi 3 HDMI mode VC will hand us; the row buffer is
+ * static BSS rather than stack so a fault here doesn't blow the main
+ * thread.
+ */
+#define PIZZA_DISPLAY_MAX_W 1920U
+static uint32_t pizza_display_row[PIZZA_DISPLAY_MAX_W];
+
+static const uint32_t pizza_display_bars[] = {
+	0xFF00FFFFU, /* Cyan */
+	0xFFFF00FFU, /* Magenta */
+	0xFFFFFF00U, /* Yellow */
+	0xFF000000U, /* Key (black) */
+	0xFFFFFFFFU, /* White */
+	0xFFFF0000U, /* Red */
+	0xFF00FF00U, /* Green */
+	0xFF0000FFU, /* Blue */
+};
+
+static void pizza_display_paint(void)
+{
+	const struct device *dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_display));
+	struct display_capabilities caps;
+	struct display_buffer_descriptor desc;
+	uint16_t w, h;
+	const size_t n = ARRAY_SIZE(pizza_display_bars);
+
+	if (!device_is_ready(dev)) {
+		return;
+	}
+	display_get_capabilities(dev, &caps);
+	w = caps.x_resolution;
+	h = caps.y_resolution;
+
+	if (w == 0 || h == 0 || w > PIZZA_DISPLAY_MAX_W) {
+		return;
+	}
+
+	for (uint16_t x = 0; x < w; x++) {
+		const size_t band = ((size_t)x * n) / w;
+
+		pizza_display_row[x] = pizza_display_bars[band];
+	}
+
+	desc.buf_size = (size_t)w * sizeof(uint32_t);
+	desc.width    = w;
+	desc.height   = 1;
+	desc.pitch    = w;
+
+	for (uint16_t y = 0; y < h; y++) {
+		(void)display_write(dev, 0, y, &desc, pizza_display_row);
+	}
+}
+
+#else  /* !DT_HAS_CHOSEN(zephyr_display) */
+static inline void pizza_display_paint(void) { }
+#endif
+
 static void pizza_snapshot_ipv4(char *buf, size_t len)
 {
 	struct net_if *iface = net_if_get_first_wifi();
@@ -270,11 +359,13 @@ static int cmd_pizza_about(const struct shell *sh, size_t argc, char **argv)
 	char ip_buf[NET_IPV4_ADDR_LEN + 24];
 	char mem_buf[24];
 	char storage_buf[40];
+	char display_buf[32];
 
 	pizza_snapshot_temp(temp_buf, sizeof(temp_buf));
 	pizza_snapshot_uptime(uptime_buf, sizeof(uptime_buf));
 	pizza_snapshot_ipv4(ip_buf, sizeof(ip_buf));
 	pizza_snapshot_storage(storage_buf, sizeof(storage_buf));
+	pizza_snapshot_display(display_buf, sizeof(display_buf));
 	snprintf(mem_buf, sizeof(mem_buf), "%llu MiB",
 		 (unsigned long long)(DT_REG_SIZE(DT_CHOSEN(zephyr_sram)) /
 				      (1024ULL * 1024ULL)));
@@ -290,7 +381,7 @@ static int cmd_pizza_about(const struct shell *sh, size_t argc, char **argv)
 	IL("SoC",      "Broadcom BCM2710 (Cortex-A53 quad, ARMv8-A AArch64)");
 	IL("Memory",   mem_buf);
 	IL("Storage",  storage_buf);
-	IL("Wi-Fi",    "CYW43439 SDIO (brcmfmac driver)");
+	IL("Display",  display_buf);
 	IL("Local IP", ip_buf);
 	IL("Console",  "USB CDC ACM (you're here)");
 	IL("Logs",     "PL011 / mini-UART on GPIO 14/15");
