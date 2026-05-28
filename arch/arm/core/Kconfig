@@ -20,6 +20,7 @@ config CPU_AARCH32_ARMV6
 	select USE_SWITCH_SUPPORTED
 	select ISA_ARM
 	select ATOMIC_OPERATIONS_BUILTIN
+	select CPU_HAS_MMU
 	help
 	  This option signifies the use of a classic ARMv6/ARMv6K CPU (ARM11),
 	  e.g. the ARM1176JZF-S in the BCM2835 (Raspberry Pi Zero / Zero W).
