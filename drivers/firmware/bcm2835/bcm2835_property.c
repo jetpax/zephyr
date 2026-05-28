@@ -214,7 +214,11 @@ int bcm2835_property_get_board_serial(uint8_t *out)
 	err = property_call_locked(RPI_FW_TAG_GET_BOARD_SERIAL, 2);
 	if (err == 0) {
 		memcpy(out, &req_buf[5], 8);
-		LOG_INF("board serial: %08x%08x", req_buf[6], req_buf[5]);
+		/* DBG: USB device init queries this once per supported speed
+		 * (HS + FS) for iSerialNumber, and the value is already
+		 * surfaced via `hwinfo devid` + the PiZZa about panel.
+		 */
+		LOG_DBG("board serial: %08x%08x", req_buf[6], req_buf[5]);
 	}
 
 	k_mutex_unlock(&req_buf_lock);
