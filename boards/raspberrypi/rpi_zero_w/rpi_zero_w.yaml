@@ -2,6 +2,8 @@ identifier: rpi_zero_w
 name: Raspberry Pi Zero / Zero W
 type: mcu
 arch: arm
+simulation:
+  - name: qemu
 toolchain:
   - zephyr
   - cross-compile
