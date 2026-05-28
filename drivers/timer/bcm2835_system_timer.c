@@ -32,14 +32,26 @@ static void bcm2835_timer_isr(const void *arg)
 {
 	ARG_UNUSED(arg);
 
-	/*
-	 * Acknowledge the match, then schedule the next tick relative to the
-	 * previous compare value so the period does not drift.
-	 */
+	/* Acknowledge the match. */
 	sys_write32(ST_MATCH, ST_CS);
-	sys_write32(sys_read32(ST_COMPARE) + CYC_PER_TICK, ST_COMPARE);
 
-	sys_clock_announce(1);
+	/*
+	 * Advance the compare relative to its previous value so the period does
+	 * not drift, but catch up any ticks missed while interrupts were masked.
+	 * This guarantees the next compare is in the future (the match cannot
+	 * re-assert immediately and storm the ISR) and keeps the kernel tick
+	 * count accurate. The signed comparison tolerates 32-bit counter wrap.
+	 */
+	uint32_t next = sys_read32(ST_COMPARE) + CYC_PER_TICK;
+	uint32_t ticks = 1;
+
+	while ((int32_t)(sys_read32(ST_CLO) - next) >= 0) {
+		next += CYC_PER_TICK;
+		ticks++;
+	}
+
+	sys_write32(next, ST_COMPARE);
+	sys_clock_announce(ticks);
 }
 
 /* Tickless kernel is not supported by this driver. */
