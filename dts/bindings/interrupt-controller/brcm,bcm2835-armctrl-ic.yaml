@@ -24,9 +24,12 @@ properties:
     required: true
 
   interrupts:
-    required: true
     description: |
       The single GPU-cascade IRQ on the parent BCM2836 ARM-local intc.
+      Present only when this controller is cascaded (BCM2836 / Pi 2+).
+      On the BCM2835 (Pi 1 / Zero / Zero W) the ARMC is the root
+      interrupt controller, wired directly to the ARM core IRQ line, so
+      it has no parent interrupt and this property is omitted.
 
   interrupt-controller:
     required: true
