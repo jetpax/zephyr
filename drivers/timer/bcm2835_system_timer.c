@@ -3,10 +3,15 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  *
- * Broadcom BCM2835 free-running system timer (1 MHz). A compare-channel
- * match raises an interrupt; the ISR reprograms the next compare for a
- * periodic (non-tickless) kernel tick. Channels 0 and 2 are reserved by
- * the VideoCore firmware, so channel 3 is used.
+ * Broadcom BCM2835 free-running system timer (1 MHz). A compare-channel match
+ * raises an interrupt. Channels 0 and 2 are reserved by the VideoCore firmware,
+ * so channel 3 is used for the kernel tick. Supports both tickless and ticking
+ * kernels.
+ *
+ * The compare is a 32-bit EQUALITY match on the counter's low word (ST_CLO): it
+ * fires only when ST_CLO == Cn. A target the counter has already passed would
+ * not match again until the low word wraps (~71 min at 1 MHz), so every compare
+ * write is kept at least MIN_DELAY cycles ahead of the live counter.
  */
 
 #define DT_DRV_COMPAT brcm_bcm2835_system_timer
@@ -28,6 +33,38 @@
 
 #define CYC_PER_TICK ((uint32_t)k_ticks_to_cyc_floor32(1))
 
+/* Largest tick count whose cycle span still fits the 32-bit compare. */
+#define MAX_TICKS    ((uint32_t)(UINT32_MAX / CYC_PER_TICK) - 2)
+
+/*
+ * Minimum cycles a freshly programmed compare must lead the live counter by,
+ * covering the read-modify-write latency so the equality match is not missed.
+ */
+#define MIN_DELAY    16
+
+/* ST_CLO value at the most recently announced tick boundary. */
+static uint32_t last_cycle;
+/* Ticks reported by the most recent sys_clock_elapsed() (tickless only). */
+static uint32_t last_elapsed;
+
+#if defined(CONFIG_TEST)
+const int32_t z_sys_timer_irq_for_test = TIMER_IRQ;
+#endif
+
+/*
+ * Program the compare register, stepping it forward in whole ticks until it is
+ * at least MIN_DELAY ahead of the live counter. Stepping by a tick (rather than
+ * to "now + MIN_DELAY") keeps the compare on a tick boundary so the period does
+ * not drift; a late ISR then simply announces the extra elapsed ticks.
+ */
+static void set_compare(uint32_t target)
+{
+	while ((int32_t)(target - sys_read32(ST_CLO)) < (int32_t)MIN_DELAY) {
+		target += CYC_PER_TICK;
+	}
+	sys_write32(target, ST_COMPARE);
+}
+
 static void bcm2835_timer_isr(const void *arg)
 {
 	ARG_UNUSED(arg);
@@ -35,29 +72,47 @@ static void bcm2835_timer_isr(const void *arg)
 	/* Acknowledge the match. */
 	sys_write32(ST_MATCH, ST_CS);
 
-	/*
-	 * Advance the compare relative to its previous value so the period does
-	 * not drift, but catch up any ticks missed while interrupts were masked.
-	 * This guarantees the next compare is in the future (the match cannot
-	 * re-assert immediately and storm the ISR) and keeps the kernel tick
-	 * count accurate. The signed comparison tolerates 32-bit counter wrap.
-	 */
-	uint32_t next = sys_read32(ST_COMPARE) + CYC_PER_TICK;
-	uint32_t ticks = 1;
+	uint32_t now = sys_read32(ST_CLO);
+	uint32_t ticks = (now - last_cycle) / CYC_PER_TICK;
 
-	while ((int32_t)(sys_read32(ST_CLO) - next) >= 0) {
-		next += CYC_PER_TICK;
-		ticks++;
+	last_cycle += ticks * CYC_PER_TICK;
+	last_elapsed = 0;
+
+	if (!IS_ENABLED(CONFIG_TICKLESS_KERNEL)) {
+		/* Re-arm for the next periodic tick. */
+		set_compare(last_cycle + CYC_PER_TICK);
 	}
 
-	sys_write32(next, ST_COMPARE);
-	sys_clock_announce(ticks);
+	sys_clock_announce((int32_t)ticks);
 }
 
-/* Tickless kernel is not supported by this driver. */
+void sys_clock_set_timeout(int32_t ticks, bool idle)
+{
+	ARG_UNUSED(idle);
+
+	if (!IS_ENABLED(CONFIG_TICKLESS_KERNEL)) {
+		return;
+	}
+
+	ticks = (ticks == K_TICKS_FOREVER) ? (int32_t)MAX_TICKS : ticks;
+	ticks = CLAMP(ticks, 0, (int32_t)MAX_TICKS);
+
+	/*
+	 * Fire `ticks` ticks past the position the kernel last observed via
+	 * sys_clock_elapsed() (last_cycle + last_elapsed). The kernel already
+	 * applies its own round-up, so the driver adds none of its own.
+	 */
+	set_compare(last_cycle + (last_elapsed + (uint32_t)ticks) * CYC_PER_TICK);
+}
+
 uint32_t sys_clock_elapsed(void)
 {
-	return 0;
+	if (!IS_ENABLED(CONFIG_TICKLESS_KERNEL)) {
+		return 0;
+	}
+
+	last_elapsed = (sys_read32(ST_CLO) - last_cycle) / CYC_PER_TICK;
+	return last_elapsed;
 }
 
 uint32_t sys_clock_cycle_get_32(void)
@@ -69,7 +124,8 @@ static int bcm2835_timer_init(void)
 {
 	IRQ_CONNECT(TIMER_IRQ, 0, bcm2835_timer_isr, NULL, 0);
 
-	sys_write32(sys_read32(ST_CLO) + CYC_PER_TICK, ST_COMPARE);
+	last_cycle = sys_read32(ST_CLO);
+	set_compare(last_cycle + CYC_PER_TICK);
 	sys_write32(ST_MATCH, ST_CS);   /* clear any stale match */
 	irq_enable(TIMER_IRQ);
 
