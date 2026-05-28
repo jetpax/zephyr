@@ -111,4 +111,18 @@
 			bias-pull-up;
 		};
 	};
+
+	/* BSC1 ("I2C1") on GPIO 2 (SDA) and GPIO 3 (SCL) at ALT0 -- the
+	 * user-facing I2C bus on the Raspberry Pi 40-pin header. The Pi
+	 * board has fixed 1.8 kOhm external pull-ups on these lines, so
+	 * the internal pull-up is strictly belt-and-braces, matching what
+	 * Linux's i2c1_gpio2 group does (bias-pull-up on both pins).
+	 */
+	i2c1_gpio2: i2c1-gpio2 {
+		group1 {
+			pinmux = <I2C1_SDA_GPIO2>,
+				 <I2C1_SCL_GPIO3>;
+			bias-pull-up;
+		};
+	};
 };

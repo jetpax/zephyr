@@ -1,0 +1,49 @@
+# Copyright (c) 2026 Jonathan Elliot Peace <jep@alphabetiq.com>
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Broadcom BCM2835 / BCM2710 / BCM2837 BSC ("Broadcom Serial Controller")
+  I2C master.
+
+  Same silicon block Linux binds with "brcm,bcm2835-i2c" -- the BSC
+  instances exposed on the Raspberry Pi family. The bus runs at
+  core_clock / CDIV; the driver picks CDIV from the standard
+  clock-frequency property (the bus rate), divided into the SoC-level
+  core-clock-frequency input.
+
+  The hardware has the following restrictions, which the driver
+  surfaces as -ENOTSUP from i2c_transfer():
+
+    - 7-bit slave addressing only.
+    - In a multi-message transfer only the last message may be a read.
+      The state machine cannot reverse direction mid-sequence except on
+      the transition into the final message.
+    - 10-bit addressing, target (slave) mode, and SMBus PEC are not
+      supported by the controller.
+
+compatible: "brcm,bcm2835-i2c"
+
+include: [i2c-controller.yaml, pinctrl-device.yaml]
+
+properties:
+  reg:
+    required: true
+
+  interrupts:
+    required: true
+
+  core-clock-frequency:
+    type: int
+    required: true
+    description: |
+      Frequency in Hz of the core clock that feeds the BSC clock
+      divider. On the BCM2710 this is the VPU core clock; with
+      "core_freq=250" in config.txt it is 250 MHz. The driver computes
+      CDIV = core-clock-frequency / clock-frequency, rounded up to the
+      next even value.
+
+  # pinctrl-0 / pinctrl-names come from pinctrl-device.yaml. They are
+  # intentionally not required here -- a board may mux the SDA/SCL pins
+  # via pinctrl at init, or omit pinctrl-0 and mux imperatively at
+  # runtime. See the layered board-config notes alongside the SPI and
+  # SDHost bindings.

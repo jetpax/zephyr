@@ -272,6 +272,61 @@
 		};
 
 		/*
+		 * BSC ("Broadcom Serial Controller") I2C masters. Three
+		 * instances on this silicon family: BSC0 lives on the main
+		 * peripheral page, BSC1 / BSC2 sit on the secondary page at
+		 * 0x3f80x000. Conventionally BSC0 is the HAT-ID-EEPROM bus
+		 * (GPIO 0/1, used by the firmware at boot), BSC1 is the
+		 * user-facing 40-pin-header bus on GPIO 2/3, and BSC2 is
+		 * reserved for HDMI's DDC line and shouldn't be enabled by
+		 * application code.
+		 *
+		 * All three share interrupt line BCM2835_IRQ_I2C -- Linux's
+		 * driver declares the same on each node and uses IRQF_SHARED
+		 * at request time. With status="disabled" by default only
+		 * one will normally be enabled at runtime, so the sharing
+		 * doesn't matter in practice; if a board enables more than
+		 * one, the build will fail at IRQ_CONNECT-duplicate time,
+		 * which is the right place to surface the conflict.
+		 *
+		 * Default disabled; board / sample overlay opts in.
+		 *
+		 * core-clock-frequency tracks the VPU core clock that feeds
+		 * the BSC CDIV divider, typ. 250 MHz with core_freq=250 in
+		 * config.txt. The bus rate is set per-node via the standard
+		 * clock-frequency property; the board overlay supplies it.
+		 */
+		i2c0: i2c@3f205000 {
+			compatible = "brcm,bcm2835-i2c";
+			reg = <0x3f205000 0x200>;
+			interrupts = <BCM2835_IRQ_I2C IRQ_TYPE_LEVEL 0>;
+			core-clock-frequency = <DT_FREQ_M(250)>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		i2c1: i2c@3f804000 {
+			compatible = "brcm,bcm2835-i2c";
+			reg = <0x3f804000 0x200>;
+			interrupts = <BCM2835_IRQ_I2C IRQ_TYPE_LEVEL 0>;
+			core-clock-frequency = <DT_FREQ_M(250)>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		i2c2: i2c@3f805000 {
+			compatible = "brcm,bcm2835-i2c";
+			reg = <0x3f805000 0x200>;
+			interrupts = <BCM2835_IRQ_I2C IRQ_TYPE_LEVEL 0>;
+			core-clock-frequency = <DT_FREQ_M(250)>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		/*
 		 * Arasan SDHCI controller (EMMC port). DREQ 11 paces the
 		 * external DMA engine that drives the data path; the board
 		 * overlay must also enable &dma. Default disabled.

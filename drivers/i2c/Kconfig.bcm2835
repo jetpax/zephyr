@@ -1,0 +1,17 @@
+# Broadcom BCM2835 BSC (I2C) controller
+#
+# Copyright (c) 2026 Jonathan Elliot Peace <jep@alphabetiq.com>
+# SPDX-License-Identifier: Apache-2.0
+
+config I2C_BCM2835
+	bool "Broadcom BCM2835 BSC (I2C) master driver"
+	default y
+	depends on DT_HAS_BRCM_BCM2835_I2C_ENABLED
+	select PINCTRL
+	select I2C_TRANSFER_TIMEOUT_SUPPORTED
+	help
+	  Enable the interrupt-driven master driver for the BCM2835 /
+	  BCM2710 / BCM2837 BSC ("Broadcom Serial Controller") I2C
+	  controller -- the BSC0/BSC1/BSC2 instances on the Raspberry Pi
+	  family. 7-bit addressing only; multi-message transfers may have
+	  at most one read, which must be the last message.
