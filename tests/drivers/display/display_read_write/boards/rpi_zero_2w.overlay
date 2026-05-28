@@ -1,0 +1,29 @@
+/*
+ * Copyright (c) 2026 jetpax
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Enable the VideoCore firmware framebuffer for the display_read_write
+ * ztest. Resolution is pinned at 640x480 -- the test reads width and
+ * height from DT at compile time to size the verification buffer, so
+ * auto-detect can't be used here.
+ */
+
+&mailbox {
+	status = "okay";
+};
+
+&firmware {
+	status = "okay";
+};
+
+&vc_fb {
+	width = <640>;
+	height = <480>;
+	status = "okay";
+};
+
+/ {
+	chosen {
+		zephyr,display = &vc_fb;
+	};
+};

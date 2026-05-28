@@ -126,6 +126,9 @@ tests:
       - native_sim/native/64
     extra_configs:
       - CONFIG_SDL_DISPLAY_DEFAULT_PIXEL_FORMAT_BGRA_8888=y
+  drivers.display.read_write.bcm2835_fb:
+    platform_allow:
+      - rpi_zero_2w
   drivers.display.read_write.ili9340:
     tags:
       - shield
