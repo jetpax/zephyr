@@ -105,5 +105,24 @@
 			clocks = <&clk_uart>;
 			status = "disabled";
 		};
+
+		/*
+		 * AUX mini-UART (UART1). reg points at the mini-UART register
+		 * block (AUX base 0x20215000 + 0x40), matching the driver's
+		 * MU_* offsets. The driver does not touch AUX_ENABLES and trusts
+		 * the firmware-programmed baud, so config.txt must carry
+		 * enable_uart=1 (which enables the AUX block and the core-clock
+		 * lock the mini-UART baud divisor depends on).
+		 */
+		uart1: uart@20215040 {
+			compatible = "brcm,bcm2711-aux-uart";
+			reg = <0x20215040 0x40>;
+			clock-frequency = <DT_FREQ_M(250)>;
+			interrupts = <BCM2835_IRQ_AUX IRQ_TYPE_LEVEL 0>;
+			interrupt-names = "uart1";
+			status = "disabled";
+		};
 	};
 };
+
+#include <broadcom/bcm283x-pinctrl.dtsi>
