@@ -256,7 +256,7 @@
 		 * fixed and required by snps,dwc2 for endpoint counts and
 		 * FIFO topology.
 		 */
-		usb: usb@3f980000 {
+		usb: zephyr_udc0: usb@3f980000 {
 			compatible = "brcm,bcm2835-usb", "snps,dwc2";
 			reg = <0x3f980000 0x10000>;
 			interrupts = <BCM2835_IRQ_USB IRQ_TYPE_LEVEL 0>;
