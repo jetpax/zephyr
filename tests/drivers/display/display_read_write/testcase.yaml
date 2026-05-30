@@ -132,6 +132,9 @@ tests:
       - native_sim/native/64
     extra_args:
       - DTC_OVERLAY_FILE=native_sim_bgra_8888.overlay
+  drivers.display.read_write.bcm2835_fb:
+    platform_allow:
+      - rpi_zero_2w
   drivers.display.read_write.ili9340:
     tags:
       - shield
