@@ -23,6 +23,8 @@ manifest:
       url-base: https://github.com/zephyrproject-rtos
     - name: babblesim
       url-base: https://github.com/BabbleSim
+    - name: jetpax
+      url-base: https://github.com/jetpax
 
   group-filter: [-babblesim, -optional, -testing]
 
@@ -169,6 +171,12 @@ manifest:
     - name: hal_bouffalolab
       path: modules/hal/bouffalolab
       revision: 6f8ee38a67b5c4a9f0b6e395d9c363fc920182a0
+      groups:
+        - hal
+    - name: hal_broadcom
+      remote: jetpax
+      revision: 5e1318dd98052f4438cdf99f6ed81850edcdfce9
+      path: modules/hal/broadcom
       groups:
         - hal
     - name: hal_espressif
