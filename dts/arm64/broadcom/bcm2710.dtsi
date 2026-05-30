@@ -80,6 +80,19 @@
 			compatible = "raspberrypi,bcm283x-vc-thermal";
 			status = "okay";
 		};
+
+		/*
+		 * VideoCore firmware framebuffer (HDMI). VC owns the HDMI
+		 * block, brings up the PHY from config.txt at boot, and
+		 * scans this buffer out to the cable continuously; the ARM
+		 * side requests the buffer at runtime via the FB property
+		 * tags. No width / height here means "ask VC for the EDID
+		 * mode". A board or sample overlay opts in.
+		 */
+		vc_fb: vc-fb {
+			compatible = "brcm,bcm2835-fb";
+			status = "disabled";
+		};
 	};
 
 	soc {

@@ -1,0 +1,17 @@
+# Copyright (c) 2026 jetpax
+# SPDX-License-Identifier: Apache-2.0
+
+config BCM2835_FB
+	bool "BCM2835/2710 VideoCore-firmware framebuffer (HDMI)"
+	default y
+	depends on DT_HAS_BRCM_BCM2835_FB_ENABLED
+	select RASPBERRYPI_FIRMWARE
+	help
+	  Enable the VideoCore-firmware-backed HDMI framebuffer driver
+	  for the BCM2835 / BCM2710 family. Requests a framebuffer from
+	  the VC GPU via the property-tag mailbox interface and exposes
+	  it through the Zephyr display driver API at PIXEL_FORMAT_ARGB_8888.
+
+	  The HDMI scanout itself is brought up by the VideoCore boot
+	  firmware according to config.txt; without `hdmi_force_hotplug=1`
+	  the GPU only enables HDMI when a monitor is connected at power-on.
