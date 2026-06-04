@@ -244,15 +244,24 @@ int rpi_fw_transfer(const struct device *dev, uint32_t tag, void *data, uint32_t
  * they cannot be issued one at a time via rpi_fw_transfer(). Matches
  * Linux drivers/video/fbdev/bcm2708_fb.c.
  *
+ * Physical (scanout) size and virtual (framebuffer) size can differ.
+ * When virt < phys, VC's HVS scales the framebuffer up to the scanout
+ * resolution on the fly -- letting the CPU paint into a smaller buffer
+ * while the monitor still receives native-resolution video. Pass
+ * @c *virt_width / @c *virt_height equal to phys (or 0, which the
+ * helper treats as "match phys") for the no-scaling case.
+ *
  * @param dev         Firmware device from DEVICE_DT_GET_ONE(raspberrypi_bcm283x_firmware).
- * @param width       In: requested width.  Out: granted (virtual) width.
- * @param height      In: requested height. Out: granted (virtual) height.
+ * @param phys_width  In: requested scanout width.  Out: granted scanout width.
+ * @param phys_height In: requested scanout height. Out: granted scanout height.
+ * @param virt_width  In: requested framebuffer width  (0 = match phys). Out: granted virtual width.
+ * @param virt_height In: requested framebuffer height (0 = match phys). Out: granted virtual height.
  * @param depth       In: requested bits-per-pixel. Out: granted bpp.
  * @param pixel_order In: 0=BGR, 1=RGB. Out: granted order.
  * @param alignment   Framebuffer base-address alignment in bytes.
  * @param fb_bus      Out: framebuffer VideoCore-bus base address.
  * @param fb_size     Out: framebuffer size in bytes.
- * @param pitch       Out: bytes per row (VC may pad beyond width * bpp).
+ * @param pitch       Out: bytes per row of the virtual buffer (VC may pad beyond virt_width * bpp).
  *
  * @retval 0          Success.
  * @retval -EINVAL    A required pointer was NULL.
@@ -260,7 +269,9 @@ int rpi_fw_transfer(const struct device *dev, uint32_t tag, void *data, uint32_t
  * @retval -EIO       Firmware rejected the request chain.
  * @retval -ETIMEDOUT Firmware did not respond within the timeout.
  */
-int rpi_fw_fb_setup(const struct device *dev, uint32_t *width, uint32_t *height,
+int rpi_fw_fb_setup(const struct device *dev,
+		    uint32_t *phys_width, uint32_t *phys_height,
+		    uint32_t *virt_width, uint32_t *virt_height,
 		    uint32_t *depth, uint32_t *pixel_order, uint32_t alignment,
 		    uintptr_t *fb_bus, uint32_t *fb_size, uint32_t *pitch);
 

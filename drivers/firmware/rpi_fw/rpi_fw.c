@@ -149,11 +149,15 @@ release_lock:
 	return ret;
 }
 
-int rpi_fw_fb_setup(const struct device *dev, uint32_t *width, uint32_t *height,
+int rpi_fw_fb_setup(const struct device *dev,
+		    uint32_t *phys_width, uint32_t *phys_height,
+		    uint32_t *virt_width, uint32_t *virt_height,
 		    uint32_t *depth, uint32_t *pixel_order, uint32_t alignment,
 		    uintptr_t *fb_bus, uint32_t *fb_size, uint32_t *pitch)
 {
-	if (width == NULL || height == NULL || depth == NULL || pixel_order == NULL ||
+	if (phys_width == NULL || phys_height == NULL ||
+	    virt_width == NULL || virt_height == NULL ||
+	    depth == NULL || pixel_order == NULL ||
 	    fb_bus == NULL || fb_size == NULL || pitch == NULL) {
 		return -EINVAL;
 	}
@@ -162,6 +166,10 @@ int rpi_fw_fb_setup(const struct device *dev, uint32_t *width, uint32_t *height,
 		LOG_ERR_DEVICE_NOT_READY(dev);
 		return -ENODEV;
 	}
+
+	/* virt = 0 means "match phys" -- the no-scaling default. */
+	const uint32_t vw_req = (*virt_width  != 0U) ? *virt_width  : *phys_width;
+	const uint32_t vh_req = (*virt_height != 0U) ? *virt_height : *phys_height;
 
 	const struct rpi_fw_config *fw_config = dev->config;
 	struct rpi_fw_data *fw_data = dev->data;
@@ -186,27 +194,30 @@ int rpi_fw_fb_setup(const struct device *dev, uint32_t *width, uint32_t *height,
 	 *
 	 *   [0]      total bytes
 	 *   [1]      request code
-	 *   [2..6]   SET_PHYSICAL_SIZE : id, 8, 0, W, H
-	 *   [7..11]  SET_VIRTUAL_SIZE  : id, 8, 0, W, H
+	 *   [2..6]   SET_PHYSICAL_SIZE : id, 8, 0, phys_W, phys_H
+	 *   [7..11]  SET_VIRTUAL_SIZE  : id, 8, 0, virt_W, virt_H
 	 *   [12..15] SET_DEPTH         : id, 4, 0, bpp
 	 *   [16..19] SET_PIXEL_ORDER   : id, 4, 0, order
 	 *   [20..24] ALLOCATE_BUFFER   : id, 8, 0, alignment, (size out)
 	 *   [25..28] GET_PITCH         : id, 4, 0, (pitch out)
 	 *   [29]     end tag
+	 *
+	 * When virt_W/H differ from phys_W/H, VC's HVS upscales the
+	 * framebuffer to the scanout resolution on the fly -- free CPU.
 	 */
 	buf[1] = RPI_FW_REQUEST_PROCESS;
 
 	buf[2] = RPI_FW_TAG_FB_SET_PHYSICAL_SIZE;
 	buf[3] = 8U;
 	buf[4] = 0U;
-	buf[5] = *width;
-	buf[6] = *height;
+	buf[5] = *phys_width;
+	buf[6] = *phys_height;
 
 	buf[7] = RPI_FW_TAG_FB_SET_VIRTUAL_SIZE;
 	buf[8] = 8U;
 	buf[9] = 0U;
-	buf[10] = *width;
-	buf[11] = *height;
+	buf[10] = vw_req;
+	buf[11] = vh_req;
 
 	buf[12] = RPI_FW_TAG_FB_SET_DEPTH;
 	buf[13] = 4U;
@@ -251,8 +262,10 @@ int rpi_fw_fb_setup(const struct device *dev, uint32_t *width, uint32_t *height,
 		goto release_lock;
 	}
 
-	*width = buf[10];        /* virtual size is what the FB actually is */
-	*height = buf[11];
+	*phys_width = buf[5];
+	*phys_height = buf[6];
+	*virt_width = buf[10];   /* virtual size is what the FB actually is */
+	*virt_height = buf[11];
 	*depth = buf[15];
 	*pixel_order = buf[19];
 	*fb_bus = buf[23];

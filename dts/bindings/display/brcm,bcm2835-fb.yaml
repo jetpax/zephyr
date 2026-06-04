@@ -19,7 +19,11 @@ description: |
   that size. This is the typical setup for HDMI, where the native
   resolution depends on the attached monitor.
 
-  Exposes the Zephyr display driver API at PIXEL_FORMAT_ARGB_8888.
+  Exposes the Zephyr display driver API at PIXEL_FORMAT_ARGB_8888 (depth
+  32) or PIXEL_FORMAT_RGB_565 (depth 16). The format is fixed at boot
+  by the `pixel-format` property and reported back via
+  display_get_capabilities(); set_pixel_format() only accepts a no-op
+  set to the configured format (VC pins depth at allocate time).
 
 compatible: "brcm,bcm2835-fb"
 
@@ -40,3 +44,33 @@ properties:
     description: |
       Framebuffer height in pixels. 0 (default) means "auto-detect"
       (see `width`).
+
+  pixel-format:
+    type: int
+    default: 0x8  # PANEL_PIXEL_FORMAT_ARGB_8888
+    description: |
+      Framebuffer pixel format. One of the PANEL_PIXEL_FORMAT_*
+      constants from <zephyr/dt-bindings/display/panel.h>. Supported
+      values are PANEL_PIXEL_FORMAT_ARGB_8888 (default, depth 32) and
+      PANEL_PIXEL_FORMAT_RGB_565 (depth 16). 16 bpp halves the per-frame
+      write bandwidth into VideoCore-shared DRAM and is the natural
+      target for small embedded software renderers that emit RGB565.
+
+  render-width:
+    type: int
+    default: 0
+    description: |
+      Optional virtual (framebuffer) width in pixels. 0 (default)
+      means "render at the same resolution as the physical scanout"
+      -- no scaling. When non-zero and smaller than `width`, the
+      VideoCore HVS hardware scaler upscales the framebuffer to the
+      scanout resolution on the fly: the CPU paints a smaller buffer
+      while the monitor still receives full-resolution video. Pair
+      with `render-height` -- both must be set.
+
+  render-height:
+    type: int
+    default: 0
+    description: |
+      Optional virtual (framebuffer) height in pixels. See
+      `render-width`.

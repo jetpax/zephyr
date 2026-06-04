@@ -10,7 +10,9 @@ config BCM2835_FB
 	  Enable the VideoCore-firmware-backed HDMI framebuffer driver
 	  for the BCM2835 / BCM2710 family. Requests a framebuffer from
 	  the VC GPU via the property-tag mailbox interface and exposes
-	  it through the Zephyr display driver API at PIXEL_FORMAT_ARGB_8888.
+	  it through the Zephyr display driver API. Pixel format is
+	  selectable per-instance via the `pixel-format` DT property --
+	  PIXEL_FORMAT_ARGB_8888 (default) or PIXEL_FORMAT_RGB_565.
 
 	  The HDMI scanout itself is brought up by the VideoCore boot
 	  firmware according to config.txt; without `hdmi_force_hotplug=1`

@@ -15,8 +15,8 @@
  *
  *   1. SET_PHYS_WH    -- scanout / monitor resolution
  *   2. SET_VIRT_WH    -- framebuffer resolution (= phys for no scrolling)
- *   3. SET_DEPTH      -- bits per pixel (32 for ARGB_8888)
- *   4. SET_PIXEL_ORDER-- 0=BGR, 1=RGB (1 matches Zephyr ARGB_8888)
+ *   3. SET_DEPTH      -- bits per pixel (32 = ARGB_8888, 16 = RGB_565)
+ *   4. SET_PIXEL_ORDER-- 0=BGR, 1=RGB (1 matches both Zephyr formats)
  *   5. ALLOCATE_BUFFER-- materialises the FB; returns VC-bus base + size
  *   6. GET_PITCH      -- actual bytes-per-row (VC may pad beyond W*BPP)
  *
@@ -28,6 +28,21 @@
  * `bus & 0x3FFFFFFF`. Mapped K_MEM_CACHE_NONE so CPU writes land in the
  * buffer without separate cache maintenance, matching VC's uncached
  * scanout view.
+ *
+ * Selectable pixel format: `pixel-format` DT property picks either
+ * PANEL_PIXEL_FORMAT_ARGB_8888 (default, depth 32) or
+ * PANEL_PIXEL_FORMAT_RGB_565 (depth 16). 16 bpp halves DRAM bandwidth
+ * per frame and lets small embedded renderers (which natively emit
+ * RGB565) drop their output straight into the scanout buffer with no
+ * per-pixel conversion.
+ *
+ * Optional HVS scaling: `render-width` / `render-height` DT properties
+ * (when non-zero) allocate a virtual framebuffer smaller than the
+ * scanout resolution. VC's hardware scaler upscales it to the monitor
+ * native size on the fly, so a software renderer can paint a quarter-
+ * area buffer (16 bpp ⇒ ~900 KB at 912x492 instead of 3.5 MiB at
+ * 1824x984) while the display still receives the full native mode.
+ * No scaling when these are absent / 0.
  */
 
 #define DT_DRV_COMPAT brcm_bcm2835_fb
@@ -39,6 +54,7 @@
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/display.h>
+#include <zephyr/dt-bindings/display/panel.h>
 #include <zephyr/init.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -48,41 +64,53 @@
 
 LOG_MODULE_REGISTER(bcm2835_fb, CONFIG_DISPLAY_LOG_LEVEL);
 
-#define BPP 4U
-
-/* Pixel order 1 = RGB, matching Zephyr's PIXEL_FORMAT_ARGB_8888. */
+/* Pixel order 1 = RGB. With depth 32 this puts R in bits [23:16] of
+ * the ARGB8888 word; with depth 16 it puts R in the top 5 bits of the
+ * RGB565 halfword -- both matching the Zephyr PIXEL_FORMAT_* layouts.
+ */
 #define BCM2835_FB_PIXEL_ORDER_RGB 1U
 
 /* VC-bus alias mask: lower 30 bits = ARM physical address. */
 #define BCM2835_VC_BUS_MASK 0x3FFFFFFFU
 
 struct bcm2835_fb_config {
-	/* Requested resolution from DT. 0 / 0 means "ask VC for the
-	 * monitor's native size" -- normal case for HDMI.
+	/* Requested physical (scanout) resolution from DT. 0 / 0 means
+	 * "ask VC for the monitor's native size" -- normal case for HDMI.
 	 */
 	uint32_t req_width;
 	uint32_t req_height;
+	/* Optional render resolution: when non-zero, VC scales this
+	 * framebuffer up to phys on scanout (HVS hardware scaler).
+	 * Lets the CPU paint a smaller buffer while the monitor still
+	 * receives native-resolution video. 0 / 0 = render at phys.
+	 */
+	uint32_t render_width;
+	uint32_t render_height;
+	/* PANEL_PIXEL_FORMAT_* from dt-bindings/display/panel.h. */
+	uint32_t panel_format;
 };
 
 struct bcm2835_fb_data {
-	uint32_t *fb;
+	uint8_t *fb;
 	mm_reg_t fb_map;
 	uint32_t width;          /* actual; either DT-provided or auto-detected */
 	uint32_t height;
-	uint32_t pitch_px;       /* pitch / BPP, for u32 row stride */
+	uint32_t pitch;          /* bytes per row (incl. VC end-of-row padding) */
 	uint32_t fb_size;
+	uint8_t bpp;             /* bytes per pixel: 4 (ARGB8888) or 2 (RGB565) */
+	enum display_pixel_format format;
 };
 
 static int bcm2835_fb_set_pixel_format(const struct device *dev,
 				       const enum display_pixel_format format)
 {
-	ARG_UNUSED(dev);
-	switch (format) {
-	case PIXEL_FORMAT_ARGB_8888:
-		return 0;
-	default:
-		return -ENOTSUP;
-	}
+	const struct bcm2835_fb_data *data = dev->data;
+
+	/* Format is fixed at allocate-time (VC picks the buffer size and
+	 * pitch from the depth tag). Accept a no-op set to the configured
+	 * format, reject anything else.
+	 */
+	return (format == data->format) ? 0 : -ENOTSUP;
 }
 
 static int bcm2835_fb_set_orientation(const struct device *dev,
@@ -104,9 +132,9 @@ static void bcm2835_fb_get_capabilities(const struct device *dev,
 
 	caps->x_resolution = data->width;
 	caps->y_resolution = data->height;
-	caps->supported_pixel_formats = PIXEL_FORMAT_ARGB_8888;
+	caps->supported_pixel_formats = data->format;
 	caps->screen_info = 0;
-	caps->current_pixel_format = PIXEL_FORMAT_ARGB_8888;
+	caps->current_pixel_format = data->format;
 	caps->current_orientation = DISPLAY_ORIENTATION_NORMAL;
 }
 
@@ -115,24 +143,26 @@ static int bcm2835_fb_write(const struct device *dev, uint16_t x, uint16_t y,
 			    const void *buf)
 {
 	struct bcm2835_fb_data *data = dev->data;
-	uint32_t *dst;
-	const uint32_t *src;
+	const size_t row_bytes = (size_t)desc->width * data->bpp;
+	const size_t src_stride = (size_t)desc->pitch * data->bpp;
+	uint8_t *dst;
+	const uint8_t *src;
 
 	if ((x + desc->width > data->width) || (y + desc->height > data->height) ||
 	    desc->pitch < desc->width) {
 		return -EINVAL;
 	}
-	if (desc->buf_size < ((size_t)desc->pitch * desc->height * BPP)) {
+	if (desc->buf_size < src_stride * desc->height) {
 		return -EINVAL;
 	}
 
-	dst = data->fb + x + ((size_t)y * data->pitch_px);
-	src = (const uint32_t *)buf;
+	dst = data->fb + (size_t)x * data->bpp + (size_t)y * data->pitch;
+	src = buf;
 
 	for (uint32_t row = 0; row < desc->height; row++) {
-		memcpy(dst, src, (size_t)desc->width * BPP);
-		dst += data->pitch_px;
-		src += desc->pitch;
+		memcpy(dst, src, row_bytes);
+		dst += data->pitch;
+		src += src_stride;
 	}
 
 	return 0;
@@ -142,24 +172,26 @@ static int bcm2835_fb_read(const struct device *dev, uint16_t x, uint16_t y,
 			   const struct display_buffer_descriptor *desc, void *buf)
 {
 	struct bcm2835_fb_data *data = dev->data;
-	uint32_t *src;
-	uint32_t *dst;
+	const size_t row_bytes = (size_t)desc->width * data->bpp;
+	const size_t dst_stride = (size_t)desc->pitch * data->bpp;
+	const uint8_t *src;
+	uint8_t *dst;
 
 	if ((x + desc->width > data->width) || (y + desc->height > data->height) ||
 	    desc->pitch < desc->width) {
 		return -EINVAL;
 	}
-	if (desc->buf_size < ((size_t)desc->pitch * desc->height * BPP)) {
+	if (desc->buf_size < dst_stride * desc->height) {
 		return -EINVAL;
 	}
 
-	src = data->fb + x + ((size_t)y * data->pitch_px);
-	dst = (uint32_t *)buf;
+	src = data->fb + (size_t)x * data->bpp + (size_t)y * data->pitch;
+	dst = buf;
 
 	for (uint32_t row = 0; row < desc->height; row++) {
-		memcpy(dst, src, (size_t)desc->width * BPP);
-		src += data->pitch_px;
-		dst += desc->pitch;
+		memcpy(dst, src, row_bytes);
+		src += data->pitch;
+		dst += dst_stride;
 	}
 
 	return 0;
@@ -178,26 +210,45 @@ static int bcm2835_fb_init(const struct device *dev)
 	const struct bcm2835_fb_config *cfg = dev->config;
 	struct bcm2835_fb_data *data = dev->data;
 	const struct device *fw = DEVICE_DT_GET_ONE(raspberrypi_bcm283x_firmware);
-	uint32_t w = cfg->req_width;
-	uint32_t h = cfg->req_height;
-	uint32_t depth = 32U;
+	uint32_t phys_w = cfg->req_width;
+	uint32_t phys_h = cfg->req_height;
+	uint32_t virt_w = cfg->render_width;   /* 0 = match phys */
+	uint32_t virt_h = cfg->render_height;
+	uint32_t depth;
 	uint32_t order = BCM2835_FB_PIXEL_ORDER_RGB;
 	uintptr_t fb_bus = 0;
 	uintptr_t fb_phys;
 	uint32_t pitch = 0;
 	int err;
 
+	switch (cfg->panel_format) {
+	case PANEL_PIXEL_FORMAT_ARGB_8888:
+		data->format = PIXEL_FORMAT_ARGB_8888;
+		data->bpp = 4U;
+		depth = 32U;
+		break;
+	case PANEL_PIXEL_FORMAT_RGB_565:
+		data->format = PIXEL_FORMAT_RGB_565;
+		data->bpp = 2U;
+		depth = 16U;
+		break;
+	default:
+		LOG_ERR("unsupported pixel-format 0x%x (expected ARGB_8888 or RGB_565)",
+			cfg->panel_format);
+		return -ENOTSUP;
+	}
+
 	if (!device_is_ready(fw)) {
 		LOG_ERR("VC firmware not ready");
 		return -ENODEV;
 	}
 
-	/* DT didn't specify a resolution -- ask VC what the monitor
+	/* DT didn't specify a phys resolution -- ask VC what the monitor
 	 * negotiated at boot (via EDID). The same value is what
 	 * `vcgencmd get_lcd_info` reports under Linux. A single-tag GET
 	 * doesn't suffer the clamping that forces the FB-setup chain.
 	 */
-	if (w == 0 || h == 0) {
+	if (phys_w == 0 || phys_h == 0) {
 		uint32_t wh[2] = {0U, 0U};
 
 		err = rpi_fw_transfer(fw, RPI_FW_TAG_FB_GET_PHYSICAL_SIZE, wh, sizeof(wh));
@@ -205,17 +256,18 @@ static int bcm2835_fb_init(const struct device *dev)
 			LOG_ERR("fb get size failed: %d", err);
 			return err;
 		}
-		w = wh[0];
-		h = wh[1];
-		if (w == 0 || h == 0) {
+		phys_w = wh[0];
+		phys_h = wh[1];
+		if (phys_w == 0 || phys_h == 0) {
 			LOG_ERR("VC reports no display (HDMI not connected? "
 				"check config.txt: hdmi_force_hotplug=1)");
 			return -ENODEV;
 		}
 	}
 
-	err = rpi_fw_fb_setup(fw, &w, &h, &depth, &order,
-			      256U, &fb_bus, &data->fb_size, &pitch);
+	err = rpi_fw_fb_setup(fw, &phys_w, &phys_h, &virt_w, &virt_h,
+			      &depth, &order, 256U,
+			      &fb_bus, &data->fb_size, &pitch);
 	if (err < 0) {
 		LOG_ERR("fb setup failed: %d", err);
 		return err;
@@ -225,17 +277,25 @@ static int bcm2835_fb_init(const struct device *dev)
 			"check config.txt: hdmi_force_hotplug=1)");
 		return -EIO;
 	}
-	if (depth != 32U) {
-		LOG_ERR("VC refused 32 bpp (got %u)", depth);
+	if (depth != (uint32_t)data->bpp * 8U) {
+		LOG_ERR("VC refused %u bpp (got %u)", data->bpp * 8U, depth);
 		return -EIO;
 	}
-	if (pitch == 0U || (pitch % BPP) != 0U) {
+	if (pitch == 0U || (pitch % data->bpp) != 0U) {
 		LOG_ERR("bad pitch %u", pitch);
 		return -EIO;
 	}
-	data->width = w;
-	data->height = h;
-	data->pitch_px = pitch / BPP;
+	/* The framebuffer geometry we expose to the display API is the
+	 * VIRTUAL size -- that's the memory the caller writes into. VC
+	 * scales it up to phys for scanout.
+	 */
+	data->width = virt_w;
+	data->height = virt_h;
+	data->pitch = pitch;
+	if (virt_w != phys_w || virt_h != phys_h) {
+		LOG_INF("HVS scaling: %ux%u virt -> %ux%u phys",
+			virt_w, virt_h, phys_w, phys_h);
+	}
 
 	/* VC-bus to ARM-physical translation: VC firmware returns
 	 * addresses in the 0xC0000000-aliased range (L2-coherent view);
@@ -247,7 +307,7 @@ static int bcm2835_fb_init(const struct device *dev)
 	fb_phys = (uintptr_t)fb_bus & BCM2835_VC_BUS_MASK;
 
 	device_map(&data->fb_map, fb_phys, data->fb_size, K_MEM_CACHE_NONE);
-	data->fb = (uint32_t *)data->fb_map;
+	data->fb = (uint8_t *)data->fb_map;
 
 	return 0;
 }
@@ -257,6 +317,9 @@ static int bcm2835_fb_init(const struct device *dev)
 	static const struct bcm2835_fb_config bcm2835_fb_cfg_##inst = {            \
 		.req_width = DT_INST_PROP(inst, width),                            \
 		.req_height = DT_INST_PROP(inst, height),                          \
+		.render_width = DT_INST_PROP(inst, render_width),                  \
+		.render_height = DT_INST_PROP(inst, render_height),                \
+		.panel_format = DT_INST_PROP(inst, pixel_format),                  \
 	};                                                                         \
 	DEVICE_DT_INST_DEFINE(inst, bcm2835_fb_init, NULL,                         \
 			      &bcm2835_fb_data_##inst, &bcm2835_fb_cfg_##inst,     \
