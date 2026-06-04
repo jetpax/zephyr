@@ -85,13 +85,16 @@ LOG_MODULE_REGISTER(dma_bcm2835, CONFIG_DMA_LOG_LEVEL);
 #define CS_RESET  BIT(31) /* WO, self-clearing */
 
 /* TI (transfer information) bits -- also the CB.info field. */
-#define TI_INT_EN    BIT(0)
-#define TI_WAIT_RESP BIT(3)
-#define TI_DEST_INC  BIT(4)
-#define TI_DEST_DREQ BIT(6)
-#define TI_SRC_INC   BIT(8)
-#define TI_SRC_DREQ  BIT(10)
-#define TI_PERMAP(x) (((x) & 0x1fU) << 16)
+#define TI_INT_EN       BIT(0)
+#define TI_WAIT_RESP    BIT(3)
+#define TI_DEST_INC     BIT(4)
+#define TI_DEST_WIDTH   BIT(5)   /* 0 = 32 bit, 1 = 128 bit (normal chans only) */
+#define TI_DEST_DREQ    BIT(6)
+#define TI_SRC_INC      BIT(8)
+#define TI_SRC_WIDTH    BIT(9)   /* 0 = 32 bit, 1 = 128 bit (normal chans only) */
+#define TI_SRC_DREQ     BIT(10)
+#define TI_BURST_LEN(n) (((n) & 0xfU) << 12)
+#define TI_PERMAP(x)    (((x) & 0x1fU) << 16)
 
 /* Maximum CBs per channel. Bounds the cyclic ring depth; single-block
  * transfers use 1. Configurable so audio paths needing deeper rings
@@ -212,7 +215,7 @@ static inline bool chan_valid(const struct dma_bcm2835_config *cfg, uint32_t cha
 static uint32_t dma_bcm2835_build_ti(uint32_t direction, uint32_t dma_slot,
 				     uint8_t src_adj, uint8_t dst_adj)
 {
-	uint32_t ti = TI_INT_EN | TI_WAIT_RESP;
+	uint32_t ti = TI_INT_EN;
 
 	if (src_adj == DMA_ADDR_ADJ_INCREMENT) {
 		ti |= TI_SRC_INC;
@@ -222,13 +225,25 @@ static uint32_t dma_bcm2835_build_ti(uint32_t direction, uint32_t dma_slot,
 	}
 
 	switch (direction) {
+	case MEMORY_TO_MEMORY:
+		/* 128-bit wide reads + writes, 4-deep AXI bursts (64 bytes
+		 * per AXI burst). Burst-8 at 128-bit hits ~456 MB/s but
+		 * wedges the channel after ~150 framebuffer-bound transfers;
+		 * dropping to burst-4 cuts in-flight write depth in half --
+		 * still wide enough to leave the engine running well above
+		 * the 32-bit single-word ceiling, but small enough to stop
+		 * the AXI write queue from accumulating to the lockup point.
+		 */
+		ti |= TI_SRC_WIDTH | TI_DEST_WIDTH | TI_BURST_LEN(4);
+		break;
 	case MEMORY_TO_PERIPHERAL:
-		ti |= TI_DEST_DREQ | TI_PERMAP(dma_slot);
+		ti |= TI_WAIT_RESP | TI_DEST_DREQ | TI_PERMAP(dma_slot);
 		break;
 	case PERIPHERAL_TO_MEMORY:
-		ti |= TI_SRC_DREQ | TI_PERMAP(dma_slot);
+		ti |= TI_WAIT_RESP | TI_SRC_DREQ | TI_PERMAP(dma_slot);
 		break;
 	default:
+		ti |= TI_WAIT_RESP;
 		break;
 	}
 
@@ -419,13 +434,20 @@ static int dma_bcm2835_start(const struct device *dev, uint32_t channel)
 	}
 	sys_cache_data_flush_range(cbs, chan->n_blocks * sizeof(*cbs));
 
-	/* Clear stale status, point the channel at the first CB, then go. */
+	/* Clear stale status, point the channel at the first CB, then go.
+	 * PRIORITY=8 / PANIC_PRIORITY=8 in CS arbitrate the channel above
+	 * the default (0) on the AXI bus: with the VC HVS reading the
+	 * framebuffer at scanout rate (>200 MB/s), a priority-0 DMA
+	 * gets starved down to ~30 MB/s. Mid-range priority (8) shares
+	 * the bus fairly rather than dominating it.
+	 */
 	dma_wr(dev, chan_off(channel, DMA_CS), CS_INT | CS_END);
 	dma_wr(dev, chan_off(channel, DMA_CONBLK_AD),
 	       dma_bcm2835_bus_addr((uintptr_t)&cbs[0]));
 	chan->cur_cb = 0U;
 	chan->busy = true;
-	dma_wr(dev, chan_off(channel, DMA_CS), CS_ACTIVE);
+	dma_wr(dev, chan_off(channel, DMA_CS),
+	       CS_ACTIVE | (8U << 16) | (8U << 20));
 
 	return 0;
 }

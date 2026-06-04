@@ -54,6 +54,7 @@
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/display.h>
+#include <zephyr/drivers/dma.h>
 #include <zephyr/dt-bindings/display/panel.h>
 #include <zephyr/init.h>
 #include <zephyr/kernel.h>
@@ -93,12 +94,20 @@ struct bcm2835_fb_config {
 struct bcm2835_fb_data {
 	uint8_t *fb;
 	mm_reg_t fb_map;
+	uintptr_t fb_phys;       /* ARM physical address of framebuffer */
 	uint32_t width;          /* actual; either DT-provided or auto-detected */
 	uint32_t height;
 	uint32_t pitch;          /* bytes per row (incl. VC end-of-row padding) */
 	uint32_t fb_size;
 	uint8_t bpp;             /* bytes per pixel: 4 (ARGB8888) or 2 (RGB565) */
 	enum display_pixel_format format;
+	/* Optional DMA path. dma_dev != NULL && dma_channel valid =>
+	 * display_write() uses memory-to-memory DMA on the contiguous
+	 * full-frame fast path; CPU memcpy is the fallback.
+	 */
+	const struct device *dma_dev;
+	int dma_channel;
+	struct k_sem dma_done;
 };
 
 static int bcm2835_fb_set_pixel_format(const struct device *dev,
@@ -138,6 +147,57 @@ static void bcm2835_fb_get_capabilities(const struct device *dev,
 	caps->current_orientation = DISPLAY_ORIENTATION_NORMAL;
 }
 
+static void bcm2835_fb_dma_cb(const struct device *dma_dev, void *user_data,
+			      uint32_t channel, int status)
+{
+	ARG_UNUSED(dma_dev);
+	ARG_UNUSED(channel);
+	ARG_UNUSED(status);
+	struct bcm2835_fb_data *data = user_data;
+
+	k_sem_give(&data->dma_done);
+}
+
+/* Single contiguous DMA copy of the entire blit (source and destination
+ * strides match the framebuffer pitch, so all rows are back-to-back in
+ * both buffers). Blocks until the DMA completion IRQ fires.
+ */
+static int bcm2835_fb_dma_blit(const struct device *dev, uintptr_t src,
+			       uintptr_t dst, size_t bytes)
+{
+	struct bcm2835_fb_data *data = dev->data;
+	struct dma_block_config blk = {
+		.source_address = src,
+		.dest_address = dst,
+		.block_size = (uint32_t)bytes,
+		.source_addr_adj = DMA_ADDR_ADJ_INCREMENT,
+		.dest_addr_adj = DMA_ADDR_ADJ_INCREMENT,
+	};
+	struct dma_config dcfg = {
+		.channel_direction = MEMORY_TO_MEMORY,
+		.block_count = 1U,
+		.head_block = &blk,
+		.dma_callback = bcm2835_fb_dma_cb,
+		.user_data = data,
+	};
+	int err;
+
+	err = dma_config(data->dma_dev, (uint32_t)data->dma_channel, &dcfg);
+	if (err < 0) {
+		LOG_ERR("dma_config: %d", err);
+		return err;
+	}
+	err = dma_start(data->dma_dev, (uint32_t)data->dma_channel);
+	if (err < 0) {
+		LOG_ERR("dma_start: %d", err);
+		return err;
+	}
+	/* Generous timeout -- a 3.5 MiB blit at the lite-channel floor
+	 * (~50 MB/s) is ~70 ms; 250 ms covers worst-case contention.
+	 */
+	return k_sem_take(&data->dma_done, K_MSEC(250));
+}
+
 static int bcm2835_fb_write(const struct device *dev, uint16_t x, uint16_t y,
 			    const struct display_buffer_descriptor *desc,
 			    const void *buf)
@@ -154,6 +214,30 @@ static int bcm2835_fb_write(const struct device *dev, uint16_t x, uint16_t y,
 	}
 	if (desc->buf_size < src_stride * desc->height) {
 		return -EINVAL;
+	}
+
+	/* DMA fast path: full-frame contiguous blit (source and
+	 * destination strides match the fb pitch, source rows have no
+	 * padding gap). Single memory-to-memory DMA -- no per-row CPU
+	 * memcpy. Falls through to the loop below if any precondition
+	 * isn't met (partial region update, etc.) or DMA isn't wired.
+	 */
+	if (data->dma_dev != NULL && x == 0 && row_bytes == data->pitch &&
+	    src_stride == data->pitch) {
+		const uintptr_t src_arm = (uintptr_t)buf;
+		const uintptr_t dst_arm = data->fb_phys +
+					  (size_t)y * data->pitch;
+		const size_t bytes = (size_t)desc->height * data->pitch;
+		int err = bcm2835_fb_dma_blit(dev, src_arm, dst_arm, bytes);
+
+		if (err == 0) {
+			return 0;
+		}
+		LOG_WRN("DMA blit failed (%d), falling back to memcpy", err);
+		/* Fall through to the CPU path -- the framebuffer state
+		 * is undefined after a half-finished DMA, but a memcpy
+		 * over the same region restores it.
+		 */
 	}
 
 	dst = data->fb + (size_t)x * data->bpp + (size_t)y * data->pitch;
@@ -305,9 +389,44 @@ static int bcm2835_fb_init(const struct device *dev)
 	 * always safe.
 	 */
 	fb_phys = (uintptr_t)fb_bus & BCM2835_VC_BUS_MASK;
+	data->fb_phys = fb_phys;
 
-	device_map(&data->fb_map, fb_phys, data->fb_size, K_MEM_CACHE_NONE);
+	/* Map Normal Non-Cacheable, not Device-nGnRnE. ARM writes still
+	 * bypass the data caches (VC's scanout sees them immediately
+	 * from its own bus master), but Normal-NC lets the AXI master
+	 * keep multiple writes outstanding and combine bursts -- with
+	 * Device-nGnRnE every write must fully reach DRAM before the
+	 * next can be issued, capping a DMA-driven blit at ~30 MB/s
+	 * regardless of burst settings. Normal-NC unlocks the full
+	 * DRAM write throughput.
+	 */
+	device_map(&data->fb_map, fb_phys, data->fb_size, K_MEM_ARM_NORMAL_NC);
 	data->fb = (uint8_t *)data->fb_map;
+
+	k_sem_init(&data->dma_done, 0, 1);
+	data->dma_dev = NULL;
+	data->dma_channel = -1;
+
+	/* Optional fast path: if a BCM2835 DMA controller is present
+	 * and enabled in DT, request any free channel from its mask
+	 * for the backbuffer->framebuffer blit. Falls back to CPU
+	 * memcpy if no DMA / channel exhaustion / dma_request_channel
+	 * fails.
+	 */
+	const struct device *dma = DEVICE_DT_GET_ANY(brcm_bcm2835_dma);
+
+	if (dma != NULL && device_is_ready(dma)) {
+		int ch = dma_request_channel(dma, NULL);
+
+		if (ch >= 0) {
+			data->dma_dev = dma;
+			data->dma_channel = ch;
+			LOG_INF("DMA blit on %s channel %d", dma->name, ch);
+		} else {
+			LOG_WRN("DMA available but no free channel (%d) -- CPU blit",
+				ch);
+		}
+	}
 
 	return 0;
 }
