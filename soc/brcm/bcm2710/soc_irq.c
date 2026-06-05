@@ -39,13 +39,14 @@
  *   3. The shortcut bits in bank 0 enable/disable registers are
  *      ignored; the actual bank 1/2 enable register must be used.
  *
- * Single-core only for now (CORE_ID = 0). Phase 1b.2 / SMP work
+ * Single-core only for now (this_core() = 0). Phase 1b.2 / SMP work
  * will extend to per-core mailbox IPIs and route the GPU IRQ
  * dynamically.
  */
 
 #include <zephyr/arch/cpu.h>
 #include <zephyr/devicetree.h>
+#include <zephyr/irq.h>
 #include <zephyr/sys/sys_io.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/sys/util_macro.h>
@@ -115,8 +116,43 @@ static const uintptr_t armc_disable_reg[3] = {
 	ARMC_DISABLE_BASIC_IRQS, ARMC_DISABLE_IRQS_1, ARMC_DISABLE_IRQS_2,
 };
 
-/* TODO: revisit when SMP arrives. */
-#define CORE_ID  0
+/* Current physical core id from MPIDR (flat single-cluster A53). */
+static inline unsigned int this_core(void)
+{
+	uint64_t mpidr;
+
+	__asm__ volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
+	return (unsigned int)(mpidr & 0xffU);
+}
+
+/* ----- SMP scheduler IPI over the BCM2836 per-core mailboxes ----- */
+#define L1_MBOX_SET(c)          (L1_BASE + 0x80 + (c) * 0x10)  /* mbox0 write-set */
+#define L1_MBOX_RDCLR(c)        (L1_BASE + 0xc0 + (c) * 0x10)  /* mbox0 read/clear */
+#define IPI_IRQ                 4  /* BCM2836_LOCAL_IRQ_MAILBOX0 -> scheduler IPI */
+
+extern void sched_ipi_handler(const void *unused);
+
+static void mbox0_ipi_isr(const void *arg)
+{
+	ARG_UNUSED(arg);
+	/* Ack: clear this core's mailbox 0 (write-1-to-clear), then dispatch. */
+	sys_write32(0xffffffffU, L1_MBOX_RDCLR(this_core()));
+	sched_ipi_handler(NULL);
+}
+
+/* Raise the scheduler IPI on the target core by setting its mailbox 0. */
+void soc_sched_ipi(uint64_t target_mpidr)
+{
+	unsigned int core = (unsigned int)(target_mpidr & 0xffU);
+
+	sys_write32(BIT(0), L1_MBOX_SET(core));
+}
+
+/* Per-core: enable this core's mailbox-0 IPI (handler wired in z_soc_irq_init). */
+void soc_per_core_init_hook(void)
+{
+	irq_enable(IPI_IRQ);
+}
 
 void z_soc_irq_init(void)
 {
@@ -125,8 +161,8 @@ void z_soc_irq_init(void)
 	 * routing register defaults to core 0 after reset; force it so
 	 * the value is deterministic across firmware variants.
 	 */
-	sys_write32(0, L1_TIMER_INT_CTRL(CORE_ID));
-	sys_write32(0, L1_MBOX_INT_CTRL(CORE_ID));
+	sys_write32(0, L1_TIMER_INT_CTRL(this_core()));
+	sys_write32(0, L1_MBOX_INT_CTRL(this_core()));
 	sys_write32(0, L1_GPU_INT_ROUTING);
 
 	/*
@@ -139,23 +175,26 @@ void z_soc_irq_init(void)
 
 	/* Cancel any FIQ left enabled by the boot firmware. */
 	sys_write32(0, ARMC_FIQ_CONTROL);
+
+	/* Register the scheduler-IPI handler (each core's mailbox 0). */
+	IRQ_CONNECT(IPI_IRQ, 0, mbox0_ipi_isr, NULL, 0);
 }
 
 void z_soc_irq_enable(unsigned int irq)
 {
 	if (IRQ_IS_L1(irq)) {
 		if (irq <= 3) {
-			sys_write32(sys_read32(L1_TIMER_INT_CTRL(CORE_ID)) | BIT(irq),
-				    L1_TIMER_INT_CTRL(CORE_ID));
+			sys_write32(sys_read32(L1_TIMER_INT_CTRL(this_core())) | BIT(irq),
+				    L1_TIMER_INT_CTRL(this_core()));
 		} else if (irq <= 7) {
-			sys_write32(sys_read32(L1_MBOX_INT_CTRL(CORE_ID)) | BIT(irq - 4),
-				    L1_MBOX_INT_CTRL(CORE_ID));
+			sys_write32(sys_read32(L1_MBOX_INT_CTRL(this_core())) | BIT(irq - 4),
+				    L1_MBOX_INT_CTRL(this_core()));
 		} else if (irq == L1_SRC_PMU_BIT) {
-			sys_write32(BIT(CORE_ID), L1_PMU_ROUTING_SET);
+			sys_write32(BIT(this_core()), L1_PMU_ROUTING_SET);
 		}
 		/*
 		 * IRQ 8 (GPU cascade) is implicit -- the L1 routing
-		 * register already steers it to CORE_ID; no per-IRQ
+		 * register already steers it to this_core(); no per-IRQ
 		 * enable bit exists.
 		 */
 		return;
@@ -170,13 +209,13 @@ void z_soc_irq_disable(unsigned int irq)
 {
 	if (IRQ_IS_L1(irq)) {
 		if (irq <= 3) {
-			sys_write32(sys_read32(L1_TIMER_INT_CTRL(CORE_ID)) & ~BIT(irq),
-				    L1_TIMER_INT_CTRL(CORE_ID));
+			sys_write32(sys_read32(L1_TIMER_INT_CTRL(this_core())) & ~BIT(irq),
+				    L1_TIMER_INT_CTRL(this_core()));
 		} else if (irq <= 7) {
-			sys_write32(sys_read32(L1_MBOX_INT_CTRL(CORE_ID)) & ~BIT(irq - 4),
-				    L1_MBOX_INT_CTRL(CORE_ID));
+			sys_write32(sys_read32(L1_MBOX_INT_CTRL(this_core())) & ~BIT(irq - 4),
+				    L1_MBOX_INT_CTRL(this_core()));
 		} else if (irq == L1_SRC_PMU_BIT) {
-			sys_write32(BIT(CORE_ID), L1_PMU_ROUTING_CLR);
+			sys_write32(BIT(this_core()), L1_PMU_ROUTING_CLR);
 		}
 		return;
 	}
@@ -190,10 +229,10 @@ int z_soc_irq_is_enabled(unsigned int irq)
 {
 	if (IRQ_IS_L1(irq)) {
 		if (irq <= 3) {
-			return !!(sys_read32(L1_TIMER_INT_CTRL(CORE_ID)) & BIT(irq));
+			return !!(sys_read32(L1_TIMER_INT_CTRL(this_core())) & BIT(irq));
 		}
 		if (irq <= 7) {
-			return !!(sys_read32(L1_MBOX_INT_CTRL(CORE_ID)) & BIT(irq - 4));
+			return !!(sys_read32(L1_MBOX_INT_CTRL(this_core())) & BIT(irq - 4));
 		}
 		if (irq == L1_SRC_GPU_BIT) {
 			/* No mask for the cascade -- always live. */
@@ -225,7 +264,7 @@ void z_soc_irq_priority_set(unsigned int irq, unsigned int prio,
  */
 static unsigned int decode_active(void)
 {
-	uint32_t l1 = sys_read32(L1_IRQ_SOURCE(CORE_ID));
+	uint32_t l1 = sys_read32(L1_IRQ_SOURCE(this_core()));
 
 	if (l1 == 0) {
 		return CONFIG_NUM_IRQS;
