@@ -488,6 +488,17 @@ static int bcm2835_fb_init(const struct device *dev)
 		LOG_INF("HVS scaling: %ux%u virt -> %ux%u phys",
 			virt_w, virt_h, phys_w, phys_h);
 	}
+	/* VC may pad the per-row pitch beyond virt_w * bpp for SDRAM
+	 * burst alignment (typically 32 or 64 bytes). When pitch >
+	 * row_bytes, the contiguous-DMA fast path can't be used: a
+	 * source row of W*bpp bytes can't be 1:1-copied into a destination
+	 * row of `pitch` bytes without per-row scatter. Surfacing the
+	 * value at init time so the app can pick a width that comes back
+	 * unpadded (try multiples that make W*bpp a multiple of 64).
+	 */
+	LOG_INF("pitch %u bytes (W*bpp = %u; %s)", pitch,
+		(unsigned)(virt_w * data->bpp),
+		(pitch == virt_w * data->bpp) ? "no padding" : "PADDED");
 
 	/* VC-bus to ARM-physical translation: VC firmware returns
 	 * addresses in the 0xC0000000-aliased range (L2-coherent view);
