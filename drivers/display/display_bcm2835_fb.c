@@ -54,7 +54,9 @@
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/display.h>
+#include <zephyr/drivers/display/bcm2835_fb.h>
 #include <zephyr/drivers/dma.h>
+#include <zephyr/drivers/dma/dma_bcm2835.h>
 #include <zephyr/dt-bindings/display/panel.h>
 #include <zephyr/init.h>
 #include <zephyr/kernel.h>
@@ -108,6 +110,14 @@ struct bcm2835_fb_data {
 	const struct device *dma_dev;
 	int dma_channel;
 	struct k_sem dma_done;
+	/* True between an async kick-off and the matching wait. Set by
+	 * bcm2835_fb_write_async() (and the internal kick-off path
+	 * shared with the sync write); cleared by the wait helper.
+	 * Any new operation (sync or async) must observe completion
+	 * first so the engine isn't asked to start while it's still
+	 * walking the previous CB chain.
+	 */
+	bool dma_in_flight;
 };
 
 static int bcm2835_fb_set_pixel_format(const struct device *dev,
@@ -158,11 +168,58 @@ static void bcm2835_fb_dma_cb(const struct device *dma_dev, void *user_data,
 	k_sem_give(&data->dma_done);
 }
 
-/* Single contiguous DMA copy of the entire blit (source and destination
- * strides match the framebuffer pitch, so all rows are back-to-back in
- * both buffers). Blocks until the DMA completion IRQ fires.
+/* Wait for the most recent kick-off to complete, dump channel state and
+ * reset on timeout. No-op when no transfer is outstanding. Used by
+ * both the sync (wait-after-kick) and async (wait-before-next-kick)
+ * paths.
+ *
+ * Generous 250 ms timeout: a 3.5 MiB blit at the lite-channel floor
+ * (~50 MB/s) is ~70 ms; 250 ms covers worst-case contention.
  */
-static int bcm2835_fb_dma_blit(const struct device *dev, uintptr_t src,
+static int bcm2835_fb_dma_wait(struct bcm2835_fb_data *data,
+			       k_timeout_t timeout)
+{
+	if (!data->dma_in_flight) {
+		return 0;
+	}
+
+	int err = k_sem_take(&data->dma_done, timeout);
+
+	if (err == 0) {
+		data->dma_in_flight = false;
+		return 0;
+	}
+
+	if (err == -EAGAIN) {
+		/* Engine never raised IRQ within the timeout: snapshot the
+		 * channel state so the wedge has evidence rather than just a
+		 * silent "fell back to memcpy". CS bit 8 = ERROR; DEBUG bits
+		 * 0..2 are READ_LAST_NOT_SET / FIFO / READ sticky errors;
+		 * DEBUG[8:4] is the outstanding-write count. TXFR_LEN > 0 with
+		 * CS_ACTIVE still set means it stalled mid-block.
+		 */
+		struct dma_bcm2835_chan_state s;
+
+		if (dma_bcm2835_get_chan_state(data->dma_dev,
+					       (uint32_t)data->dma_channel,
+					       &s) == 0) {
+			LOG_ERR("DMA wedge ch%d: CS=%08x CONBLK=%08x TI=%08x "
+				"SRC=%08x DST=%08x LEN=%u DEBUG=%08x",
+				data->dma_channel, s.cs, s.conblk_ad, s.ti,
+				s.source_ad, s.dest_ad, s.txfr_len, s.debug);
+		}
+		dma_stop(data->dma_dev, (uint32_t)data->dma_channel);
+		data->dma_in_flight = false;
+	}
+	return err;
+}
+
+/* Kick off a single contiguous DMA copy and return without waiting.
+ * Source and destination strides match the framebuffer pitch, so all
+ * rows are back-to-back in both buffers. Any previous in-flight
+ * transfer is waited on before re-arming the channel.
+ */
+static int bcm2835_fb_dma_kick(const struct device *dev, uintptr_t src,
 			       uintptr_t dst, size_t bytes)
 {
 	struct bcm2835_fb_data *data = dev->data;
@@ -180,7 +237,11 @@ static int bcm2835_fb_dma_blit(const struct device *dev, uintptr_t src,
 		.dma_callback = bcm2835_fb_dma_cb,
 		.user_data = data,
 	};
-	int err;
+	int err = bcm2835_fb_dma_wait(data, K_MSEC(250));
+
+	if (err < 0) {
+		return err;
+	}
 
 	err = dma_config(data->dma_dev, (uint32_t)data->dma_channel, &dcfg);
 	if (err < 0) {
@@ -192,10 +253,21 @@ static int bcm2835_fb_dma_blit(const struct device *dev, uintptr_t src,
 		LOG_ERR("dma_start: %d", err);
 		return err;
 	}
-	/* Generous timeout -- a 3.5 MiB blit at the lite-channel floor
-	 * (~50 MB/s) is ~70 ms; 250 ms covers worst-case contention.
-	 */
-	return k_sem_take(&data->dma_done, K_MSEC(250));
+	data->dma_in_flight = true;
+	return 0;
+}
+
+/* Synchronous full-frame DMA blit: kick + wait. */
+static int bcm2835_fb_dma_blit(const struct device *dev, uintptr_t src,
+			       uintptr_t dst, size_t bytes)
+{
+	struct bcm2835_fb_data *data = dev->data;
+	int err = bcm2835_fb_dma_kick(dev, src, dst, bytes);
+
+	if (err < 0) {
+		return err;
+	}
+	return bcm2835_fb_dma_wait(data, K_MSEC(250));
 }
 
 static int bcm2835_fb_write(const struct device *dev, uint16_t x, uint16_t y,
@@ -279,6 +351,42 @@ static int bcm2835_fb_read(const struct device *dev, uint16_t x, uint16_t y,
 	}
 
 	return 0;
+}
+
+int bcm2835_fb_write_async(const struct device *dev,
+			   const struct display_buffer_descriptor *desc,
+			   const void *buf)
+{
+	struct bcm2835_fb_data *data = dev->data;
+	const size_t row_bytes = (size_t)desc->width * data->bpp;
+	const size_t src_stride = (size_t)desc->pitch * data->bpp;
+
+	if (data->dma_dev == NULL) {
+		return -EINVAL;
+	}
+	/* Full-frame contiguous fast path only -- partial rectangles
+	 * cannot be a single DMA descriptor without per-row scatter.
+	 */
+	if (desc->width != data->width || desc->height != data->height ||
+	    row_bytes != data->pitch || src_stride != data->pitch) {
+		return -EINVAL;
+	}
+	if (desc->buf_size < src_stride * desc->height) {
+		return -EINVAL;
+	}
+
+	const uintptr_t src_arm = (uintptr_t)buf;
+	const uintptr_t dst_arm = data->fb_phys;
+	const size_t bytes = (size_t)desc->height * data->pitch;
+
+	return bcm2835_fb_dma_kick(dev, src_arm, dst_arm, bytes);
+}
+
+int bcm2835_fb_wait(const struct device *dev, k_timeout_t timeout)
+{
+	struct bcm2835_fb_data *data = dev->data;
+
+	return bcm2835_fb_dma_wait(data, timeout);
 }
 
 static DEVICE_API(display, bcm2835_fb_api) = {
@@ -406,6 +514,7 @@ static int bcm2835_fb_init(const struct device *dev)
 	k_sem_init(&data->dma_done, 0, 1);
 	data->dma_dev = NULL;
 	data->dma_channel = -1;
+	data->dma_in_flight = false;
 
 	/* Optional fast path: if a BCM2835 DMA controller is present
 	 * and enabled in DT, request any free channel from its mask

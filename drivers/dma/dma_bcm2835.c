@@ -57,6 +57,7 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/dma.h>
 #include <zephyr/cache.h>
+#include <zephyr/drivers/dma/dma_bcm2835.h>
 #include <zephyr/irq.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/sys_io.h>
@@ -647,6 +648,26 @@ static int dma_bcm2835_init(const struct device *dev)
 	}
 
 	dcfg->irq_config();
+
+	return 0;
+}
+
+int dma_bcm2835_get_chan_state(const struct device *dev, uint32_t channel,
+			       struct dma_bcm2835_chan_state *out)
+{
+	const struct dma_bcm2835_config *dcfg = dev->config;
+
+	if (out == NULL || !chan_valid(dcfg, channel)) {
+		return -EINVAL;
+	}
+
+	out->cs        = dma_rd(dev, chan_off(channel, DMA_CS));
+	out->conblk_ad = dma_rd(dev, chan_off(channel, DMA_CONBLK_AD));
+	out->ti        = dma_rd(dev, chan_off(channel, DMA_TI));
+	out->source_ad = dma_rd(dev, chan_off(channel, DMA_SOURCE_AD));
+	out->dest_ad   = dma_rd(dev, chan_off(channel, DMA_DEST_AD));
+	out->txfr_len  = dma_rd(dev, chan_off(channel, DMA_TXFR_LEN));
+	out->debug     = dma_rd(dev, chan_off(channel, DMA_DEBUG));
 
 	return 0;
 }
