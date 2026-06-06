@@ -186,13 +186,88 @@ static int sdhost_wait_cmd_done(const struct device *dev, int timeout_ms)
 {
 	uintptr_t base = DEVICE_MMIO_GET(dev);
 	int64_t deadline = k_uptime_get() + timeout_ms;
+	uint32_t iters = 0;
 
 	while (sys_read32(base + SDCMD) & SDCMD_NEW_FLAG) {
 		if (k_uptime_get() > deadline) {
+			LOG_ERR("%s wait_cmd_done timeout: iters=%u "
+				"sdcmd=0x%08x edm=0x%08x sdhsts=0x%08x",
+				dev->name, iters,
+				sys_read32(base + SDCMD),
+				sys_read32(base + SDEDM),
+				sys_read32(base + SDHSTS));
+			return -ETIMEDOUT;
+		}
+		k_busy_wait(10);
+		iters++;
+	}
+	return 0;
+}
+
+/* ===== CMD12 STOP_TRANSMISSION (inline) ============================
+ * Issued by the driver itself after the data phase of a multi-block
+ * read/write. The SD subsystem deliberately leaves CMD12 to the host
+ * driver (sd_ops.c::card_read comment). Without it, the controller's
+ * FSM stays in READDATA/WRITEDATA and the next command's NEW_FLAG
+ * poll times out -- which is exactly the symptom multi-block reads
+ * hit before this was added.
+ *
+ * CMD12's protocol response type is R1b (card holds DAT0 low while
+ * the stop completes). We treat it as R1 here: SDCMD_BUSYWAIT would
+ * spin the controller on DAT0 with no IRQ-driven timeout, which can
+ * hang. Instead we poll SDEDM until the FSM returns to IDENT, which
+ * is the controller's signal that it has released the data path.
+ */
+static int sdhost_stop_transmission(const struct device *dev, int timeout_ms)
+{
+	uintptr_t base = DEVICE_MMIO_GET(dev);
+	int64_t deadline;
+	uint32_t edm;
+	int ret;
+
+	sys_write32(0, base + SDARG);
+	sys_write32(SD_STOP_TRANSMISSION | SDCMD_NEW_FLAG, base + SDCMD);
+
+	ret = sdhost_wait_cmd_done(dev, timeout_ms);
+	if (ret != 0) {
+		LOG_ERR("%s CMD12 NEW_FLAG never cleared", dev->name);
+		return ret;
+	}
+
+	/* Drain the response register; we don't surface card state to the
+	 * SD subsystem since CMD12 here is invisible to the caller. */
+	(void)sys_read32(base + SDRSP0);
+
+	deadline = k_uptime_get() + timeout_ms;
+	while (true) {
+		uint32_t fsm;
+
+		edm = sys_read32(base + SDEDM);
+		fsm = edm & SDEDM_FSM_MASK;
+		/* IDENT or DATAMODE both mean "controller has left the
+		 * data path and can accept the next command" -- successful
+		 * single-block reads also exit with FSM=DATAMODE. R1b's
+		 * card-side DAT0 busy can keep the FSM in DATAMODE for
+		 * longer than IDENT alone would tolerate. The error cases
+		 * we still want to catch are the real data states
+		 * (READDATA / WRITEDATA / READWAIT / READCRC / etc.) --
+		 * those mean CMD12 didn't actually stop the transfer.
+		 */
+		if (fsm == SDEDM_FSM_IDENTMODE || fsm == SDEDM_FSM_DATAMODE) {
+			break;
+		}
+		if (k_uptime_get() > deadline) {
+			LOG_ERR("%s CMD12 FSM stuck: edm=0x%08x", dev->name, edm);
 			return -ETIMEDOUT;
 		}
 		k_busy_wait(10);
 	}
+
+	/* Belt and braces: zero SDHBLC so the next data CMD starts from a
+	 * clean block counter. Mirrors Linux's bcm2835-sdhost. */
+	sys_write32(0, base + SDHBLC);
+
+	LOG_DBG("%s CMD12 ok edm=0x%08x", dev->name, edm);
 	return 0;
 }
 
@@ -473,8 +548,12 @@ static int sdhc_bcm2835_sdhost_request(const struct device *dev,
 	 */
 	ret = sdhost_wait_cmd_done(dev, cmd_timeout_ms);
 	if (ret != 0) {
-		LOG_ERR("%s CMD%u: previous command never completed",
-			dev->name, cmd->opcode);
+		LOG_ERR("%s CMD%u: previous command never completed "
+			"sdcmd=0x%08x edm=0x%08x sdhsts=0x%08x",
+			dev->name, cmd->opcode,
+			sys_read32(base + SDCMD),
+			sys_read32(base + SDEDM),
+			sys_read32(base + SDHSTS));
 		return ret;
 	}
 
@@ -581,6 +660,21 @@ static int sdhc_bcm2835_sdhost_request(const struct device *dev,
 		ret = sdhost_pio_xfer(dev, data, data_is_read);
 		if (ret != 0) {
 			return ret;
+		}
+
+		/* Multi-block CMD18/CMD25 don't auto-stop -- the card keeps
+		 * streaming (or expecting writes) until host issues CMD12.
+		 * Without this, the controller's FSM stays in READDATA /
+		 * WRITEDATA and the next command's NEW_FLAG poll times out.
+		 * SD subsystem leaves CMD12 to the host driver (sd_ops.c
+		 * card_read() comment).
+		 */
+		if (cmd->opcode == SD_READ_MULTIPLE_BLOCK ||
+		    cmd->opcode == SD_WRITE_MULTIPLE_BLOCK) {
+			ret = sdhost_stop_transmission(dev, cmd_timeout_ms);
+			if (ret != 0) {
+				return ret;
+			}
 		}
 	}
 
