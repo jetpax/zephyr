@@ -153,6 +153,7 @@ FUNC_NORETURN void arch_secondary_cpu_init(void)
 #endif
 
 #ifdef CONFIG_SMP
+#if !defined(CONFIG_ARM_CUSTOM_INTERRUPT_CONTROLLER)
 	arm_gic_secondary_init();
 
 	irq_enable(SGI_SCHED_IPI);
@@ -162,6 +163,13 @@ FUNC_NORETURN void arch_secondary_cpu_init(void)
 #ifdef CONFIG_FPU_SHARING
 	irq_enable(SGI_FPU_IPI);
 #endif
+#else
+	/*
+	 * No GIC (e.g. BCM2710/BCM2836 ARM-local intc). Per-core IPI and
+	 * timer setup is done by the SoC in soc_per_core_init_hook() below;
+	 * the scheduler IPI is raised via the SoC mailbox path in send_ipi().
+	 */
+#endif /* !CONFIG_ARM_CUSTOM_INTERRUPT_CONTROLLER */
 #endif
 
 	soc_per_core_init_hook();
@@ -186,6 +194,18 @@ FUNC_NORETURN void arch_secondary_cpu_init(void)
 
 #ifdef CONFIG_SMP
 
+#if defined(CONFIG_ARM_CUSTOM_INTERRUPT_CONTROLLER)
+/*
+ * Raise a scheduler IPI on the target core. The SoC provides the real
+ * implementation (e.g. the BCM2836 per-core mailboxes); this weak no-op
+ * keeps non-mailbox custom-intc platforms linking.
+ */
+__weak void soc_sched_ipi(uint64_t target_mpidr)
+{
+	ARG_UNUSED(target_mpidr);
+}
+#endif
+
 static void send_ipi(unsigned int ipi, uint32_t cpu_bitmap)
 {
 	uint64_t mpidr = MPIDR_TO_CORE(GET_MPIDR());
@@ -208,7 +228,13 @@ static void send_ipi(unsigned int ipi, uint32_t cpu_bitmap)
 		}
 
 		aff0 = MPIDR_AFFLVL(target_mpidr, 0);
+#if !defined(CONFIG_ARM_CUSTOM_INTERRUPT_CONTROLLER)
 		gic_raise_sgi(ipi, target_mpidr, 1 << aff0);
+#else
+		ARG_UNUSED(ipi);
+		ARG_UNUSED(aff0);
+		soc_sched_ipi(target_mpidr);
+#endif
 	}
 }
 
@@ -301,6 +327,7 @@ int arch_smp_init(void)
 	 * SGI0 is use for sched ipi, this might be changed to use Kconfig
 	 * option
 	 */
+#if !defined(CONFIG_ARM_CUSTOM_INTERRUPT_CONTROLLER)
 	IRQ_CONNECT(SGI_SCHED_IPI, IRQ_DEFAULT_PRIORITY, sched_ipi_handler, NULL, 0);
 	irq_enable(SGI_SCHED_IPI);
 
@@ -313,6 +340,9 @@ int arch_smp_init(void)
 	IRQ_CONNECT(SGI_FPU_IPI, IRQ_DEFAULT_PRIORITY, flush_fpu_ipi_handler, NULL, 0);
 	irq_enable(SGI_FPU_IPI);
 #endif
+#else
+	/* No GIC: the SoC wires its mailbox IPI to sched_ipi_handler (M3). */
+#endif /* !CONFIG_ARM_CUSTOM_INTERRUPT_CONTROLLER */
 
 	return 0;
 }
