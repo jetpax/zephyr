@@ -137,8 +137,24 @@ extern void sched_ipi_handler(const void *unused);
 static void mbox0_ipi_isr(const void *arg)
 {
 	ARG_UNUSED(arg);
-	/* Ack: clear this core's mailbox 0 (write-1-to-clear), then dispatch. */
-	sys_write32(0xffffffffU, L1_MBOX_RDCLR(this_core()));
+	/*
+	 * Read the set mailbox bits, then write the same value back to
+	 * ack ONLY those bits. A concurrent raise from another core that
+	 * lands between this read and the write is preserved: its bit
+	 * stays set, the mailbox source stays asserted at the L1 intc,
+	 * and the level-triggered IRQ refires once z_soc_irq_eoi()
+	 * re-enables MBOX_INT_CTRL. Blanket-clearing 0xffffffff drops
+	 * any such mid-isr raise on the floor.
+	 *
+	 * Same pattern as Linux's drivers/irqchip/irq-bcm2836.c:
+	 *   bcm2836_arm_irqchip_handle_ipi() reads MAILBOX0_CLR + ffs(),
+	 *   bcm2836_arm_irqchip_ipi_ack()    writes BIT(d->hwirq) back.
+	 */
+	uint32_t mbox = sys_read32(L1_MBOX_RDCLR(this_core()));
+
+	if (mbox != 0U) {
+		sys_write32(mbox, L1_MBOX_RDCLR(this_core()));
+	}
 	sched_ipi_handler(NULL);
 }
 
