@@ -166,6 +166,24 @@ void soc_sched_ipi(uint64_t target_mpidr)
 	sys_write32(BIT(0), L1_MBOX_SET(core));
 }
 
+/*
+ * Strong override of the __weak arch_spin_relax in kernel/idle.c.
+ * The default asserts !arch_cpu_irqs_are_enabled(), which is the right
+ * invariant for the in-tree callers (k_spin_lock, z_smp_global_lock,
+ * thread_halt_spin, z_sched_switch_spin all relax with IRQs masked).
+ * The arm64 GIC build supplies a non-asserting variant under
+ * CONFIG_FPU_SHARING (arch/arm64/core/smp.c) to drain the FPU IPI
+ * during a contended spin; this prototype runs FPU_SHARING off, so
+ * the __weak default applies and its assertion fires on any path
+ * that relaxes outside an irq lock. Provide a plain relax that
+ * mirrors the FPU_SHARING shape but without the GIC-specific
+ * bookkeeping (which doesn't exist here).
+ */
+void arch_spin_relax(void)
+{
+	arch_nop();
+}
+
 /* Per-core: enable this core's mailbox-0 IPI (handler wired in z_soc_irq_init). */
 void soc_per_core_init_hook(void)
 {
