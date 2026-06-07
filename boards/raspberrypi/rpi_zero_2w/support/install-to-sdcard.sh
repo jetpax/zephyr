@@ -72,6 +72,14 @@ core_freq=250
 kernel_address=0x200000
 kernel=zephyr.bin
 
+# Pin the A53 at its max rated frequency. Zephyr has no cpufreq governor,
+# so without these two the VC firmware leaves the A53 at arm_freq_min
+# (~600 MHz on this SoC) and any CPU-bound workload looks ~40% slower
+# than the silicon's actual capability. Remove if you need thermal
+# headroom in a chassis.
+arm_freq=1000
+force_turbo=1
+
 # Bring HDMI up at boot even if no monitor is attached when the Pi is
 # powered on. Without this, hot-plugging a cable later leaves the
 # pipeline cold and the Zephyr FB driver's ALLOCATE_BUFFER returns
