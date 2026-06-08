@@ -58,6 +58,20 @@ LOG_MODULE_REGISTER(bcm2835_v3d, CONFIG_BCM2835_V3D_LOG_LEVEL);
 #define V3D_IDENT0   0x0000  /* V3D identity register 0 -- "V3D\x02" */
 #define V3D_IDENT1   0x0004
 #define V3D_IDENT2   0x0008
+
+/* IDENT1 bit fields (Linux drivers/gpu/drm/vc4/vc4_regs.h). NSLC * QUPS
+ * is the count of physical QPUs in this silicon. BCM2835/2710/2837 all
+ * report 3 * 4 = 12; the architectural maximum the IP supports is
+ * 4 * 4 = 16.
+ */
+#define V3D_IDENT1_VPM_SIZE_SHIFT 28
+#define V3D_IDENT1_NSEM_SHIFT     16
+#define V3D_IDENT1_TUPS_SHIFT     12
+#define V3D_IDENT1_QUPS_SHIFT     8
+#define V3D_IDENT1_NSLC_SHIFT     4
+#define V3D_IDENT1_REV_SHIFT      0
+#define V3D_IDENT1_NIB(v, sh)     (((v) >> (sh)) & 0xfu)
+#define V3D_IDENT1_NSEM(v)        (((v) >> V3D_IDENT1_NSEM_SHIFT) & 0xffu)
 #define V3D_L2CACTL  0x0020  /* L2 cache control */
 #define V3D_SLCACTL  0x0024  /* Slice cache control */
 #define V3D_SRQPC    0x0430  /* SRQ program counter (write = kick) */
@@ -1046,8 +1060,20 @@ static int bcm2835_v3d_init(const struct device *dev)
 		return -EIO;
 	}
 
+	uint32_t ident1 = v3d_read(dev, V3D_IDENT1);
+	uint32_t ident2 = v3d_read(dev, V3D_IDENT2);
+	uint32_t nslc   = V3D_IDENT1_NIB(ident1, V3D_IDENT1_NSLC_SHIFT);
+	uint32_t qups   = V3D_IDENT1_NIB(ident1, V3D_IDENT1_QUPS_SHIFT);
+	uint32_t tups   = V3D_IDENT1_NIB(ident1, V3D_IDENT1_TUPS_SHIFT);
+	uint32_t rev    = V3D_IDENT1_NIB(ident1, V3D_IDENT1_REV_SHIFT);
+	uint32_t nsem   = V3D_IDENT1_NSEM(ident1);
+	uint32_t vpmsz  = V3D_IDENT1_NIB(ident1, V3D_IDENT1_VPM_SIZE_SHIFT);
+
 	LOG_INF("V3D up: IDENT0=0x%08x IDENT1=0x%08x IDENT2=0x%08x",
-		ident, v3d_read(dev, V3D_IDENT1), v3d_read(dev, V3D_IDENT2));
+		ident, ident1, ident2);
+	LOG_INF("V3D config: rev=%u, %u slices x %u QPUs/slice = %u physical QPUs, "
+		"%u TUs/slice, %u semaphores, VPM=%u KB; SRQ depth=16",
+		rev, nslc, qups, nslc * qups, tups, nsem, vpmsz);
 
 	return 0;
 }

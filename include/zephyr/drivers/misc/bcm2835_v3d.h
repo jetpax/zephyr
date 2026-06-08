@@ -54,8 +54,18 @@
 extern "C" {
 #endif
 
-/** Maximum QPUs we'll ever target (the BCM2835/2710 has 12). */
-#define BCM2835_V3D_MAX_QPUS 12
+/** Maximum QPUs the driver will accept in @ref bcm2835_v3d_kernel_init.
+ *
+ * Bounded by the V3D SRQ (scheduler-request queue) depth, which is 16
+ * outstanding PC writes -- the SRQCS done-counter field is 8 bits and
+ * the hardware exposes a 16-slot queue. The number of *physical* QPUs
+ * is silicon-dependent (read NSLC * QUPS from V3D_IDENT1 to get the
+ * actual count; e.g. BCM2710 has 3 slices x 4 QPUs = 12). Submitting
+ * more threads than physical QPUs is valid software oversubscription
+ * -- the SRQ scheduler queues the extras and dispatches them as the
+ * first wave finishes.
+ */
+#define BCM2835_V3D_MAX_QPUS 16
 
 /**
  * @brief Handle for a single QPU kernel + its per-QPU uniforms.
