@@ -376,5 +376,28 @@
 			dma-names = "rx-tx";
 			status = "disabled";
 		};
+
+		/*
+		 * VideoCore IV 3D (V3D) hardware -- the 12-QPU SIMD compute
+		 * engine that backs the BCM2710's GPU. We use the scheduler-
+		 * request queue (SRQ) registers at offsets 0x430-0x43c to
+		 * launch hand-written QPU kernels directly from ARM, bypassing
+		 * the firmware mailbox tag 0x60010 ("execute QPU") which
+		 * incurs ~1 ms per call.
+		 *
+		 * Per-pi V3D register window is 4 KiB at 0x3fc00000 (same as
+		 * Linux's vc4 binding). Coherent memory for QPU code +
+		 * uniforms + I/O comes from the firmware mailbox ALLOCATE /
+		 * LOCK property tags (already in the rpi_fw driver), so we
+		 * carry a firmware phandle here.
+		 *
+		 * Default disabled -- boards opt in.
+		 */
+		v3d: v3d@3fc00000 {
+			compatible = "brcm,bcm2835-v3d";
+			reg = <0x3fc00000 0x1000>;
+			firmware = <&firmware>;
+			status = "disabled";
+		};
 	};
 };

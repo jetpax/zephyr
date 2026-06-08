@@ -1,0 +1,38 @@
+# Copyright (c) 2026 jetpax
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Broadcom VideoCore IV 3D (V3D) hardware -- the 12-QPU SIMD compute
+  engine on BCM2835 / BCM2710 / BCM2711 SoCs. Each QPU is a 16-lane
+  32-bit SIMD core; the V3D scheduler-request queue (SRQ) registers
+  let ARM launch hand-written QPU kernels (qasm assembled to
+  uint32_t[]) and wait for their completion.
+
+  Code, per-QPU uniforms, and any I/O buffers live in firmware-
+  allocated GPU-coherent memory (mailbox ALLOCATE_MEMORY +
+  LOCK_MEMORY property tags). The driver holds a phandle to the
+  firmware mailbox device for those allocations.
+
+  The QPU clock domain must be powered on at boot via the
+  SET_ENABLE_QPU mailbox tag before any SRQ-queue access. The
+  driver handles this during initialisation.
+
+compatible: "brcm,bcm2835-v3d"
+
+include: base.yaml
+
+properties:
+  reg:
+    required: true
+    description: |
+      Base address and size of the V3D register window. 4 KiB is
+      sufficient -- the SRQ + cache-control registers used by the
+      driver live below 0x440.
+
+  firmware:
+    type: phandle
+    required: true
+    description: |
+      Phandle to the VideoCore firmware mailbox device. Used for QPU
+      enable (SET_ENABLE_QPU) and for allocating GPU-coherent memory
+      that holds QPU code + uniforms + I/O buffers.

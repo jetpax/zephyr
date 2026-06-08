@@ -1,0 +1,38 @@
+# Copyright (c) 2026 jetpax
+# SPDX-License-Identifier: Apache-2.0
+
+config BCM2835_V3D
+	bool "Broadcom VideoCore IV 3D (QPU) compute driver"
+	default y
+	depends on DT_HAS_BRCM_BCM2835_V3D_ENABLED
+	depends on RASPBERRYPI_FIRMWARE
+	select MMU
+	help
+	  Direct V3D scheduler-queue (SRQ) driver for the BCM2835 /
+	  BCM2710 / BCM2711 QPUs. Lets ARM launch hand-written QPU
+	  kernels (qasm assembled to uint32_t[]) without going through
+	  the firmware mailbox tag 0x60010 (which adds ~1 ms per kick).
+
+	  Coherent memory for kernel code + uniforms comes from the
+	  firmware mailbox ALLOCATE/LOCK property tags, which the
+	  rpi_fw driver already implements.
+
+if BCM2835_V3D
+
+config BCM2835_V3D_INIT_PRIORITY
+	int "init priority"
+	default 70
+	help
+	  Driver init priority within POST_KERNEL. Must be strictly
+	  greater than CONFIG_RASPBERRYPI_FIRMWARE_INIT_PRIORITY (the
+	  V3D driver depends on the firmware mailbox for QPU enable and
+	  coherent memory allocation).
+
+config BCM2835_V3D_LOG_LEVEL
+	int "log level"
+	range 0 4
+	default 3
+	help
+	  Log level for the bcm2835_v3d driver (0 = off, 4 = debug).
+
+endif # BCM2835_V3D

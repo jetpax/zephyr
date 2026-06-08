@@ -127,6 +127,8 @@
 #define RPI_FW_TAG_RELEASE_MEMORY       0x0003000FU
 /** @brief Execute code on the VideoCore */
 #define RPI_FW_TAG_EXECUTE_CODE         0x00030010U
+/** @brief Enable or disable the VC4 QPU (scheduler queue). One u32 in: 1=enable, 0=disable. */
+#define RPI_FW_TAG_SET_ENABLE_QPU       0x00030012U
 /** @brief Get dispmanx resource memory handle */
 #define RPI_FW_TAG_GET_DISPMANX_MEM_HDL 0x00030014U
 /** @brief Get a 128-byte EDID block from attached display */
