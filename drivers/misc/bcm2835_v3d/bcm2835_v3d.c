@@ -63,6 +63,9 @@ LOG_MODULE_REGISTER(bcm2835_v3d, CONFIG_BCM2835_V3D_LOG_LEVEL);
 #define V3D_SRQPC    0x0430  /* SRQ program counter (write = kick) */
 #define V3D_SRQUA    0x0434  /* SRQ uniforms address */
 #define V3D_SRQCS    0x043C  /* SRQ control/status */
+#define V3D_SRQCS_DONE_SHIFT 16
+#define V3D_SRQCS_DONE_MASK  (0xFFu << V3D_SRQCS_DONE_SHIFT)
+#define V3D_SRQCS_RESET      (BIT(7) | BIT(8) | BIT(16))
 #define V3D_DBCFG    0x0E00
 #define V3D_DBQITE   0x0E2C
 #define V3D_DBQITC   0x0E30
@@ -568,72 +571,230 @@ int bcm2835_v3d_free_coherent(const struct device *dev, uint32_t handle)
 }
 
 /* ------------------------------------------------------------------ *
- *  Kernel / launch stubs -- implemented in the next bring-up commit
+ *  Kernel API: pack code + per-QPU uniforms + scheduler-message array
+ *  into one GPU-coherent buffer, then kick V3D's SRQ.
+ *
+ *  Layout (matches rpi_os/src/lib/kernel.c -- the proven-on-BCM2835
+ *  reference; we use the same single-allocation arena pattern):
+ *
+ *    cur_unif[NUM_QPUS]                 4-byte align
+ *    code   [code_size / 4]             8-byte align
+ *    unif   [NUM_QPUS * NUM_UNIFS]     16-byte align
+ *    mbox_msg[NUM_QPUS * 2]             4-byte align
+ *      = pairs of (unif_bus_addr, code_bus_addr) the V3D SRQ reads
+ *
+ *  The mbox_msg array isn't actually consumed by the mailbox -- it's
+ *  the ARM-side staging that we walk when issuing SRQUA/SRQPC writes.
  * ------------------------------------------------------------------ */
+
+#define ALIGN_UP_PTR(p, a) ((uint8_t *)(((uintptr_t)(p) + (a) - 1) & ~((uintptr_t)(a) - 1)))
 
 int bcm2835_v3d_kernel_init(const struct device *dev,
                             struct bcm2835_v3d_kernel *k,
                             uint32_t num_qpus, uint32_t num_unifs,
                             const uint32_t *code, uint32_t code_size)
 {
-	ARG_UNUSED(dev);
-	ARG_UNUSED(k);
-	ARG_UNUSED(num_qpus);
-	ARG_UNUSED(num_unifs);
-	ARG_UNUSED(code);
-	ARG_UNUSED(code_size);
-	return -ENOSYS;
+	if (k == NULL || code == NULL) {
+		return -EINVAL;
+	}
+	if (num_qpus == 0 || num_qpus > BCM2835_V3D_MAX_QPUS || num_unifs == 0) {
+		return -EINVAL;
+	}
+	if (code_size == 0 || (code_size & 3u) != 0) {
+		return -EINVAL;
+	}
+
+	uint32_t cur_unif_sz = num_qpus * sizeof(uint32_t);
+	uint32_t unif_sz     = num_qpus * num_unifs * sizeof(uint32_t);
+	uint32_t mbox_sz     = num_qpus * 2u * sizeof(uint32_t);
+	/* +48 covers worst-case alignment slack across the three boundaries
+	 * (8 for code, 16 for unif, 4 for mbox_msg). Same number rpi_os uses.
+	 */
+	uint32_t total = cur_unif_sz + code_size + unif_sz + mbox_sz + 48u;
+
+	uintptr_t bus = 0;
+	void     *cpu = NULL;
+	uint32_t  handle = 0;
+	int rc = bcm2835_v3d_alloc_coherent(dev, total, 4096u,
+	                                    V3D_MEM_FLAG_L1_NONALLOC,
+	                                    &bus, &cpu, &handle);
+	if (rc) {
+		return rc;
+	}
+
+	memset(k, 0, sizeof(*k));
+	k->bus_addr   = bus;
+	k->cpu_addr   = cpu;
+	k->total_size = total;
+	k->mem_handle = handle;
+	k->num_qpus   = num_qpus;
+	k->num_unifs  = num_unifs;
+	k->code_size  = code_size;
+
+	uint8_t *p = (uint8_t *)cpu;
+
+	k->cur_unif = (uint32_t *)p;
+	p += cur_unif_sz;
+	memset(k->cur_unif, 0, cur_unif_sz);
+
+	p = ALIGN_UP_PTR(p, 8);
+	k->code = (uint32_t *)p;
+	p += code_size;
+	memcpy(k->code, code, code_size);
+
+	p = ALIGN_UP_PTR(p, 16);
+	k->unif = (uint32_t *)p;
+	p += unif_sz;
+
+	p = ALIGN_UP_PTR(p, 4);
+	k->mbox_msg = (uint32_t *)p;
+	p += mbox_sz;
+
+	if ((uintptr_t)p > (uintptr_t)cpu + total) {
+		LOG_ERR("kernel_init: layout overflow (computed %u, used %u)",
+			total, (uint32_t)((uintptr_t)p - (uintptr_t)cpu));
+		(void)bcm2835_v3d_free_coherent(dev, handle);
+		return -ENOMEM;
+	}
+
+	/* Compute bus addresses for the SRQ submission. The whole buffer
+	 * lives at bus address `bus`; ARM-visible pointer is `cpu`; bus
+	 * offset of any P inside the buffer = bus + (P - cpu).
+	 */
+	uintptr_t code_bus = bus + ((uintptr_t)k->code - (uintptr_t)cpu);
+
+	for (uint32_t i = 0; i < num_qpus; i++) {
+		uintptr_t unif_i_bus =
+			bus + ((uintptr_t)&k->unif[i * num_unifs] - (uintptr_t)cpu);
+		k->mbox_msg[i * 2]     = (uint32_t)unif_i_bus;
+		k->mbox_msg[i * 2 + 1] = (uint32_t)code_bus;
+	}
+
+	LOG_DBG("kernel_init: buf bus=0x%lx cpu=%p size=%u; "
+		"code=%u unif=%u mbox=%u",
+		(unsigned long)bus, cpu, total,
+		code_size, unif_sz, mbox_sz);
+	return 0;
 }
 
 int bcm2835_v3d_kernel_free(const struct device *dev, struct bcm2835_v3d_kernel *k)
 {
-	ARG_UNUSED(dev);
-	ARG_UNUSED(k);
-	return -ENOSYS;
+	if (k == NULL) {
+		return -EINVAL;
+	}
+	int rc = bcm2835_v3d_free_coherent(dev, k->mem_handle);
+	memset(k, 0, sizeof(*k));
+	return rc;
 }
 
 void bcm2835_v3d_kernel_reset_unifs(struct bcm2835_v3d_kernel *k)
 {
-	ARG_UNUSED(k);
+	if (k == NULL || k->cur_unif == NULL) {
+		return;
+	}
+	memset(k->cur_unif, 0, k->num_qpus * sizeof(uint32_t));
 }
 
-int bcm2835_v3d_kernel_load_unif_u32(struct bcm2835_v3d_kernel *k, uint32_t qpu, uint32_t val)
+int bcm2835_v3d_kernel_load_unif_u32(struct bcm2835_v3d_kernel *k,
+                                     uint32_t qpu, uint32_t val)
 {
-	ARG_UNUSED(k);
-	ARG_UNUSED(qpu);
-	ARG_UNUSED(val);
-	return -ENOSYS;
+	if (k == NULL || qpu >= k->num_qpus) {
+		return -EINVAL;
+	}
+	if (k->cur_unif[qpu] >= k->num_unifs) {
+		return -ENOSPC;
+	}
+	k->unif[qpu * k->num_unifs + k->cur_unif[qpu]] = val;
+	k->cur_unif[qpu]++;
+	return 0;
 }
 
-int bcm2835_v3d_kernel_load_unif_f32(struct bcm2835_v3d_kernel *k, uint32_t qpu, float val)
+int bcm2835_v3d_kernel_load_unif_f32(struct bcm2835_v3d_kernel *k,
+                                     uint32_t qpu, float val)
 {
-	ARG_UNUSED(k);
-	ARG_UNUSED(qpu);
-	ARG_UNUSED(val);
-	return -ENOSYS;
+	union {
+		float    f;
+		uint32_t u;
+	} cvt = { .f = val };
+
+	return bcm2835_v3d_kernel_load_unif_u32(k, qpu, cvt.u);
 }
 
-int bcm2835_v3d_kernel_execute(const struct device *dev, struct bcm2835_v3d_kernel *k)
+int bcm2835_v3d_kernel_execute_async(const struct device *dev,
+                                     struct bcm2835_v3d_kernel *k)
 {
-	ARG_UNUSED(dev);
-	ARG_UNUSED(k);
-	return -ENOSYS;
+	if (k == NULL || k->mbox_msg == NULL) {
+		return -EINVAL;
+	}
+
+	/* Disable V3D IRQs (we busy-poll SRQCS for completion). */
+	v3d_write(dev, V3D_DBCFG,  0);
+	v3d_write(dev, V3D_DBQITE, 0);
+	v3d_write(dev, V3D_DBQITC, 0xFFFFFFFFu);
+
+	/* Drop stale cache state, then clear SRQ done/scheduled/error
+	 * counters so our num_qpus polling starts from a known zero.
+	 */
+	v3d_write(dev, V3D_L2CACTL, BIT(2));
+	v3d_write(dev, V3D_SLCACTL, 0xFFFFFFFFu);
+	v3d_write(dev, V3D_SRQCS,   V3D_SRQCS_RESET);
+
+	/* Kick each QPU thread: write the unif base, then write the PC --
+	 * the PC write is what actually queues the thread into the SRQ.
+	 * No cache flush needed because the coherent buffer is mapped
+	 * K_MEM_CACHE_NONE (Device-nGnRnE on AArch64).
+	 */
+	for (uint32_t q = 0; q < k->num_qpus; q++) {
+		v3d_write(dev, V3D_SRQUA, k->mbox_msg[q * 2]);
+		v3d_write(dev, V3D_SRQPC, k->mbox_msg[q * 2 + 1]);
+	}
+	return 0;
 }
 
-int bcm2835_v3d_kernel_execute_async(const struct device *dev, struct bcm2835_v3d_kernel *k)
-{
-	ARG_UNUSED(dev);
-	ARG_UNUSED(k);
-	return -ENOSYS;
-}
-
-int bcm2835_v3d_kernel_wait(const struct device *dev, struct bcm2835_v3d_kernel *k,
+int bcm2835_v3d_kernel_wait(const struct device *dev,
+                            struct bcm2835_v3d_kernel *k,
                             uint32_t timeout_us)
 {
-	ARG_UNUSED(dev);
-	ARG_UNUSED(k);
-	ARG_UNUSED(timeout_us);
-	return -ENOSYS;
+	if (k == NULL) {
+		return -EINVAL;
+	}
+
+	uint32_t start = k_cycle_get_32();
+	uint32_t cps   = (uint32_t)sys_clock_hw_cycles_per_sec();
+	/* timeout_us == 0 => wait forever */
+	uint64_t limit = (timeout_us == 0U)
+		? UINT64_MAX
+		: ((uint64_t)cps * timeout_us) / 1000000ULL;
+
+	for (;;) {
+		uint32_t srqcs = v3d_read(dev, V3D_SRQCS);
+		uint32_t done  = (srqcs & V3D_SRQCS_DONE_MASK) >> V3D_SRQCS_DONE_SHIFT;
+
+		if (done == k->num_qpus) {
+			return 0;
+		}
+		if ((uint64_t)(k_cycle_get_32() - start) > limit) {
+			LOG_ERR("kernel_wait: timeout after %u us; "
+				"SRQCS=0x%08x done=%u/%u",
+				timeout_us, srqcs, done, k->num_qpus);
+			return -ETIMEDOUT;
+		}
+	}
+}
+
+int bcm2835_v3d_kernel_execute(const struct device *dev,
+                               struct bcm2835_v3d_kernel *k)
+{
+	int rc = bcm2835_v3d_kernel_execute_async(dev, k);
+
+	if (rc) {
+		return rc;
+	}
+	/* 1 second is wildly generous for any sane QPU shader -- if we
+	 * hit it, something is wrong (shader hangs, memory unreachable,
+	 * power-domain dropped, etc).
+	 */
+	return bcm2835_v3d_kernel_wait(dev, k, 1000000U);
 }
 
 /* ------------------------------------------------------------------ *
