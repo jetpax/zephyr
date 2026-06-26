@@ -551,13 +551,34 @@ int bcm2835_v3d_alloc_coherent(const struct device *dev,
 
 	if (cpu_addr) {
 		/* Map the ARM-physical alias of this bus address into ARM
-		 * virtual as device memory (cache-none) so ARM reads/writes
-		 * are coherent with the QPU without per-access cache flushes.
+		 * virtual as K_MEM_ARM_NORMAL_NC -- Normal-Non-cacheable.
+		 *
+		 * Why not K_MEM_CACHE_NONE (Device-nGnRnE)? On AArch64,
+		 * K_MEM_CACHE_NONE = MT_DEVICE_nGnRnE = no-Gathering,
+		 * no-Reordering, no-Early-ack: every 4-byte load/store is
+		 * a discrete synchronous AXI transaction. For QPU-coherent
+		 * buffers that get hundreds of KB of scatter/gather per
+		 * frame from ARM, that's catastrophic -- ~7 ms of pure
+		 * DRAM round-trip latency on a 5000-tri wipeout frame.
+		 *
+		 * Normal-NC bypasses the data caches (so ARM <-> QPU stay
+		 * coherent without explicit maintenance, exactly as
+		 * Device-nGnRnE), but the memory type permits the bus to
+		 * gather adjacent accesses into AXI bursts and the LSU
+		 * to keep multiple loads in flight (MSHRs). Callers must
+		 * issue DSB barriers around QPU kicks to ensure ARM writes
+		 * have drained to DRAM before the QPU reads, and that QPU
+		 * writes are visible to ARM after the kick completes --
+		 * bcm2835_v3d_kernel_execute_async + kernel_wait do this.
+		 *
+		 * MMIO mappings (V3D / PM / ASB / CM) stay K_MEM_CACHE_NONE
+		 * -- they need the strict ordering for password-protected
+		 * register writes.
 		 */
 		uint8_t *va = NULL;
 		uint32_t phys = bus & V3D_BUS_TO_PHYS_MASK;
 
-		device_map((mm_reg_t *)&va, phys, size, K_MEM_CACHE_NONE);
+		device_map((mm_reg_t *)&va, phys, size, K_MEM_ARM_NORMAL_NC);
 		if (!va) {
 			(void)fw_unlock_mem(cfg->fw, h);
 			(void)fw_release_mem(cfg->fw, h);
@@ -741,6 +762,21 @@ int bcm2835_v3d_kernel_execute_async(const struct device *dev,
 		return -EINVAL;
 	}
 
+	/* Drain any pending ARM-side writes to the K_MEM_ARM_NORMAL_NC
+	 * coherent buffers (kernel code, unifs, mbox_msg, plus any
+	 * caller-allocated input buffer) before the QPU starts reading.
+	 * Normal-NC allows the LSU to keep writes in flight; dsb sy
+	 * stalls until every store is observed by all observers (i.e.
+	 * landed in DRAM) -- exactly what the QPU needs to see correct
+	 * inputs.
+	 *
+	 * If we left buffers at K_MEM_CACHE_NONE (Device-nGnRnE) this
+	 * barrier would be unnecessary (nGnRnE is non-bufferable and
+	 * non-gathering by definition), but at ~7 ms/frame of round-
+	 * trip latency that's not a trade we want.
+	 */
+	__asm__ volatile("dsb sy" ::: "memory");
+
 	/* Disable V3D IRQs (we busy-poll SRQCS for completion). */
 	v3d_write(dev, V3D_DBCFG,  0);
 	v3d_write(dev, V3D_DBQITE, 0);
@@ -755,8 +791,6 @@ int bcm2835_v3d_kernel_execute_async(const struct device *dev,
 
 	/* Kick each QPU thread: write the unif base, then write the PC --
 	 * the PC write is what actually queues the thread into the SRQ.
-	 * No cache flush needed because the coherent buffer is mapped
-	 * K_MEM_CACHE_NONE (Device-nGnRnE on AArch64).
 	 */
 	for (uint32_t q = 0; q < k->num_qpus; q++) {
 		v3d_write(dev, V3D_SRQUA, k->mbox_msg[q * 2]);
@@ -785,6 +819,15 @@ int bcm2835_v3d_kernel_wait(const struct device *dev,
 		uint32_t done  = (srqcs & V3D_SRQCS_DONE_MASK) >> V3D_SRQCS_DONE_SHIFT;
 
 		if (done == k->num_qpus) {
+			/* QPU has reported all kernels done. With Normal-NC
+			 * coherent buffers, ARM may still have stale Read-
+			 * Allocate buffer state from before the kick. dsb sy
+			 * orders all prior memory accesses (including the
+			 * SRQCS read above) against subsequent ones so the
+			 * caller's gather reads from the output buffer see
+			 * the QPU's writes, not anything earlier.
+			 */
+			__asm__ volatile("dsb sy" ::: "memory");
 			return 0;
 		}
 		if ((uint64_t)(k_cycle_get_32() - start) > limit) {
