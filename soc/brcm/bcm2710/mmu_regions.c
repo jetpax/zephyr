@@ -22,6 +22,14 @@ static const struct arm_mmu_region mmu_regions[] = {
 			      DT_REG_ADDR(DT_INST(0, brcm_bcm2835_armctrl_ic)),
 			      DT_REG_SIZE(DT_INST(0, brcm_bcm2835_armctrl_ic)),
 			      MT_DEVICE_nGnRnE | MT_P_RW_U_NA | MT_DEFAULT_SECURE_STATE),
+
+	/* PM block (watchdog / RSTC) — needed for sys_arch_reboot().
+	 * 0x3f100000 + 0x114 bytes; round up to a 4 KiB page.
+	 */
+	MMU_REGION_FLAT_ENTRY("BCM2835_PM",
+			      0x3f100000UL,
+			      0x1000,
+			      MT_DEVICE_nGnRnE | MT_P_RW_U_NA | MT_DEFAULT_SECURE_STATE),
 };
 
 const struct arm_mmu_config mmu_config = {
