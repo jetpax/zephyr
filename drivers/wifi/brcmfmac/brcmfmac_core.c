@@ -15,6 +15,7 @@
 #define DT_DRV_COMPAT brcm_bcm43xxx_sdio
 
 #include <zephyr/device.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/init.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/net/conn_mgr/connectivity_wifi_mgmt.h>
@@ -74,6 +75,42 @@ static int brcmfmac_probe_sdio(const struct device *dev)
 	if (!device_is_ready(cfg->sdhc)) {
 		LOG_ERR("SDHC parent %s not ready", cfg->sdhc->name);
 		return -ENODEV;
+	}
+
+	/* WL_REG_ON reset pulse. Mirrors Linux mmc-pwrseq-simple's
+	 * pre_power_on -> post_power_on(delay=10ms) sequence: hold the
+	 * regulator-enable line deasserted, wait 20 ms so any prior boot
+	 * state fully drops, assert it, then wait 150 ms for the chip's
+	 * internal ARM CM3 + PMU to boot before SDIO enumeration.
+	 *
+	 * Without this pulse the BCM43430A1 on the original Pi Zero W
+	 * (BCM2835) enumerates but then fires DATA_CRC on the second /
+	 * third F1 backplane read: the VC firmware / DTB (bcm2708) leaves
+	 * WL_REG_ON in an indeterminate state, unlike the Pi 3 / Zero 2 W
+	 * (bcm2710 DTB) which asserts it cleanly through boot.
+	 *
+	 * Skipped only if the DT node omits wifi-reg-on-gpios entirely
+	 * (some boards route the line through firmware already).
+	 */
+	if (cfg->reg_on.port != NULL) {
+		if (!gpio_is_ready_dt(&cfg->reg_on)) {
+			LOG_ERR("wifi-reg-on GPIO %s not ready",
+				cfg->reg_on.port->name);
+			return -ENODEV;
+		}
+		ret = gpio_pin_configure_dt(&cfg->reg_on, GPIO_OUTPUT_INACTIVE);
+		if (ret != 0) {
+			LOG_ERR("wifi-reg-on configure failed: %d", ret);
+			return ret;
+		}
+		k_msleep(20);
+		ret = gpio_pin_set_dt(&cfg->reg_on, 1);
+		if (ret != 0) {
+			LOG_ERR("wifi-reg-on assert failed: %d", ret);
+			return ret;
+		}
+		k_msleep(150);
+		LOG_INF("WL_REG_ON pulsed low->high (chip released from reset)");
 	}
 
 	ret = sd_init(cfg->sdhc, &data->card);
