@@ -9,11 +9,15 @@ description: |
   IRQs (PEND1 + PEND2 banks) plus 8 ARMC "basic" IRQs into the GPU
   cascade line of its parent.
 
-  Zephyr exposes a flat 0..71 IRQ space:
-    0..7   = basic bank
-    8..39  = GPU PEND1 (bits 0..31)
-    40..71 = GPU PEND2 (bits 0..31)
-  (See <zephyr/dt-bindings/interrupt-controller/bcm2835-armctrl.h>.)
+  Zephyr exposes this controller's IRQs in a flat range offset by 32
+  (the L1 ARM-local intc occupies 0..31, only 0..9 used):
+    32..39   = basic bank   (IRQ_BASIC_PENDING bits 0..7)
+    64..95   = GPU PEND1    (PEND1 bits 0..31)
+    96..127  = GPU PEND2    (PEND2 bits 0..31)
+  (See <zephyr/dt-bindings/interrupt-controller/bcm2835-armctrl.h>
+  for the symbolic constants, and the per-SoC soc_irq.c decode that
+  maps these numbers to the bank-0 shortcut bits + PEND1 / PEND2
+  registers.)
 
 compatible: "brcm,bcm2835-armctrl-ic"
 
