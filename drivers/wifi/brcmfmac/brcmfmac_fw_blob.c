@@ -17,3 +17,12 @@ const unsigned char brcmfmac_nvram[] = {
 #include "brcmfmac_nvram.inc"
 };
 const unsigned int brcmfmac_nvram_len = sizeof(brcmfmac_nvram);
+
+/* CLM (regulatory database) blob for trim-on-build firmware images
+ * that ship without a built-in CLM. Zero-length when
+ * CONFIG_WIFI_BRCMFMAC_CLM_FILE is empty.
+ */
+const unsigned char brcmfmac_clm[] = {
+#include "brcmfmac_clm.inc"
+};
+const unsigned int brcmfmac_clm_len = sizeof(brcmfmac_clm);
