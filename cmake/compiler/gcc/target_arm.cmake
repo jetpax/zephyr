@@ -57,11 +57,21 @@ set(LLEXT_REMOVE_FLAGS
   -Os
 )
 
-# Flags to be added to llext code compilation
-set(LLEXT_APPEND_FLAGS
-  -mlong-calls
-  -mthumb
-)
+# Flags to be added to llext code compilation. -mthumb is Cortex-M-only;
+# ARM1176JZF-S (ARMv6-A) runs the loader in ARM mode and forcing sketches
+# to Thumb breaks the interworking the linker emits. -mlong-calls is still
+# wanted on cortex-m so the sketch can call kernel functions outside its
+# llext code section's PC-relative branch range.
+if(CONFIG_CPU_AARCH32_ARMV6)
+  set(LLEXT_APPEND_FLAGS
+    -mlong-calls
+  )
+else()
+  set(LLEXT_APPEND_FLAGS
+    -mlong-calls
+    -mthumb
+  )
+endif()
 
 list(APPEND LLEXT_EDK_REMOVE_FLAGS
     --sysroot=.*
