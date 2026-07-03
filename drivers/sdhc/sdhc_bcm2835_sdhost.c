@@ -113,6 +113,7 @@ LOG_MODULE_REGISTER(sdhc_bcm2835_sdhost, CONFIG_SDHC_LOG_LEVEL);
 
 /* ===== FIFO / timing constants ==================================== */
 #define SDDATA_FIFO_WORDS	16
+#define SDDATA_FIFO_PIO_BURST	8
 #define FIFO_READ_THRESHOLD	4
 #define FIFO_WRITE_THRESHOLD	4
 #define SDTOUT_RESET_VALUE	0x00f00000
@@ -175,7 +176,29 @@ static void sdhost_soft_reset(const struct device *dev)
 	sys_write32(SDVDD_POWER_ON, base + SDVDD);
 	k_msleep(SDHOST_POWER_SETTLE_MS);
 
-	data->hcfg = 0;
+	/* SDHCFG bits to set at init and leave on:
+	 *
+	 * SLOW_CARD -- disables the controller's automatic ident->data
+	 *   clock-mode switch. Without it, the controller starts in 11-bit
+	 *   ident-mode divisor (low clock), then auto-switches to 3-bit
+	 *   data-mode divisor (potentially much higher clock) on the first
+	 *   data command. With max_clk=250 MHz, the smallest data-mode
+	 *   clock is ~27 MHz, which the card cannot follow if we last set
+	 *   the ident clock to 400 kHz. Symptom on Pi Zero W 2026-06-30:
+	 *   first FIFO load (≤16 words) succeeds at ident clock, then the
+	 *   auto-switched data clock loses the card and subsequent FIFO
+	 *   refills return zeros with sdhsts=0 -- exactly the 16-word
+	 *   boundary observed. Linux's set_ios comment: "Disable clever
+	 *   clock switching, to cope with fast core clocks."
+	 *
+	 * WIDE_INT_BUS -- host-internal data-path bus width. Linux always
+	 *   sets it; safe to mirror.
+	 *
+	 * DATA_IRPT_EN / BUSY_IRPT_EN -- Linux sets both before every data
+	 *   transfer. Leave on at init since we don't connect the IRQ line.
+	 */
+	data->hcfg = SDHCFG_SLOW_CARD | SDHCFG_WIDE_INT_BUS |
+		     SDHCFG_DATA_IRPT_EN | SDHCFG_BUSY_IRPT_EN;
 	data->cdiv = SDCDIV_MAX_CDIV;
 	sys_write32(data->hcfg, base + SDHCFG);
 	sys_write32(data->cdiv, base + SDCDIV);
@@ -341,8 +364,21 @@ static int sdhost_pio_xfer(const struct device *dev, struct sdhc_data *data,
 			uint32_t fifo_ready = is_read ? fifo_used
 						      : (SDDATA_FIFO_WORDS -
 							 fifo_used);
+			/* Mirror Linux's bcm2835-sdhost.c: drain (or fill) in
+			 * fixed bursts of SDDATA_FIFO_PIO_BURST words, not
+			 * piecemeal. Reading SDDATA when fewer than `burst`
+			 * words are committed returns zeros / stale data on
+			 * BCM2835/ARMv6 (proven on Pi Zero W 2026-06-30 -- a
+			 * 512-byte read returned 128 zero words with sdhsts=0).
+			 * On AArch64 the CPU was fast enough that by the time
+			 * `fifo_used` was sampled, a full burst had always
+			 * landed -- which masked the bug.
+			 */
+			uint32_t burst = SDDATA_FIFO_PIO_BURST < words_left
+						 ? SDDATA_FIFO_PIO_BURST
+						 : words_left;
 
-			if (fifo_ready == 0) {
+			if (fifo_ready < burst) {
 				uint32_t fsm = edm & SDEDM_FSM_MASK;
 				bool fsm_active = is_read
 					? (fsm == SDEDM_FSM_READDATA ||
@@ -378,24 +414,27 @@ static int sdhost_pio_xfer(const struct device *dev, struct sdhc_data *data,
 				continue;
 			}
 
-			uint32_t do_words = fifo_ready < words_left
-						    ? fifo_ready
-						    : words_left;
+			uint32_t do_words = burst;
+
+			/* Ack DATA_FLAG before draining: Linux's IRQ handler
+			 * W1Cs DATA_FLAG before reading the FIFO. Mirror it
+			 * defensively even though our polled path doesn't
+			 * strictly require it.
+			 */
+			sys_write32(SDHSTS_DATA_FLAG, base + SDHSTS);
 
 			for (uint32_t i = 0; i < do_words; i++) {
 				if (is_read) {
 					uint32_t w = sys_read32(base + SDDATA);
 
-					buf[0] = w & 0xff;
-					buf[1] = (w >> 8) & 0xff;
-					buf[2] = (w >> 16) & 0xff;
-					buf[3] = (w >> 24) & 0xff;
+					/* Buffers from FATFS / SD subsystem are
+					 * 4-byte aligned. Aligned word store is
+					 * faster than 4 byte stores and avoids
+					 * ARMv6 write-buffer surprises.
+					 */
+					*(uint32_t *)buf = w;
 				} else {
-					uint32_t w =
-						(uint32_t)buf[0] |
-						((uint32_t)buf[1] << 8) |
-						((uint32_t)buf[2] << 16) |
-						((uint32_t)buf[3] << 24);
+					uint32_t w = *(const uint32_t *)buf;
 
 					sys_write32(w, base + SDDATA);
 				}
