@@ -80,6 +80,12 @@
 			reg = <0x8000 DT_SIZE_M(248)>;
 		};
 
+		rng: rng@20104000 {
+			compatible = "brcm,bcm2835-rng";
+			reg = <0x20104000 0x10>;
+			status = "okay";
+		};
+
 		armctrl_intc: interrupt-controller@2000b200 {
 			compatible = "brcm,bcm2835-armctrl-ic";
 			reg = <0x2000b200 0x200>;
@@ -154,6 +160,72 @@
 			interrupts = <BCM2835_IRQ_ARM_MAILBOX IRQ_TYPE_LEVEL 0>;
 			#mbox-cells = <1>;
 			status = "okay";
+		};
+
+		/*
+		 * Legacy SDHost controller -> external microSD card slot.
+		 * Drives GPIO 48..53 at ALT0. Proprietary Broadcom register
+		 * layout, distinct from the Arasan SDHCI block on the same
+		 * SoC. clock-frequency tracks the VPU core clock feeding
+		 * SDHost's SDCDIV reference divider (core_freq=250 in
+		 * config.txt). Board DTS opts in and adds the
+		 * zephyr,sdmmc-disk child.
+		 */
+		sdhost: mmc@20202000 {
+			compatible = "brcm,bcm2835-sdhost";
+			reg = <0x20202000 0x100>;
+			interrupts = <BCM2835_IRQ_SDHOST IRQ_TYPE_LEVEL 0>;
+			clock-frequency = <DT_FREQ_M(250)>;
+			bus-width = <4>;
+			status = "disabled";
+		};
+
+		/*
+		 * DMA controller -- a control-block (linked-list descriptor)
+		 * engine. Peripherals such as SPI, I2S and the Arasan SDHCI
+		 * pace transfers off it via DREQ. Default disabled; board
+		 * overlays opt in.
+		 *
+		 * brcm,dma-channel-mask = 0x7f30 keeps channels 4,5,8..14 and
+		 * excludes the VideoCore-firmware-reserved and special-function
+		 * channels (0,1,2,3,6,7). The interrupts list covers exactly
+		 * those mask channels: 4,5,8,9,10 have dedicated lines, 11..14
+		 * share one.
+		 */
+		dma: dma@20007000 {
+			compatible = "brcm,bcm2835-dma";
+			reg = <0x20007000 0xf00>;
+			interrupts = <BCM2835_IRQ_DMA(4)  IRQ_TYPE_LEVEL 0>,
+				     <BCM2835_IRQ_DMA(5)  IRQ_TYPE_LEVEL 0>,
+				     <BCM2835_IRQ_DMA(8)  IRQ_TYPE_LEVEL 0>,
+				     <BCM2835_IRQ_DMA(9)  IRQ_TYPE_LEVEL 0>,
+				     <BCM2835_IRQ_DMA(10) IRQ_TYPE_LEVEL 0>,
+				     <BCM2835_IRQ_DMA_SHARED IRQ_TYPE_LEVEL 0>;
+			#dma-cells = <1>;
+			dma-channels = <16>;
+			brcm,dma-channel-mask = <0x7f30>;
+			dma-buf-addr-alignment = <64>;
+			status = "disabled";
+		};
+
+		/*
+		 * Arasan SDHCI controller (EMMC port). Wired to the on-module
+		 * BCM43430A1 wireless chip via GPIO 34..39 ALT3 + GPCLK2 on
+		 * GPIO 43 ALT0. The Arasan's built-in DMA is unusable (its
+		 * CAPABILITIES register reads zero on this silicon); data
+		 * bytes move through the BUFFER FIFO via the external
+		 * bcm2835-dma engine, DREQ 11. The board overlay must also
+		 * enable &dma. Default disabled.
+		 */
+		emmc: sdhci@20300000 {
+			compatible = "brcm,bcm2835-sdhci";
+			reg = <0x20300000 0x100>;
+			interrupts = <BCM2835_IRQ_ARASAN_SDIO IRQ_TYPE_LEVEL 0>;
+			clock-frequency = <DT_FREQ_M(200)>;
+			bus-width = <4>;
+			dmas = <&dma 11>;
+			dma-names = "rx-tx";
+			status = "disabled";
 		};
 
 		/*

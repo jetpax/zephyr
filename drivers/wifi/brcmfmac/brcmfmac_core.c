@@ -15,6 +15,7 @@
 #define DT_DRV_COMPAT brcm_bcm43xxx_sdio
 
 #include <zephyr/device.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/init.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/net/conn_mgr/connectivity_wifi_mgmt.h>
@@ -76,6 +77,42 @@ static int brcmfmac_probe_sdio(const struct device *dev)
 		return -ENODEV;
 	}
 
+	/* WL_REG_ON reset pulse. Mirrors Linux mmc-pwrseq-simple's
+	 * pre_power_on -> post_power_on(delay=10ms) sequence: hold the
+	 * regulator-enable line deasserted, wait 20 ms so any prior boot
+	 * state fully drops, assert it, then wait 150 ms for the chip's
+	 * internal ARM CM3 + PMU to boot before SDIO enumeration.
+	 *
+	 * Without this pulse the BCM43430A1 on the original Pi Zero W
+	 * (BCM2835) enumerates but then fires DATA_CRC on the second /
+	 * third F1 backplane read: the VC firmware / DTB (bcm2708) leaves
+	 * WL_REG_ON in an indeterminate state, unlike the Pi 3 / Zero 2 W
+	 * (bcm2710 DTB) which asserts it cleanly through boot.
+	 *
+	 * Skipped only if the DT node omits wifi-reg-on-gpios entirely
+	 * (some boards route the line through firmware already).
+	 */
+	if (cfg->reg_on.port != NULL) {
+		if (!gpio_is_ready_dt(&cfg->reg_on)) {
+			LOG_ERR("wifi-reg-on GPIO %s not ready",
+				cfg->reg_on.port->name);
+			return -ENODEV;
+		}
+		ret = gpio_pin_configure_dt(&cfg->reg_on, GPIO_OUTPUT_INACTIVE);
+		if (ret != 0) {
+			LOG_ERR("wifi-reg-on configure failed: %d", ret);
+			return ret;
+		}
+		k_msleep(20);
+		ret = gpio_pin_set_dt(&cfg->reg_on, 1);
+		if (ret != 0) {
+			LOG_ERR("wifi-reg-on assert failed: %d", ret);
+			return ret;
+		}
+		k_msleep(150);
+		LOG_INF("WL_REG_ON pulsed low->high (chip released from reset)");
+	}
+
 	ret = sd_init(cfg->sdhc, &data->card);
 	if (ret != 0) {
 		LOG_ERR("sd_init failed: %d", ret);
@@ -105,6 +142,80 @@ static int brcmfmac_probe_sdio(const struct device *dev)
 		return ret;
 	}
 	LOG_DBG("F1 claimed (max_blk=%u)", data->backplane.cis.max_blk_size);
+	return 0;
+}
+
+/* Download the CLM (regulatory/channel database) blob via the
+ * "clmload" iovar. Mirrors Linux brcmf_c_download_blob(). Cypress
+ * trim-on-build firmware (e.g. the 43430A1 image) ships without a
+ * built-in CLM; until one is loaded the firmware sits at the null
+ * country "#n" with zero valid channels, WLC_UP reports OK but isup
+ * stays 0, and every radio op fails BCME_NOTUP.
+ */
+#define BRCMF_DLOAD_HANDLER_VER  1u
+#define BRCMF_DLOAD_FLAG_BEGIN   0x0002u
+#define BRCMF_DLOAD_FLAG_END     0x0004u
+#define BRCMF_DLOAD_VER_SHIFT    12
+#define BRCMF_DLOAD_TYPE_CLM     2u
+#define BRCMF_CLM_CHUNK_LEN      512u
+
+static int brcmfmac_clm_download(struct brcmfmac_data *data)
+{
+	struct dload_hdr {
+		uint16_t flag;
+		uint16_t dload_type;
+		uint32_t len;
+		uint32_t crc;
+	} __packed;
+	static uint8_t chunk[sizeof(struct dload_hdr) + BRCMF_CLM_CHUNK_LEN]
+		__aligned(4);
+	struct dload_hdr *hdr = (struct dload_hdr *)chunk;
+	uint32_t offset = 0;
+	uint16_t flag = BRCMF_DLOAD_FLAG_BEGIN
+		      | (BRCMF_DLOAD_HANDLER_VER << BRCMF_DLOAD_VER_SHIFT);
+	int ret;
+
+	if (brcmfmac_clm_len == 0U) {
+		return 0;
+	}
+
+	while (offset < brcmfmac_clm_len) {
+		uint32_t len = brcmfmac_clm_len - offset;
+
+		if (len > BRCMF_CLM_CHUNK_LEN) {
+			len = BRCMF_CLM_CHUNK_LEN;
+		} else {
+			flag |= BRCMF_DLOAD_FLAG_END;
+		}
+
+		hdr->flag = flag;
+		hdr->dload_type = BRCMF_DLOAD_TYPE_CLM;
+		hdr->len = len;
+		hdr->crc = 0;
+		memcpy(chunk + sizeof(*hdr), brcmfmac_clm + offset, len);
+
+		ret = brcmfmac_bcdc_iovar_set(data, "clmload", chunk,
+					      (uint16_t)(sizeof(*hdr) + len));
+		if (ret != 0) {
+			LOG_ERR("clmload chunk @%u/%u failed: %d",
+				offset, brcmfmac_clm_len, ret);
+			return ret;
+		}
+
+		flag &= ~BRCMF_DLOAD_FLAG_BEGIN;
+		offset += len;
+	}
+
+	uint32_t status = 0xdeadbeef;
+
+	ret = brcmfmac_bcdc_iovar_get(data, "clmload_status",
+				      (uint8_t *)&status, sizeof(status));
+	if (ret < 0 || status != 0U) {
+		LOG_ERR("clmload_status=%u (ret=%d)", status, ret);
+		return -EIO;
+	}
+	LOG_INF("CLM blob loaded (%u bytes), clmload_status=0",
+		brcmfmac_clm_len);
 	return 0;
 }
 
@@ -140,15 +251,70 @@ static int brcmfmac_init(const struct device *dev)
 		data->chip_mac[0], data->chip_mac[1], data->chip_mac[2],
 		data->chip_mac[3], data->chip_mac[4], data->chip_mac[5]);
 
+	/* Must happen before WLC_UP -- see brcmfmac_clm_download(). */
+	ret = brcmfmac_clm_download(data);
+	if (ret != 0) {
+		return ret;
+	}
+
 	/* WLC_UP: bring the MAC layer up. Most write IOCTLs (notably the
 	 * "escan" IOVAR) return BCME_NOTUP (-4) until this fires.
+	 *
+	 * The command must carry a 4-byte integer payload. Both Linux
+	 * (brcmf_fil_cmd_int_set(BRCMF_C_UP, 0) in brcmf_config_dongle) and
+	 * the zerowi bare-metal reference send one; brcmfmac43430a1
+	 * firmware answers BCME_OK to a zero-length WLC_UP but leaves the
+	 * radio down, and every radio op after that fails BCME_NOTUP.
 	 */
-	ret = brcmfmac_bcdc_set_dcmd(data, BRCMFMAC_WLC_UP, NULL, 0);
+	const uint32_t up_arg = 0;
+
+	ret = brcmfmac_bcdc_set_dcmd(data, BRCMFMAC_WLC_UP,
+				     (const uint8_t *)&up_arg, 4);
 	if (ret != 0) {
 		LOG_ERR("WLC_UP failed: %d", ret);
 		return ret;
 	}
-	LOG_INF("WLC_UP ok");
+
+	uint32_t isup = 0;
+
+	ret = brcmfmac_bcdc_query_dcmd(data, BRCMFMAC_WLC_GET_UP, NULL, 0,
+				       (uint8_t *)&isup, sizeof(isup));
+	if (ret >= 0 && isup == 1U) {
+		LOG_INF("WLC_UP ok (isup=1)");
+	} else {
+		LOG_WRN("WLC_UP acked but radio not up (isup=%u) -- "
+			"missing CLM blob or no valid country?", isup);
+	}
+
+	/* Optional regulatory override. The firmware boots on the CLM's
+	 * default country; boards that need a specific domain set it via
+	 * Kconfig. ISO3166 alpha2 with rev=0, matching Linux's
+	 * brmcf_use_iso3166_ccode_fallback() handling for this chip
+	 * family.
+	 */
+	if (sizeof(CONFIG_WIFI_BRCMFMAC_COUNTRY) > 1) {
+		struct {
+			char country_abbrev[4];
+			int32_t rev;
+			char ccode[4];
+		} __packed cspec;
+
+		memset(&cspec, 0, sizeof(cspec));
+		strncpy(cspec.country_abbrev, CONFIG_WIFI_BRCMFMAC_COUNTRY, 3);
+		strncpy(cspec.ccode, CONFIG_WIFI_BRCMFMAC_COUNTRY, 3);
+		cspec.rev = 0;
+
+		ret = brcmfmac_bcdc_iovar_set(data, "country",
+					      (const uint8_t *)&cspec,
+					      sizeof(cspec));
+		if (ret != 0) {
+			LOG_WRN("country=%s rejected (%d), staying on CLM "
+				"default", CONFIG_WIFI_BRCMFMAC_COUNTRY, ret);
+		} else {
+			LOG_INF("country set to %s",
+				CONFIG_WIFI_BRCMFMAC_COUNTRY);
+		}
+	}
 
 	/* Enable the events we care about in the chip's event mask. Read
 	 * current mask first so we don't clobber chip defaults. Events the

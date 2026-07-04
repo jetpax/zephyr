@@ -7,6 +7,7 @@
 /dts-v1/;
 
 #include <broadcom/bcm2835.dtsi>
+#include <zephyr/dt-bindings/gpio/gpio.h>
 
 / {
 	model = "Raspberry Pi Zero W";
@@ -16,6 +17,11 @@
 		zephyr,console = &uart1;
 		zephyr,shell-uart = &uart1;
 		zephyr,sram = &sram0;
+		zephyr,entropy = &rng;
+	};
+
+	aliases {
+		sdhc0 = &emmc;
 	};
 };
 
@@ -26,4 +32,34 @@
 	pinctrl-0 = <&uart1_gpio14>;
 	pinctrl-names = "default";
 	status = "okay";
+};
+
+/* GPIO bank 1 (BCM 28..53). Pin 41 carries WL_REG_ON for the on-module
+ * BCM43430A1 wireless chip; enabling the bank makes the line available
+ * to the brcmfmac driver. ngpios extended past the dtsi default of 18
+ * to cover the wireless chip lines (28..53).
+ */
+&gpio1 {
+	status = "okay";
+	ngpios = <26>;
+};
+
+&dma {
+	status = "okay";
+};
+
+/* Arasan SDHCI -> on-module BCM43430A1 SDIO wireless chip. The slot is
+ * a board-level fact (PCB pad, GPIO 34..39 ALT3 + GPCLK2 on GPIO 43 ALT0);
+ * the routing lives in the board DTS.
+ */
+&emmc {
+	pinctrl-names = "default";
+	pinctrl-0 = <&emmc_gpio34>;
+	status = "okay";
+
+	brcmfmac: brcmfmac {
+		compatible = "brcm,bcm43xxx-sdio";
+		wifi-reg-on-gpios = <&gpio1 13 GPIO_ACTIVE_HIGH>;
+		status = "okay";
+	};
 };
