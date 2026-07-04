@@ -10,6 +10,19 @@ if(CONFIG_SLOW_FLASH_DATA)
   endif()
 endif()
 
+if(CONFIG_CPU_AARCH32_ARMV6)
+  # ARM1176 / ARMv6KZ does NOT support true unaligned access -- a misaligned
+  # LDR returns the aligned word rotated by (addr & 3) * 8 bits instead of
+  # faulting. GCC optimises byte-shift patterns like ELM FatFs's ld_32
+  # (ptr[3]<<24 | ptr[2]<<16 | ptr[1]<<8 | ptr[0]) into a single LDR,
+  # which then silently returns a rotated word when the pointer isn't
+  # 4-byte aligned. Symptom: FATFS read of MBR partition LBA at byte 454
+  # returned 0x20020800 instead of 0x00000800. Force GCC to emit byte
+  # loads. Mirrors what the kernel does for ARMv6 (CONFIG_ARM=y +
+  # !CONFIG_ARCH_ARMV7 in Linux's arch/arm/Makefile).
+  zephyr_compile_options(-mno-unaligned-access)
+endif()
+
 zephyr_library_sources(
   fatal.c
   nmi.c

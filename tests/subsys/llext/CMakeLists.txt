@@ -77,6 +77,25 @@ if(CONFIG_LLEXT_VENEERS)
   generate_inc_file_for_target(app ${ext_bin} ${ext_inc})
 endif()
 
+# A C++ extension referencing the thread-local errno, exercising the AArch64
+# local-exec TLS relocations (R_AARCH64_TLSLE_ADD_TPREL_*). Only arm64
+# implements these in arch_elf_relocate(); the C++ standard library (and so
+# toolchain picolibc with a TLS errno) is enabled by the llext.tls scenario.
+if(CONFIG_ARM64 AND CONFIG_GLIBCXX_LIBCPP)
+  add_llext_target(tls_ext
+    OUTPUT  ${PROJECT_BINARY_DIR}/llext/tls.llext
+    SOURCES ${PROJECT_SOURCE_DIR}/src/tls_ext.cpp
+  )
+  # errno has no dynamic initializer, so drop the C++ _ZTH5errno TLS-init thunk
+  # (a weak-undefined symbol llext cannot resolve), leaving only the local-exec
+  # tprel access. Mirrors the on-target sketch toolchain flags.
+  get_target_property(tls_lib tls_ext lib_target)
+  target_compile_options(${tls_lib} PRIVATE -fno-extern-tls-init)
+  generate_inc_file_for_target(app ${PROJECT_BINARY_DIR}/llext/tls.llext
+    ${ZEPHYR_BINARY_DIR}/include/generated/tls.inc
+  )
+endif()
+
 if(NOT CONFIG_LLEXT_TYPE_ELF_OBJECT)
   add_llext_target(multi_file_ext
     OUTPUT  ${PROJECT_BINARY_DIR}/llext/multi_file.llext
