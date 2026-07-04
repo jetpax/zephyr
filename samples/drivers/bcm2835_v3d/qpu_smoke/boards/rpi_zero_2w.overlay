@@ -1,0 +1,33 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Enable the V3D + firmware mailbox + console UART for the QPU smoke
+ * test on rpi_zero_2w. The board DTS leaves V3D + firmware disabled
+ * so unrelated builds don't pull them in; this overlay opts in.
+ */
+
+&mbox0 {
+	status = "okay";
+};
+
+&firmware {
+	status = "okay";
+};
+
+&v3d {
+	status = "okay";
+};
+
+&uart1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart1_gpio14>;
+	status = "okay";
+	current-speed = <115200>;
+};
+
+/ {
+	chosen {
+		zephyr,console = &uart1;
+		zephyr,shell-uart = &uart1;
+	};
+};

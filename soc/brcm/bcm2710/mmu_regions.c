@@ -22,6 +22,12 @@ static const struct arm_mmu_region mmu_regions[] = {
 			      DT_REG_ADDR(DT_INST(0, brcm_bcm2835_armctrl_ic)),
 			      DT_REG_SIZE(DT_INST(0, brcm_bcm2835_armctrl_ic)),
 			      MT_DEVICE_nGnRnE | MT_P_RW_U_NA | MT_DEFAULT_SECURE_STATE),
+
+	/* V3D / PM / ASB peripheral windows handled at driver runtime via
+	 * device_map(K_MEM_CACHE_NONE). Static MMU entries with
+	 * non-64KB-aligned bases (e.g. ASB at 0x3F00A000) interact badly
+	 * with CONFIG_MMU_PAGE_SIZE=0x10000 and silently break early boot.
+	 */
 };
 
 const struct arm_mmu_config mmu_config = {
