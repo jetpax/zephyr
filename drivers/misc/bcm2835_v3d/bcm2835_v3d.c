@@ -913,11 +913,13 @@ static int bcm2835_v3d_init(const struct device *dev)
 	device_map((mm_reg_t *)&d->cm_regs,  V3D_CM_PHYS,  V3D_CM_SIZE,  K_MEM_CACHE_NONE);
 	if (!d->v3d_regs || !d->pm_regs || !d->asb_regs || !d->cm_regs) {
 		LOG_ERR("device_map failed: v3d=%p pm=%p asb=%p cm=%p",
-			d->v3d_regs, d->pm_regs, d->asb_regs, d->cm_regs);
+			(void *)d->v3d_regs, (void *)d->pm_regs,
+			(void *)d->asb_regs, (void *)d->cm_regs);
 		return -ENOMEM;
 	}
 	LOG_INF("device_map ok: v3d=%p pm=%p asb=%p cm=%p",
-		d->v3d_regs, d->pm_regs, d->asb_regs, d->cm_regs);
+		(void *)d->v3d_regs, (void *)d->pm_regs,
+		(void *)d->asb_regs, (void *)d->cm_regs);
 
 	/* Snapshot pre-anything register state. The ASB BRDG ID read is
 	 * Linux's sanity check (bcm2835_power_probe in
