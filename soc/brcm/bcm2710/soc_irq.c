@@ -51,6 +51,10 @@
 #include <zephyr/sys/sys_io.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/sys/util_macro.h>
+#ifdef CONFIG_FPU_SHARING
+#include <zephyr/kernel_structs.h>
+#include <kernel_arch_interface.h>
+#endif
 
 /* ----- BCM2836 ARM-local intc (base 0x40000000) ----- */
 #define L1_BASE                 DT_REG_ADDR(DT_INST(0, brcm_bcm2836_l1_intc))
@@ -127,12 +131,23 @@ static inline unsigned int this_core(void)
 	return (unsigned int)(mpidr & 0xffU);
 }
 
-/* ----- SMP scheduler IPI over the BCM2836 per-core mailboxes ----- */
+/* ----- SMP scheduler + FPU-flush IPIs over the BCM2836 mailboxes ----- */
 #define L1_MBOX_SET(c)          (L1_BASE + 0x80 + (c) * 0x10)  /* mbox0 write-set */
 #define L1_MBOX_RDCLR(c)        (L1_BASE + 0xc0 + (c) * 0x10)  /* mbox0 read/clear */
-#define IPI_IRQ                 4  /* BCM2836_LOCAL_IRQ_MAILBOX0 -> scheduler IPI */
+#define IPI_IRQ                 4  /* BCM2836_LOCAL_IRQ_MAILBOX0 */
+
+/*
+ * IPI types are bits within mailbox 0, Linux-style (irq-bcm2836.c keeps
+ * all its IPIs in mailbox 0 too). One mailbox means one MBOX_INT_CTRL
+ * enable covers every IPI type -- no extra per-core unmask to forget.
+ */
+#define MBOX0_IPI_SCHED         BIT(0)
+#define MBOX0_IPI_FPU           BIT(1)
 
 extern void sched_ipi_handler(const void *unused);
+#ifdef CONFIG_FPU_SHARING
+extern void flush_fpu_ipi_handler(const void *unused);
+#endif
 
 static void mbox0_ipi_isr(const void *arg)
 {
@@ -156,6 +171,18 @@ static void mbox0_ipi_isr(const void *arg)
 		sys_write32(mbox, L1_MBOX_RDCLR(this_core()));
 	}
 	sched_ipi_handler(NULL);
+#ifdef CONFIG_FPU_SHARING
+	/*
+	 * FPU flush LAST: flush_fpu_ipi_handler() masks IRQs at DAIF and
+	 * deliberately leaves them masked (exception return restores the
+	 * interrupted context's DAIF). Anything dispatched after it would
+	 * run with IRQs masked inside an isr_wrapper that expects them
+	 * unmasked for nesting.
+	 */
+	if ((mbox & MBOX0_IPI_FPU) != 0U) {
+		flush_fpu_ipi_handler(NULL);
+	}
+#endif
 }
 
 /* Raise the scheduler IPI on the target core by setting its mailbox 0. */
@@ -163,24 +190,45 @@ void soc_sched_ipi(uint64_t target_mpidr)
 {
 	unsigned int core = (unsigned int)(target_mpidr & 0xffU);
 
-	sys_write32(BIT(0), L1_MBOX_SET(core));
+	sys_write32(MBOX0_IPI_SCHED, L1_MBOX_SET(core));
 }
 
+#ifdef CONFIG_FPU_SHARING
+/* Raise the FPU-flush IPI on the target core (arch_flush_fpu_ipi hook). */
+void soc_flush_fpu_ipi(uint64_t target_mpidr)
+{
+	unsigned int core = (unsigned int)(target_mpidr & 0xffU);
+
+	sys_write32(MBOX0_IPI_FPU, L1_MBOX_SET(core));
+}
+#endif
+
 /*
- * Strong override of the __weak arch_spin_relax in kernel/idle.c.
- * The default asserts !arch_cpu_irqs_are_enabled(), which is the right
- * invariant for the in-tree callers (k_spin_lock, z_smp_global_lock,
- * thread_halt_spin, z_sched_switch_spin all relax with IRQs masked).
- * The arm64 GIC build supplies a non-asserting variant under
- * CONFIG_FPU_SHARING (arch/arm64/core/smp.c) to drain the FPU IPI
- * during a contended spin; this prototype runs FPU_SHARING off, so
- * the __weak default applies and its assertion fires on any path
- * that relaxes outside an irq lock. Provide a plain relax that
- * mirrors the FPU_SHARING shape but without the GIC-specific
- * bookkeeping (which doesn't exist here).
+ * Strong override of the __weak arch_spin_relax in kernel/idle.c (the
+ * arm64 GIC variant is compiled out under a custom interrupt
+ * controller). The __weak default asserts !arch_cpu_irqs_are_enabled(),
+ * which trips on SMP bring-up paths that relax with IRQs unmasked.
+ *
+ * With FPU_SHARING this must also drain a pending FPU-flush IPI, for
+ * the same reason as the GIC variant: a cpu spinning IRQs-masked on a
+ * lock cannot take the mailbox IRQ, but the lock holder may be waiting
+ * for this cpu's FPU content to be flushed -- deadlock unless the spin
+ * loop polls the mailbox manually. Reading L1_MBOX_RDCLR does not
+ * clear (write-1-to-clear only), so the peek is side-effect free, and
+ * clearing just MBOX0_IPI_FPU leaves a concurrently-raised scheduler
+ * bit pending.
  */
 void arch_spin_relax(void)
 {
+#ifdef CONFIG_FPU_SHARING
+	unsigned int core = this_core();
+
+	if ((sys_read32(L1_MBOX_RDCLR(core)) & MBOX0_IPI_FPU) != 0U) {
+		sys_write32(MBOX0_IPI_FPU, L1_MBOX_RDCLR(core));
+		/* May not be in IRQ context: no arch_flush_local_fpu() here. */
+		arch_float_disable(_current_cpu->arch.fpu_owner);
+	}
+#endif
 	arch_nop();
 }
 
