@@ -20,6 +20,10 @@
 		zephyr,shell-uart = &uart1;
 		zephyr,sram = &sram0;
 		zephyr,entropy = &rng;
+		/* The OUTER zephyr,bt-hci-uart node (the H:4 driver), not the
+		 * inner vendor node. Unused unless CONFIG_BT.
+		 */
+		zephyr,bt-hci = &bt_hci_uart;
 	};
 
 	aliases {
@@ -40,6 +44,34 @@
 	pinctrl-0 = <&uart1_gpio14>;
 	current-speed = <115200>;
 	status = "okay";
+};
+
+/* PL011 uart0 -> on-module CYW43436 Bluetooth HCI. A board-level fact
+ * like the SDIO wireless below: GPIO 32/33 TXD0/RXD0 + GPIO 30/31
+ * CTS0/RTS0 (ALT3, internal to the module -- not on the header), and
+ * BT_REG_ON on GPIO 45 = bank1 pin 17 (sequenced by the AIROC driver).
+ * Inert without CONFIG_BT: the H:4 + AIROC drivers are only compiled
+ * with the BT stack; for everyone else uart0 just sits idle on the
+ * internal pins. Baud stays 115200 -- fw-download-speed and
+ * hci-operation-speed are deliberately omitted so the driver never
+ * re-rates the UART. The PL011 drives real RTS/CTS (hw-flow-control).
+ */
+&uart0 {
+	status = "okay";
+	current-speed = <115200>;
+	hw-flow-control;
+	pinctrl-0 = <&uart0_ctsrts_gpio32>;
+	pinctrl-names = "default";
+
+	bt_hci_uart: bt_hci_uart {
+		compatible = "zephyr,bt-hci-uart";
+		status = "okay";
+
+		bt_hci: bt-hci {
+			compatible = "infineon,bt-hci-uart";
+			bt-reg-on-gpios = <&gpio1 17 GPIO_ACTIVE_HIGH>;
+		};
+	};
 };
 
 /*

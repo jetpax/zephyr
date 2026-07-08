@@ -113,7 +113,6 @@ LOG_MODULE_REGISTER(sdhc_bcm2835_sdhost, CONFIG_SDHC_LOG_LEVEL);
 
 /* ===== FIFO / timing constants ==================================== */
 #define SDDATA_FIFO_WORDS	16
-#define SDDATA_FIFO_PIO_BURST	8
 #define FIFO_READ_THRESHOLD	4
 #define FIFO_WRITE_THRESHOLD	4
 #define SDTOUT_RESET_VALUE	0x00f00000
@@ -176,29 +175,7 @@ static void sdhost_soft_reset(const struct device *dev)
 	sys_write32(SDVDD_POWER_ON, base + SDVDD);
 	k_msleep(SDHOST_POWER_SETTLE_MS);
 
-	/* SDHCFG bits to set at init and leave on:
-	 *
-	 * SLOW_CARD -- disables the controller's automatic ident->data
-	 *   clock-mode switch. Without it, the controller starts in 11-bit
-	 *   ident-mode divisor (low clock), then auto-switches to 3-bit
-	 *   data-mode divisor (potentially much higher clock) on the first
-	 *   data command. With max_clk=250 MHz, the smallest data-mode
-	 *   clock is ~27 MHz, which the card cannot follow if we last set
-	 *   the ident clock to 400 kHz. Symptom on Pi Zero W 2026-06-30:
-	 *   first FIFO load (≤16 words) succeeds at ident clock, then the
-	 *   auto-switched data clock loses the card and subsequent FIFO
-	 *   refills return zeros with sdhsts=0 -- exactly the 16-word
-	 *   boundary observed. Linux's set_ios comment: "Disable clever
-	 *   clock switching, to cope with fast core clocks."
-	 *
-	 * WIDE_INT_BUS -- host-internal data-path bus width. Linux always
-	 *   sets it; safe to mirror.
-	 *
-	 * DATA_IRPT_EN / BUSY_IRPT_EN -- Linux sets both before every data
-	 *   transfer. Leave on at init since we don't connect the IRQ line.
-	 */
-	data->hcfg = SDHCFG_SLOW_CARD | SDHCFG_WIDE_INT_BUS |
-		     SDHCFG_DATA_IRPT_EN | SDHCFG_BUSY_IRPT_EN;
+	data->hcfg = 0;
 	data->cdiv = SDCDIV_MAX_CDIV;
 	sys_write32(data->hcfg, base + SDHCFG);
 	sys_write32(data->cdiv, base + SDCDIV);
@@ -209,37 +186,33 @@ static int sdhost_wait_cmd_done(const struct device *dev, int timeout_ms)
 {
 	uintptr_t base = DEVICE_MMIO_GET(dev);
 	int64_t deadline = k_uptime_get() + timeout_ms;
-	uint32_t iters = 0;
 
 	while (sys_read32(base + SDCMD) & SDCMD_NEW_FLAG) {
 		if (k_uptime_get() > deadline) {
-			LOG_ERR("%s wait_cmd_done timeout: iters=%u "
-				"sdcmd=0x%08x edm=0x%08x sdhsts=0x%08x",
-				dev->name, iters,
-				sys_read32(base + SDCMD),
-				sys_read32(base + SDEDM),
-				sys_read32(base + SDHSTS));
 			return -ETIMEDOUT;
 		}
 		k_busy_wait(10);
-		iters++;
 	}
 	return 0;
 }
 
 /* ===== CMD12 STOP_TRANSMISSION (inline) ============================
- * Issued by the driver itself after the data phase of a multi-block
- * read/write. The SD subsystem deliberately leaves CMD12 to the host
- * driver (sd_ops.c::card_read comment). Without it, the controller's
- * FSM stays in READDATA/WRITEDATA and the next command's NEW_FLAG
- * poll times out -- which is exactly the symptom multi-block reads
- * hit before this was added.
+ * Issued by the driver after the data phase of a multi-block
+ * read/write. SDHBLC (programmed in request()) only sizes the host's
+ * FIFO engine -- it does NOT terminate the card's open-ended CMD18/
+ * CMD25 transfer. Without a CMD23/SBC (the SD subsystem never sends
+ * one) the card stays in the data/receive state until it gets CMD12,
+ * so the FSM stays in READDATA/WRITEDATA and sd_ops.c's post-transfer
+ * sdmmc_wait_ready() CMD13 poll never sees TRANSFER state ("Card did
+ * not return to ready state"). Mirrors Linux bcm2835-sdhost.c, which
+ * sends mrq->stop after data whenever SBC was not used.
  *
- * CMD12's protocol response type is R1b (card holds DAT0 low while
- * the stop completes). We treat it as R1 here: SDCMD_BUSYWAIT would
- * spin the controller on DAT0 with no IRQ-driven timeout, which can
- * hang. Instead we poll SDEDM until the FSM returns to IDENT, which
- * is the controller's signal that it has released the data path.
+ * CMD12's protocol response type is R1b (card holds DAT0 low while the
+ * stop completes). We treat it as R1 here: SDCMD_BUSYWAIT would spin
+ * the controller on DAT0 with no IRQ-driven timeout, which can hang.
+ * Instead we poll SDEDM until the FSM leaves the data states; the
+ * card's post-write programming busy is then absorbed by sd_ops.c's
+ * CMD13 wait loop.
  */
 static int sdhost_stop_transmission(const struct device *dev, int timeout_ms)
 {
@@ -258,7 +231,8 @@ static int sdhost_stop_transmission(const struct device *dev, int timeout_ms)
 	}
 
 	/* Drain the response register; we don't surface card state to the
-	 * SD subsystem since CMD12 here is invisible to the caller. */
+	 * SD subsystem since CMD12 here is invisible to the caller.
+	 */
 	(void)sys_read32(base + SDRSP0);
 
 	deadline = k_uptime_get() + timeout_ms;
@@ -267,13 +241,11 @@ static int sdhost_stop_transmission(const struct device *dev, int timeout_ms)
 
 		edm = sys_read32(base + SDEDM);
 		fsm = edm & SDEDM_FSM_MASK;
-		/* IDENT or DATAMODE both mean "controller has left the
-		 * data path and can accept the next command" -- successful
-		 * single-block reads also exit with FSM=DATAMODE. R1b's
-		 * card-side DAT0 busy can keep the FSM in DATAMODE for
-		 * longer than IDENT alone would tolerate. The error cases
-		 * we still want to catch are the real data states
-		 * (READDATA / WRITEDATA / READWAIT / READCRC / etc.) --
+		/* IDENT or DATAMODE both mean "controller has left the data
+		 * path and can accept the next command". R1b's card-side DAT0
+		 * busy can keep the FSM in DATAMODE longer than IDENT alone
+		 * would tolerate. The states we still want to catch are the
+		 * real data states (READDATA / WRITEDATA / READWAIT / etc.) --
 		 * those mean CMD12 didn't actually stop the transfer.
 		 */
 		if (fsm == SDEDM_FSM_IDENTMODE || fsm == SDEDM_FSM_DATAMODE) {
@@ -286,8 +258,9 @@ static int sdhost_stop_transmission(const struct device *dev, int timeout_ms)
 		k_busy_wait(10);
 	}
 
-	/* Belt and braces: zero SDHBLC so the next data CMD starts from a
-	 * clean block counter. Mirrors Linux's bcm2835-sdhost. */
+	/* Zero SDHBLC so the next data command starts from a clean block
+	 * counter. Mirrors Linux's bcm2835-sdhost.
+	 */
 	sys_write32(0, base + SDHBLC);
 
 	LOG_DBG("%s CMD12 ok edm=0x%08x", dev->name, edm);
@@ -311,7 +284,8 @@ static int sdhost_data_direction(const struct sdhc_command *cmd, bool *is_read)
 						 *          which is non-data;
 						 *          this case only fires
 						 *          when data != NULL, so
-						 *          unambiguous) */
+						 *          unambiguous)
+						 */
 	case SD_APP_SEND_SCR:			/* ACMD51 -- 8-byte SCR */
 	case SD_APP_SEND_NUM_WRITTEN_BLK:	/* ACMD22 -- 4-byte count */
 		*is_read = true;
@@ -326,7 +300,8 @@ static int sdhost_data_direction(const struct sdhc_command *cmd, bool *is_read)
 	default:
 		/* Unrecognised data-phase opcode -- refuse rather than
 		 * guess a direction (a wrong direction on a write would
-		 * leave the card holding bytes we never sent). */
+		 * leave the card holding bytes we never sent).
+		 */
 		return -EINVAL;
 	}
 }
@@ -351,7 +326,8 @@ static int sdhost_pio_xfer(const struct device *dev, struct sdhc_data *data,
 		/* Word-paced FIFO; partial-word blocks would need a
 		 * scratch-word read with byte-shift unpacking. SD spec
 		 * blocks are always multiples of 4 so refuse rather than
-		 * carry dead code. */
+		 * carry dead code.
+		 */
 		return -EINVAL;
 	}
 
@@ -364,21 +340,8 @@ static int sdhost_pio_xfer(const struct device *dev, struct sdhc_data *data,
 			uint32_t fifo_ready = is_read ? fifo_used
 						      : (SDDATA_FIFO_WORDS -
 							 fifo_used);
-			/* Mirror Linux's bcm2835-sdhost.c: drain (or fill) in
-			 * fixed bursts of SDDATA_FIFO_PIO_BURST words, not
-			 * piecemeal. Reading SDDATA when fewer than `burst`
-			 * words are committed returns zeros / stale data on
-			 * BCM2835/ARMv6 (proven on Pi Zero W 2026-06-30 -- a
-			 * 512-byte read returned 128 zero words with sdhsts=0).
-			 * On AArch64 the CPU was fast enough that by the time
-			 * `fifo_used` was sampled, a full burst had always
-			 * landed -- which masked the bug.
-			 */
-			uint32_t burst = SDDATA_FIFO_PIO_BURST < words_left
-						 ? SDDATA_FIFO_PIO_BURST
-						 : words_left;
 
-			if (fifo_ready < burst) {
+			if (fifo_ready == 0) {
 				uint32_t fsm = edm & SDEDM_FSM_MASK;
 				bool fsm_active = is_read
 					? (fsm == SDEDM_FSM_READDATA ||
@@ -414,27 +377,24 @@ static int sdhost_pio_xfer(const struct device *dev, struct sdhc_data *data,
 				continue;
 			}
 
-			uint32_t do_words = burst;
-
-			/* Ack DATA_FLAG before draining: Linux's IRQ handler
-			 * W1Cs DATA_FLAG before reading the FIFO. Mirror it
-			 * defensively even though our polled path doesn't
-			 * strictly require it.
-			 */
-			sys_write32(SDHSTS_DATA_FLAG, base + SDHSTS);
+			uint32_t do_words = fifo_ready < words_left
+						    ? fifo_ready
+						    : words_left;
 
 			for (uint32_t i = 0; i < do_words; i++) {
 				if (is_read) {
 					uint32_t w = sys_read32(base + SDDATA);
 
-					/* Buffers from FATFS / SD subsystem are
-					 * 4-byte aligned. Aligned word store is
-					 * faster than 4 byte stores and avoids
-					 * ARMv6 write-buffer surprises.
-					 */
-					*(uint32_t *)buf = w;
+					buf[0] = w & 0xff;
+					buf[1] = (w >> 8) & 0xff;
+					buf[2] = (w >> 16) & 0xff;
+					buf[3] = (w >> 24) & 0xff;
 				} else {
-					uint32_t w = *(const uint32_t *)buf;
+					uint32_t w =
+						(uint32_t)buf[0] |
+						((uint32_t)buf[1] << 8) |
+						((uint32_t)buf[2] << 16) |
+						((uint32_t)buf[3] << 24);
 
 					sys_write32(w, base + SDDATA);
 				}
@@ -443,6 +403,43 @@ static int sdhost_pio_xfer(const struct device *dev, struct sdhc_data *data,
 			}
 		}
 		blocks_left--;
+	}
+
+	/* WRITE drain gate. The fill loop above returns the instant the last
+	 * word is pushed into the FIFO, but the controller is still clocking
+	 * up to a full FIFO (16 words) out to the card. On a multi-block
+	 * write the caller issues CMD12 next; if we return before the FIFO
+	 * drains, CMD12 stops the card mid-block and silently truncates the
+	 * tail of the final block (~1 FIFO deep, last block of every
+	 * transfer). Linux gates this on the BLOCK_IRPT interrupt; polled, we
+	 * wait for the FSM to leave the write-data states. Mirrors Linux's
+	 * bcm2835_sdhost_wait_transfer_complete().
+	 */
+	if (!is_read) {
+		while (true) {
+			uint32_t edm = sys_read32(base + SDEDM);
+			uint32_t fsm = edm & SDEDM_FSM_MASK;
+
+			if (fsm == SDEDM_FSM_IDENTMODE ||
+			    fsm == SDEDM_FSM_DATAMODE) {
+				break;
+			}
+			/* WRITESTART1 is the write-path idle the controller can
+			 * park in once the data is sent; nudge it to data mode
+			 * exactly as Linux does, then treat it as done.
+			 */
+			if (fsm == SDEDM_FSM_WRITESTART1) {
+				sys_write32(edm | SDEDM_FORCE_DATA_MODE,
+					    base + SDEDM);
+				break;
+			}
+			if (k_uptime_get() > deadline) {
+				LOG_ERR("PIO write drain: FSM stuck edm=0x%08x",
+					edm);
+				return -ETIMEDOUT;
+			}
+			k_busy_wait(10);
+		}
 	}
 
 	sdhsts = sys_read32(base + SDHSTS);
@@ -471,23 +468,23 @@ static int sdhost_pio_xfer(const struct device *dev, struct sdhc_data *data,
  */
 static uint32_t sdhost_calc_clk_div(uint32_t clk_in, uint32_t target_hz)
 {
-	uint32_t div;
+	uint32_t cdiv;
 
 	if (target_hz == 0 || target_hz >= clk_in / 2) {
 		return 0;
 	}
-	div = clk_in / target_hz;
-	if (div < 2) {
-		div = 2;
+	cdiv = clk_in / target_hz;
+	if (cdiv < 2) {
+		cdiv = 2;
 	}
-	if ((clk_in / div) > target_hz) {
-		div++;
+	if ((clk_in / cdiv) > target_hz) {
+		cdiv++;
 	}
-	div -= 2;
-	if (div > SDCDIV_MAX_CDIV) {
-		div = SDCDIV_MAX_CDIV;
+	cdiv -= 2;
+	if (cdiv > SDCDIV_MAX_CDIV) {
+		cdiv = SDCDIV_MAX_CDIV;
 	}
-	return div;
+	return cdiv;
 }
 
 static int sdhc_bcm2835_sdhost_reset(const struct device *dev)
@@ -502,7 +499,7 @@ static int sdhc_bcm2835_sdhost_set_io(const struct device *dev,
 	const struct sdhc_bcm2835_sdhost_config *cfg = dev->config;
 	struct sdhc_bcm2835_sdhost_data *data = dev->data;
 	uintptr_t base = DEVICE_MMIO_GET(dev);
-	uint32_t div;
+	uint32_t cdiv;
 
 	/* Reject targets outside the host's claimed range; the SDHC API
 	 * caller relies on this to discover bus capability.
@@ -518,10 +515,10 @@ static int sdhc_bcm2835_sdhost_set_io(const struct device *dev,
 	/* Clock divider. SDCDIV gates and re-arms the bus clock; SDHost
 	 * has no separate enable bit. Target 0 -> slowest divider.
 	 */
-	div = (ios->clock == 0) ? SDCDIV_MAX_CDIV
-				: sdhost_calc_clk_div(cfg->clock_freq, ios->clock);
-	data->cdiv = div;
-	sys_write32(div, base + SDCDIV);
+	cdiv = (ios->clock == 0) ? SDCDIV_MAX_CDIV
+				 : sdhost_calc_clk_div(cfg->clock_freq, ios->clock);
+	data->cdiv = cdiv;
+	sys_write32(cdiv, base + SDCDIV);
 
 	/* Power: bit 0 of SDVDD. SDHost is 3.3V-only; signal_voltage
 	 * field is ignored (the only meaningful value is SD_VOL_3_3_V).
@@ -587,12 +584,8 @@ static int sdhc_bcm2835_sdhost_request(const struct device *dev,
 	 */
 	ret = sdhost_wait_cmd_done(dev, cmd_timeout_ms);
 	if (ret != 0) {
-		LOG_ERR("%s CMD%u: previous command never completed "
-			"sdcmd=0x%08x edm=0x%08x sdhsts=0x%08x",
-			dev->name, cmd->opcode,
-			sys_read32(base + SDCMD),
-			sys_read32(base + SDEDM),
-			sys_read32(base + SDHSTS));
+		LOG_ERR("%s CMD%u: previous command never completed",
+			dev->name, cmd->opcode);
 		return ret;
 	}
 
@@ -623,7 +616,8 @@ static int sdhc_bcm2835_sdhost_request(const struct device *dev,
 		/* Short 48-bit response. SDHost handles CRC + index check
 		 * decisions automatically based on the opcode; we don't
 		 * need explicit toggles like SDHCI's CMDTM_CRC_CHECK /
-		 * INDEX_CHECK. */
+		 * INDEX_CHECK.
+		 */
 		break;
 	case SD_RSP_TYPE_R1b:
 	case SD_RSP_TYPE_R5b:
@@ -633,7 +627,8 @@ static int sdhc_bcm2835_sdhost_request(const struct device *dev,
 		 * can hang. Refuse for now -- matches the Arasan v1
 		 * driver. Callers (e.g. CMD7) can request R1; the next
 		 * command will inhibit until the card finishes whatever
-		 * R1b would have waited for. */
+		 * R1b would have waited for.
+		 */
 		return -ENOTSUP;
 	default:
 		return -EINVAL;
@@ -662,7 +657,8 @@ static int sdhc_bcm2835_sdhost_request(const struct device *dev,
 	}
 
 	/* Re-read SDCMD; FAIL_FLAG signals the controller hit a CRC /
-	 * timeout / etc. error during the command. */
+	 * timeout / etc. error during the command.
+	 */
 	sdcmd = sys_read32(base + SDCMD);
 	if (sdcmd & SDCMD_FAIL_FLAG) {
 		sdhsts = sys_read32(base + SDHSTS);
@@ -671,7 +667,8 @@ static int sdhc_bcm2835_sdhost_request(const struct device *dev,
 		if (sdhsts & SDHSTS_CMD_TIME_OUT) {
 			/* CMD8 on legacy SD 1.x cards times out by spec;
 			 * the sd subsystem retries with the legacy path.
-			 * Don't spam ERR for the expected case. */
+			 * Don't spam ERR for the expected case.
+			 */
 			LOG_DBG("%s CMD%u arg=0x%08x: timeout (sdhsts=0x%08x)",
 				dev->name, cmd->opcode, cmd->arg, sdhsts);
 			return -ETIMEDOUT;
@@ -701,12 +698,9 @@ static int sdhc_bcm2835_sdhost_request(const struct device *dev,
 			return ret;
 		}
 
-		/* Multi-block CMD18/CMD25 don't auto-stop -- the card keeps
-		 * streaming (or expecting writes) until host issues CMD12.
-		 * Without this, the controller's FSM stays in READDATA /
-		 * WRITEDATA and the next command's NEW_FLAG poll times out.
-		 * SD subsystem leaves CMD12 to the host driver (sd_ops.c
-		 * card_read() comment).
+		/* Multi-block CMD18/CMD25 need an explicit CMD12 to return the
+		 * card to the transfer state (SDHBLC only bounds the host FIFO
+		 * engine). Single-block CMD17/CMD24 auto-stop, so no CMD12.
 		 */
 		if (cmd->opcode == SD_READ_MULTIPLE_BLOCK ||
 		    cmd->opcode == SD_WRITE_MULTIPLE_BLOCK) {
