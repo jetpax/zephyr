@@ -160,6 +160,17 @@
 #define SPI0_MOSI_GPIO10  BCM2711_PINMUX(10, BCM2711_FSEL_ALT0)
 #define SPI0_SCLK_GPIO11  BCM2711_PINMUX(11, BCM2711_FSEL_ALT0)
 
+/* PWM pinmux. The BCM283x PWM block's two channels reach the 40-pin
+ * header on GPIO 12 / 13 (ALT0) and GPIO 18 / 19 (ALT5). The ALT5
+ * pair overlaps the PCM / I2S pins below -- boards pick one. GPIO
+ * 40/41/45 also carry PWM but are the analog-audio path, not header
+ * pins.
+ */
+#define PWM0_GPIO12       BCM2711_PINMUX(12, BCM2711_FSEL_ALT0)
+#define PWM1_GPIO13       BCM2711_PINMUX(13, BCM2711_FSEL_ALT0)
+#define PWM0_GPIO18       BCM2711_PINMUX(18, BCM2711_FSEL_ALT5)
+#define PWM1_GPIO19       BCM2711_PINMUX(19, BCM2711_FSEL_ALT5)
+
 /* PCM / I2S pinmux definitions (GPIO 18..21, ALT0) */
 #define PCM_CLK_GPIO18    BCM2711_PINMUX(18, BCM2711_FSEL_ALT0)
 #define PCM_FS_GPIO19     BCM2711_PINMUX(19, BCM2711_FSEL_ALT0)
