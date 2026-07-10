@@ -1,0 +1,69 @@
+# Copyright (c) 2026 Jonathan Elliot Peace <jep@alphabetiq.com>
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Broadcom BCM2835 / BCM2710 / BCM2837 PWM controller.
+
+  Same silicon block Linux binds with "brcm,bcm2835-pwm" -- one PWM
+  block with two output channels sharing a reference clock. The
+  driver runs the block in mark:space mode; the serialiser / FIFO
+  (audio) mode is out of scope.
+
+  Two register windows: the PWM block itself and the CM_PWM slice of
+  the clock manager (CM_PWMCTL / CM_PWMDIV), which the driver
+  programs directly -- 19.2 MHz crystal oscillator source divided by
+  an integer divisor chosen from clock-frequency. Direct programming
+  mirrors the vendor driver; moving it behind a Zephyr clock-control
+  provider is a possible follow-up.
+
+  Channel 0 is the datasheet's PWM0 (RNG1/DAT1, GPIO 12 ALT0 or
+  GPIO 18 ALT5), channel 1 is PWM1 (RNG2/DAT2, GPIO 13 ALT0 or
+  GPIO 19 ALT5). GPIO 40/41/45 also reach the block but carry the
+  analog audio path on Pi boards and are not on the 40-pin header.
+
+compatible: "brcm,bcm2835-pwm"
+
+include: [pwm-controller.yaml, pinctrl-device.yaml, base.yaml]
+
+properties:
+  reg:
+    required: true
+
+  reg-names:
+    required: true
+    description: |
+      Must be "pwm" (the PWM block) and "cm" (the two-register
+      CM_PWM clock-manager slice), in that order.
+
+  clock-frequency:
+    type: int
+    required: true
+    description: |
+      Requested reference-clock (counter tick) rate in Hz. The
+      driver rounds it to the nearest integer division of the
+      oscillator; the resulting divisor must land in 2..4095. Period
+      and pulse handed to pwm_set_cycles() are in ticks of this
+      clock, and pwm_get_cycles_per_sec() reports the actual rate
+      after rounding.
+
+  oscillator-frequency:
+    type: int
+    default: 19200000
+    description: |
+      Crystal oscillator rate in Hz feeding the CM_PWM divider.
+      19.2 MHz on every BCM2835/2710/2837 board; the property exists
+      for family members with a different crystal.
+
+  "#pwm-cells":
+    const: 3
+
+pwm-cells:
+  - channel
+  - period
+  - flags
+
+# pinctrl-0 / pinctrl-names come from pinctrl-device.yaml. They are
+# intentionally not required here -- a board may route PWM to pins
+# via pinctrl at init, or omit pinctrl-0 and mux imperatively at
+# runtime. See the layered board-config notes alongside the SPI and
+# SDHost bindings.

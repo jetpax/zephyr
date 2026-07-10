@@ -1,0 +1,16 @@
+# Broadcom BCM2835 PWM controller
+#
+# Copyright (c) 2026 Jonathan Elliot Peace <jep@alphabetiq.com>
+# SPDX-License-Identifier: Apache-2.0
+
+config PWM_BCM2835
+	bool "Broadcom BCM2835 PWM driver"
+	default y
+	depends on DT_HAS_BRCM_BCM2835_PWM_ENABLED
+	select PINCTRL
+	help
+	  Enable the driver for the BCM2835 / BCM2710 / BCM2837 PWM
+	  controller on the Raspberry Pi family -- one block with two
+	  output channels, run in mark:space mode. The driver programs
+	  the CM_PWM clock-manager slice directly (19.2 MHz oscillator
+	  source, integer divisor).
