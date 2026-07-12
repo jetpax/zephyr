@@ -126,6 +126,53 @@
 		};
 	};
 
+	/* PWM on the 40-pin header. GPIO 12/13 (ALT0) is the
+	 * conflict-free pair; the GPIO 18/19 (ALT5) alternative
+	 * overlaps the I2S / PCM pins below. pwm_gpio12 / pwm_gpio18
+	 * route both channels (pin order = channel order); the
+	 * single-channel groups follow for boards that use only one.
+	 * NOTE: this SoC family's pinctrl consumes exactly ONE group
+	 * phandle per pinctrl-N state (extra phandles are silently
+	 * ignored) -- pick one group, never list two.
+	 */
+	pwm_gpio12: pwm-gpio12 {
+		group1 {
+			pinmux = <PWM0_GPIO12>,
+				 <PWM1_GPIO13>;
+		};
+	};
+
+	pwm_gpio18: pwm-gpio18 {
+		group1 {
+			pinmux = <PWM0_GPIO18>,
+				 <PWM1_GPIO19>;
+		};
+	};
+
+	pwm0_gpio12: pwm0-gpio12 {
+		group1 {
+			pinmux = <PWM0_GPIO12>;
+		};
+	};
+
+	pwm1_gpio13: pwm1-gpio13 {
+		group1 {
+			pinmux = <PWM1_GPIO13>;
+		};
+	};
+
+	pwm0_gpio18: pwm0-gpio18 {
+		group1 {
+			pinmux = <PWM0_GPIO18>;
+		};
+	};
+
+	pwm1_gpio19: pwm1-gpio19 {
+		group1 {
+			pinmux = <PWM1_GPIO19>;
+		};
+	};
+
 	i2s_gpio18: i2s-gpio18 {
 		group1 {
 			pinmux = <PCM_CLK_GPIO18>,

@@ -256,6 +256,26 @@
 			status = "disabled";
 		};
 
+		/*
+		 * PWM controller -- one block, two channels, run in
+		 * mark:space mode. The second reg window is the CM_PWM
+		 * clock-manager slice the driver programs directly
+		 * (19.2 MHz crystal oscillator source -- stable regardless
+		 * of core_freq, unlike PLLD). clock-frequency is the
+		 * requested counter tick rate; 9.6 MHz = oscillator / 2 is
+		 * the highest jitter-free rate. Channel 0 = PWM0 (GPIO 12
+		 * ALT0 / GPIO 18 ALT5), channel 1 = PWM1 (GPIO 13 ALT0 /
+		 * GPIO 19 ALT5); boards opt in with a pinctrl group.
+		 */
+		pwm0: pwm@3f20c000 {
+			compatible = "brcm,bcm2835-pwm";
+			reg = <0x3f20c000 0x28>, <0x3f1010a0 0x8>;
+			reg-names = "pwm", "cm";
+			clock-frequency = <9600000>;
+			#pwm-cells = <3>;
+			status = "disabled";
+		};
+
 		uart1: uart@3f215040 {
 			compatible = "brcm,bcm2711-aux-uart";
 			reg = <0x3f215040 0x40>;

@@ -63,13 +63,23 @@ int pinctrl_configure_pins(const pinctrl_soc_pin_t *pins, uint8_t pin_cnt, uintp
 {
 	ARG_UNUSED(reg);
 
-	uintptr_t base;
+	/*
+	 * Map the register window once and cache it. device_map() hands
+	 * out a fresh virtual mapping per call with no unmap on this
+	 * path, so mapping per call leaks virtual address space --
+	 * fatal for callers that reconfigure pins continuously (e.g.
+	 * ArduinoCore's analogWrite re-muxes its pin on every call;
+	 * ~40 s at 33 calls/s exhausted the Pi Zero W's VA space).
+	 */
+	static uintptr_t base;
 
 	if (!pins || pin_cnt == 0) {
 		return -EINVAL;
 	}
 
-	device_map(&base, BCM2711_PINCTRL_BASE_ADDR, 0x100, K_MEM_CACHE_NONE);
+	if (base == 0) {
+		device_map(&base, BCM2711_PINCTRL_BASE_ADDR, 0x100, K_MEM_CACHE_NONE);
+	}
 
 	for (uint8_t i = 0; i < pin_cnt; i++) {
 		uint8_t pin = pins[i].pin;
