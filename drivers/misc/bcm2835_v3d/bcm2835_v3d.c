@@ -755,6 +755,18 @@ int bcm2835_v3d_kernel_load_unif_f32(struct bcm2835_v3d_kernel *k,
 	return bcm2835_v3d_kernel_load_unif_u32(k, qpu, cvt.u);
 }
 
+uint32_t bcm2835_v3d_kernel_unif_bus_addr(const struct bcm2835_v3d_kernel *k,
+                                          uint32_t qpu)
+{
+	if (k == NULL || qpu >= k->num_qpus) {
+		return 0;
+	}
+	/* Same value the SRQ launch message uses: the bus address of this
+	 * QPU's uniform block, computed in kernel_init.
+	 */
+	return k->mbox_msg[qpu * 2];
+}
+
 int bcm2835_v3d_kernel_execute_async(const struct device *dev,
                                      struct bcm2835_v3d_kernel *k)
 {

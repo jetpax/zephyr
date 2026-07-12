@@ -160,6 +160,18 @@ int bcm2835_v3d_kernel_load_unif_f32(struct bcm2835_v3d_kernel *k,
                                      uint32_t qpu, float val);
 
 /**
+ * @brief Bus address of QPU @p qpu's uniform block.
+ *
+ * For kernels compiled with the work-group-loop optimisation, the QPU
+ * re-reads its uniforms each work-group from a self-referential
+ * "uniform address" uniform. Callers load this value into that slot.
+ *
+ * @return Bus address, or 0 if @p k is NULL or @p qpu is out of range.
+ */
+uint32_t bcm2835_v3d_kernel_unif_bus_addr(const struct bcm2835_v3d_kernel *k,
+                                          uint32_t qpu);
+
+/**
  * @brief Kick the kernel on all @c num_qpus QPUs and busy-wait until
  *        every QPU reports completion via SRQCS.
  */
