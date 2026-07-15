@@ -194,6 +194,55 @@ int bcm2835_v3d_kernel_wait(const struct device *dev,
                             struct bcm2835_v3d_kernel *k,
                             uint32_t timeout_us);
 
+/**
+ * @brief Timing / binner-pool numbers from one @ref bcm2835_v3d_cl_submit.
+ *
+ * bpca/bpcs are raw reads of V3D_BPCA (current binning-pool allocation
+ * pointer, a bus address) and V3D_BPCS (bytes remaining in the pool)
+ * taken after the binning pass completes; the caller knows the pool
+ * base/size it wrote into the Tile Binning Mode Configuration record,
+ * so pool high-water = pool_size - bpcs.
+ */
+struct bcm2835_v3d_cl_stats {
+	uint32_t bin_us;   /* wall time of the binning pass */
+	uint32_t rdr_us;   /* wall time of the rendering pass */
+	uint32_t bpca;     /* V3D_BPCA after binning */
+	uint32_t bpcs;     /* V3D_BPCS after binning */
+};
+
+/**
+ * @brief Execute one frame: a binning control list on CLE thread 0,
+ *        then a rendering control list on CLE thread 1.
+ *
+ * The two passes are serialised in software (bin completion is awaited
+ * via V3D_BFC before the render list is kicked) rather than with CL
+ * semaphores -- slower by a scheduling epsilon, but each pass fails
+ * individually with its own register dump, which is what bring-up
+ * wants.
+ *
+ * All four addresses are V3D bus addresses of memory written through a
+ * @ref bcm2835_v3d_alloc_coherent mapping (or otherwise made visible
+ * to V3D before the call). The driver issues the DSB and drops V3D's
+ * L2/slice caches before kicking, mirroring the compute path.
+ *
+ * @param dev        v3d device.
+ * @param bin_ca     Bus address of the first byte of the binning list.
+ * @param bin_ea     Bus address one past the last byte of the binning list.
+ * @param rdr_ca     Bus address of the first byte of the rendering list.
+ * @param rdr_ea     Bus address one past the last byte of the rendering list.
+ * @param timeout_us Max microseconds to wait for each pass; 0 = forever.
+ * @param[out] stats Optional timing / binner-pool numbers.
+ *
+ * @retval 0          Both passes completed.
+ * @retval -ETIMEDOUT A pass did not complete (registers logged).
+ * @retval -EIO       CLE reported a control-thread error (registers logged).
+ */
+int bcm2835_v3d_cl_submit(const struct device *dev,
+                          uint32_t bin_ca, uint32_t bin_ea,
+                          uint32_t rdr_ca, uint32_t rdr_ea,
+                          uint32_t timeout_us,
+                          struct bcm2835_v3d_cl_stats *stats);
+
 #ifdef __cplusplus
 }
 #endif

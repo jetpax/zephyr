@@ -74,6 +74,34 @@ LOG_MODULE_REGISTER(bcm2835_v3d, CONFIG_BCM2835_V3D_LOG_LEVEL);
 #define V3D_IDENT1_NSEM(v)        (((v) >> V3D_IDENT1_NSEM_SHIFT) & 0xffu)
 #define V3D_L2CACTL  0x0020  /* L2 cache control */
 #define V3D_SLCACTL  0x0024  /* Slice cache control */
+
+/* Control List Executor (CLE) registers -- ARG section 10, Table 48.
+ * Thread 0 executes tile-binning lists, thread 1 tile-rendering lists.
+ */
+#define V3D_CT0CS    0x0100  /* Thread n control and status */
+#define V3D_CT1CS    0x0104
+#define V3D_CT0EA    0x0108  /* Thread n end address (write kicks a stopped thread) */
+#define V3D_CT1EA    0x010C
+#define V3D_CT0CA    0x0110  /* Thread n current address (write only when stopped) */
+#define V3D_CT1CA    0x0114
+#define V3D_CTNCS_CTRSTA BIT(15)  /* write 1: stop thread + reset register */
+#define V3D_CTNCS_CTRUN  BIT(5)
+#define V3D_CTNCS_CTERR  BIT(3)
+
+#define V3D_VPMBASE  0x0504  /* VPM base (user) memory reservation */
+
+#define V3D_PCS      0x0130  /* Pipeline control and status */
+#define V3D_PCS_BMOOM    BIT(8)   /* binner out of memory */
+#define V3D_BFC      0x0134  /* Binning mode flush count (write 1 clears) */
+#define V3D_RFC      0x0138  /* Rendering mode frame count (write 1 clears) */
+#define V3D_BPCA     0x0300  /* Current address of binning memory pool */
+#define V3D_BPCS     0x0304  /* Remaining size of binning memory pool */
+
+/* Error / diagnostic registers, dumped when a pass times out. */
+#define V3D_DBGE     0x0F00  /* PSE error signals */
+#define V3D_FDBGO    0x0F04  /* FEP overrun error signals */
+#define V3D_ERRSTAT  0x0F20  /* Miscellaneous error signals */
+
 #define V3D_SRQPC    0x0430  /* SRQ program counter (write = kick) */
 #define V3D_SRQUA    0x0434  /* SRQ uniforms address */
 #define V3D_SRQCS    0x043C  /* SRQ control/status */
@@ -864,6 +892,172 @@ int bcm2835_v3d_kernel_execute(const struct device *dev,
 	 * power-domain dropped, etc).
 	 */
 	return bcm2835_v3d_kernel_wait(dev, k, 1000000U);
+}
+
+/* ------------------------------------------------------------------ *
+ *  Control-list execution (3D fixed-function pipeline)
+ *
+ *  The compute path above uses the QPU scheduler queue directly; the
+ *  3D pipeline is instead driven by the Control List Executor. The
+ *  host builds a binning list and a rendering list in memory and
+ *  points a CLE thread at each: writing CTnCA (only legal while the
+ *  thread is stopped) arms the list, writing CTnEA starts it. The
+ *  thread advances CTnCA until it equals CTnEA. Completion is counted
+ *  in BFC (binning: increments when the PTB has flushed all tile
+ *  lists) and RFC (rendering: increments when the last tile store of
+ *  the frame lands in memory) -- ARG section 8.
+ * ------------------------------------------------------------------ */
+
+static void cl_dump_state(const struct device *dev, const char *tag, int thread)
+{
+	uint32_t cs  = v3d_read(dev, thread ? V3D_CT1CS : V3D_CT0CS);
+	uint32_t ca  = v3d_read(dev, thread ? V3D_CT1CA : V3D_CT0CA);
+	uint32_t ea  = v3d_read(dev, thread ? V3D_CT1EA : V3D_CT0EA);
+
+	LOG_ERR("[%s] CT%dCS=0x%08x (RUN=%d ERR=%d) CT%dCA=0x%08x CT%dEA=0x%08x",
+		tag, thread, cs, !!(cs & V3D_CTNCS_CTRUN), !!(cs & V3D_CTNCS_CTERR),
+		thread, ca, thread, ea);
+	LOG_ERR("[%s] PCS=0x%08x BFC=%u RFC=%u BPCA=0x%08x BPCS=%u",
+		tag, v3d_read(dev, V3D_PCS),
+		v3d_read(dev, V3D_BFC) & 0xFFu, v3d_read(dev, V3D_RFC) & 0xFFu,
+		v3d_read(dev, V3D_BPCA), v3d_read(dev, V3D_BPCS));
+	LOG_ERR("[%s] ERRSTAT=0x%08x DBGE=0x%08x FDBGO=0x%08x",
+		tag, v3d_read(dev, V3D_ERRSTAT),
+		v3d_read(dev, V3D_DBGE), v3d_read(dev, V3D_FDBGO));
+}
+
+/* Run one control list on CLE thread @n and busy-wait for @done_reg
+ * (BFC or RFC) to count it complete. Returns elapsed microseconds in
+ * *us_out on success.
+ */
+static int cl_run_thread(const struct device *dev, int n,
+                         uint32_t ca, uint32_t ea, uint32_t done_reg,
+                         uint32_t timeout_us, uint32_t *us_out)
+{
+	uint32_t cs_reg = n ? V3D_CT1CS : V3D_CT0CS;
+	uint32_t ca_reg = n ? V3D_CT1CA : V3D_CT0CA;
+	uint32_t ea_reg = n ? V3D_CT1EA : V3D_CT0EA;
+
+	/* Linux submit_cl() never resets a healthy thread -- it writes
+	 * CA then EA on the stopped-at-end thread and reserves CTRSTA
+	 * for error recovery. CTRSTA clears ALL thread state (including
+	 * the semaphore view), so a per-frame reset is a non-canonical
+	 * hardware state no other driver exercises.
+	 */
+	uint32_t cs = v3d_read(dev, cs_reg);
+
+	if (cs & V3D_CTNCS_CTRUN) {
+		LOG_WRN("CT%d still running before arm (CS=0x%08x); resetting",
+			n, cs);
+		v3d_write(dev, cs_reg, V3D_CTNCS_CTRSTA);
+	}
+	v3d_write(dev, done_reg, 1);
+	v3d_write(dev, ca_reg, ca);
+	v3d_write(dev, ea_reg, ea);
+
+	uint32_t start = k_cycle_get_32();
+	uint32_t cps   = (uint32_t)sys_clock_hw_cycles_per_sec();
+	uint64_t limit = (timeout_us == 0U)
+		? UINT64_MAX
+		: ((uint64_t)cps * timeout_us) / 1000000ULL;
+
+	for (;;) {
+		if ((v3d_read(dev, done_reg) & 0xFFu) != 0) {
+			break;
+		}
+		if (v3d_read(dev, cs_reg) & V3D_CTNCS_CTERR) {
+			cl_dump_state(dev, "CTERR", n);
+			return -EIO;
+		}
+		if ((uint64_t)(k_cycle_get_32() - start) > limit) {
+			cl_dump_state(dev, "timeout", n);
+			return -ETIMEDOUT;
+		}
+	}
+
+	if (us_out) {
+		uint32_t elapsed = k_cycle_get_32() - start;
+
+		*us_out = (uint32_t)(((uint64_t)elapsed * 1000000ULL) / cps);
+	}
+	return 0;
+}
+
+int bcm2835_v3d_cl_submit(const struct device *dev,
+                          uint32_t bin_ca, uint32_t bin_ea,
+                          uint32_t rdr_ca, uint32_t rdr_ea,
+                          uint32_t timeout_us,
+                          struct bcm2835_v3d_cl_stats *stats)
+{
+	int rc;
+	uint32_t bin_us = 0, rdr_us = 0;
+
+	/* Drain ARM-side writes to the Normal-NC buffers (lists, shader
+	 * code, shader record, vertex data, textures) before V3D reads
+	 * them -- same contract as the compute kick.
+	 */
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	/* Drop stale V3D-side cache state: L2C holds instruction/uniform
+	 * /texture lines from any previous frame or compute run.
+	 */
+	v3d_write(dev, V3D_L2CACTL, BIT(2));
+	v3d_write(dev, V3D_SLCACTL, 0xFFFFFFFFu);
+
+	/* Claim the whole VPM for the render pipeline. The 3D pipeline
+	 * stages vertex data through the VPM (NV mode: VCD loads shaded
+	 * vertices, PSE reads them back); a nonzero user-program VPM
+	 * reservation left by the firmware (BCM2710 boots this at 0x10)
+	 * skews that path and silently mangles per-tile coverage. Linux
+	 * vc4_v3d_init_hw() zeroes VPMBASE for the same reason.
+	 */
+	v3d_write(dev, V3D_VPMBASE, 0);
+
+	rc = cl_run_thread(dev, 0, bin_ca, bin_ea, V3D_BFC, timeout_us, &bin_us);
+	if (rc) {
+		return rc;
+	}
+
+	uint32_t bpca = v3d_read(dev, V3D_BPCA);
+	uint32_t bpcs = v3d_read(dev, V3D_BPCS);
+
+	/* R3 discipline: binner pool exhaustion is silent corruption in
+	 * the wild -- make it loud. (No overspill block is armed; a
+	 * frame that trips this needs a bigger pool.)
+	 */
+	if (v3d_read(dev, V3D_PCS) & V3D_PCS_BMOOM) {
+		LOG_ERR("binner OUT OF MEMORY (PCS=0x%08x BPCA=0x%08x BPCS=%u)",
+			v3d_read(dev, V3D_PCS), bpca, bpcs);
+		return -ENOMEM;
+	}
+
+	/* Drop L2C/slice caches again between the passes: the PTB has
+	 * just written tile lists + compressed primitives into the
+	 * binning pool, and the render-side CLE/FEP must not consume
+	 * stale lines for those addresses if any were allocated during
+	 * binning. (L2C is a read-path cache -- ARG s.4 -- so a clear
+	 * here cannot drop write data.)
+	 */
+	v3d_write(dev, V3D_L2CACTL, BIT(2));
+	v3d_write(dev, V3D_SLCACTL, 0xFFFFFFFFu);
+
+	rc = cl_run_thread(dev, 1, rdr_ca, rdr_ea, V3D_RFC, timeout_us, &rdr_us);
+	if (rc) {
+		return rc;
+	}
+
+	/* Order the RFC read against the caller's subsequent reads of
+	 * V3D-written memory (tile stores land via the V3D bus master).
+	 */
+	__asm__ volatile("dsb sy" ::: "memory");
+
+	if (stats) {
+		stats->bin_us = bin_us;
+		stats->rdr_us = rdr_us;
+		stats->bpca   = bpca;
+		stats->bpcs   = bpcs;
+	}
+	return 0;
 }
 
 /* ------------------------------------------------------------------ *
