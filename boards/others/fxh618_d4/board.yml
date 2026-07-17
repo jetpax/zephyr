@@ -1,0 +1,6 @@
+board:
+  name: fxh618_d4
+  full_name: FX-H618-D4 V10 TV Box
+  vendor: others
+  socs:
+  - name: sun50i_h618

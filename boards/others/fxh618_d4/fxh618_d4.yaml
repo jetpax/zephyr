@@ -1,0 +1,8 @@
+identifier: fxh618_d4
+name: FX-H618-D4 V10 TV Box
+type: mcu
+arch: arm64
+toolchain:
+  - zephyr
+vendor: others
+ram: 4096

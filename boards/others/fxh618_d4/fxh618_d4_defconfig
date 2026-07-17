@@ -1,0 +1,13 @@
+# Copyright (c) 2026 Jonathan E. Peace <jep@alphabetiq.com>
+# SPDX-License-Identifier: Apache-2.0
+CONFIG_SERIAL=y
+CONFIG_UART_INTERRUPT_DRIVEN=y
+CONFIG_CONSOLE=y
+CONFIG_UART_CONSOLE=y
+# FEL/reset64 boot has no BL31: Zephyr runs secure-world and owns the
+# GIC. ARMV8_A_NS needs a TF-A stage to move interrupts to Group 1 NS.
+CONFIG_CACHE_MANAGEMENT=y
+CONFIG_ARM64_DCACHE_ALL_OPS=y
+CONFIG_ARM64_BOOT_DISABLE_DCACHE=y
+# 2 GiB dram0 span leaves the default 8-table pool at 7/8
+CONFIG_MAX_XLAT_TABLES=16

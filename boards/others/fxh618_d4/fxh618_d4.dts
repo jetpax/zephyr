@@ -1,0 +1,36 @@
+/*
+ * Copyright (c) 2026 Jonathan E. Peace <jep@alphabetiq.com>
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/dts-v1/;
+
+#include <allwinner/sun50i-h618.dtsi>
+#include <common/mem.h>
+
+/ {
+	model = "FX-H618-D4 V10 TV box";
+	compatible = "fx,h618-d4", "allwinner,sun50i-h618";
+
+	chosen {
+		zephyr,console = &uart0;
+		zephyr,shell-uart = &uart0;
+		zephyr,sram = &dram0;
+	};
+
+	/*
+	 * 4 GiB fitted; Zephyr claims the low 2 GiB until the MMU
+	 * work sizes the map per DRAM variant.
+	 */
+	dram0: memory@40080000 {
+		device_type = "memory";
+		compatible = "mmio-sram";
+		reg = <0x40080000 DT_SIZE_M(2047)>;
+	};
+};
+
+&uart0 {
+	status = "okay";
+	current-speed = <115200>;
+};
