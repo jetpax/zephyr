@@ -20,13 +20,13 @@
 	};
 
 	/*
-	 * 4 GiB fitted; Zephyr claims the low 2 GiB until the MMU
-	 * work sizes the map per DRAM variant.
+	 * 4 GiB fitted. BL31 owns [0x40000000, 0x40040000); Zephyr
+	 * claims the rest of DRAM from its 0x40080000 entry point.
 	 */
 	dram0: memory@40080000 {
 		device_type = "memory";
 		compatible = "mmio-sram";
-		reg = <0x40080000 DT_SIZE_M(2047)>;
+		reg = <0x40080000 0xfff80000>;
 	};
 };
 

@@ -4,10 +4,19 @@ CONFIG_SERIAL=y
 CONFIG_UART_INTERRUPT_DRIVEN=y
 CONFIG_CONSOLE=y
 CONFIG_UART_CONSOLE=y
-# FEL/reset64 boot has no BL31: Zephyr runs secure-world and owns the
-# GIC. ARMV8_A_NS needs a TF-A stage to move interrupts to Group 1 NS.
+# The FEL chain carries TF-A BL31 at 0x40000000 (PSCI CPU_ON, GIC
+# interrupts moved to Group 1 NS); Zephyr enters at EL2 non-secure.
+# A non-secure build booted without BL31 comes up with all IRQs dead:
+# always write bl31-sun50i-h616.bin before reset64.
+CONFIG_ARMV8_A_NS=y
 CONFIG_CACHE_MANAGEMENT=y
 CONFIG_ARM64_DCACHE_ALL_OPS=y
 CONFIG_ARM64_BOOT_DISABLE_DCACHE=y
-# 2 GiB dram0 span leaves the default 8-table pool at 7/8
+# Quad Cortex-A53 released through PSCI (TF-A native power sequence)
+CONFIG_SMP=y
+CONFIG_PM_CPU_OPS=y
+# dram0 runs 0x40080000..0x140000000: the span crosses the 32-bit
+# boundary, so both address widths step up to 36 bits.
+CONFIG_ARM64_VA_BITS_36=y
+CONFIG_ARM64_PA_BITS_36=y
 CONFIG_MAX_XLAT_TABLES=16
