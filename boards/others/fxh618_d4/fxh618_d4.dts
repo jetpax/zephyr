@@ -19,6 +19,10 @@
 		zephyr,sram = &dram0;
 	};
 
+	aliases {
+		sdhc0 = &smhc0;
+	};
+
 	/*
 	 * 4 GiB fitted. BL31 owns [0x40000000, 0x40040000); Zephyr
 	 * claims the rest of DRAM from its 0x40080000 entry point.
@@ -33,4 +37,18 @@
 &uart0 {
 	status = "okay";
 	current-speed = <115200>;
+};
+
+/*
+ * microSD slot (sdc0). The card doubles as the FEL-entry medium:
+ * fel-sdboot lives at 8 KB, so the first 16 KB of the raw device are
+ * off-limits to writes.
+ */
+&smhc0 {
+	status = "okay";
+
+	sdmmc {
+		compatible = "zephyr,sdmmc-disk";
+		disk-name = "SD";
+	};
 };

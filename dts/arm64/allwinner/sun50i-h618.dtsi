@@ -71,6 +71,30 @@
 			status = "okay";
 		};
 
+		ccu: clock@3001000 {
+			compatible = "allwinner,sun50i-h618-ccu";
+			reg = <0x03001000 0x1000>;
+		};
+
+		smhc0: mmc@4020000 {
+			compatible = "allwinner,sun50i-h618-mmc",
+				     "allwinner,sunxi-smhc";
+			reg = <0x04020000 0x1000>;
+			interrupts = <GIC_SPI 35 IRQ_TYPE_LEVEL
+				      IRQ_DEFAULT_PRIORITY>;
+			allwinner,ccu = <&ccu>;
+			allwinner,ccu-clk-offset = <0x830>;
+			allwinner,ccu-bgr-offset = <0x84c>;
+			allwinner,ccu-bgr-bit = <0>;
+			allwinner,pio-bank-reg = <0x0300b0b4>;
+			/*
+			 * OSC24M-sourced PIO driver: 24 MHz ceiling until
+			 * PLL sourcing + sample-delay calibration exist.
+			 */
+			max-bus-freq = <24000000>;
+			status = "disabled";
+		};
+
 		uart0: uart@5000000 {
 			compatible = "snps,dw-apb-uart", "ns16550";
 			reg = <0x05000000 0x400>;
