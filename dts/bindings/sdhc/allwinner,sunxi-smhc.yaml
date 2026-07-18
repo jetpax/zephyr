@@ -5,13 +5,14 @@ description: |
   Allwinner SMHC SD/MMC host controller (sunxi), driven in PIO mode.
 
   Covers the H6-generation IP (H616/H618: new timing mode, THLDC at
-  0x100, FIFO at 0x200). The driver programs the CCU module clock,
-  bus gate and reset directly through the referenced CCU node until a
-  proper sunxi clock-control driver exists.
+  0x100, FIFO at 0x200). Clocking comes from the SoC CCU: the "ahb"
+  clock is the bus gate, the "mod" clock is the module clock whose
+  rate the driver programs, and the reset line is the block's BGR
+  reset.
 
 compatible: "allwinner,sunxi-smhc"
 
-include: [sdhc.yaml, base.yaml]
+include: [sdhc.yaml, base.yaml, reset-device.yaml]
 
 properties:
   reg:
@@ -20,25 +21,15 @@ properties:
   interrupts:
     required: true
 
-  allwinner,ccu:
-    type: phandle
+  clocks:
     required: true
-    description: CCU node; its reg supplies the CCU MMIO base.
 
-  allwinner,ccu-clk-offset:
-    type: int
+  clock-names:
     required: true
-    description: Offset of this controller's module clock register.
+    description: Must be "ahb" then "mod".
 
-  allwinner,ccu-bgr-offset:
-    type: int
+  resets:
     required: true
-    description: Offset of the MMC bus-gating/reset register.
-
-  allwinner,ccu-bgr-bit:
-    type: int
-    required: true
-    description: Gate bit index; the reset bit is this index + 16.
 
   allwinner,pio-bank-reg:
     type: int
@@ -47,4 +38,3 @@ properties:
       driver muxes pins 0..5 of that bank to function 2 (mmc), with
       pull-up and drive level 2. The BROM leaves this set after SD
       boot; setting it here removes the dependence on boot path.
-

@@ -16,6 +16,8 @@
 #define DT_DRV_COMPAT allwinner_sunxi_smhc
 
 #include <zephyr/device.h>
+#include <zephyr/drivers/clock_control.h>
+#include <zephyr/drivers/reset.h>
 #include <zephyr/drivers/sdhc.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -91,11 +93,6 @@ LOG_MODULE_REGISTER(sdhc_sunxi, CONFIG_SDHC_LOG_LEVEL);
 #define THLDC_BSY_CLR_INT_EN	BIT(1)
 #define THLDC_READ_THLD(x)	(((x) & 0xfff) << 16)
 
-#define CCU_MMC_ENABLE		BIT(31)
-#define CCU_MMC_SRC_OSC24M	(0 << 24)
-#define CCU_MMC_N(x)		(((x) & 0x3) << 8)
-#define CCU_MMC_M(x)		(((x) - 1) & 0xf)
-
 #define PIO_CFG0		0x00
 #define PIO_DRV0		0x14
 #define PIO_PULL0		0x1c
@@ -106,17 +103,16 @@ LOG_MODULE_REGISTER(sdhc_sunxi, CONFIG_SDHC_LOG_LEVEL);
 
 struct sunxi_smhc_config {
 	DEVICE_MMIO_ROM;
-	uintptr_t ccu_base;
-	uint32_t clk_off;
-	uint32_t bgr_off;
-	uint8_t bgr_bit;
+	const struct device *ccu;
+	clock_control_subsys_t ahb_clk;
+	clock_control_subsys_t mod_clk;
+	struct reset_dt_spec rst;
 	uintptr_t pio_bank;
 	uint32_t max_freq;
 };
 
 struct sunxi_smhc_data {
 	DEVICE_MMIO_RAM;
-	mm_reg_t ccu;
 	struct sdhc_io io;
 };
 
@@ -152,21 +148,10 @@ static int smhc_update_clk(mm_reg_t base)
 
 static int smhc_set_clock(const struct device *dev, uint32_t hz)
 {
-	struct sunxi_smhc_data *data = dev->data;
 	mm_reg_t base = DEVICE_MMIO_GET(dev);
 	const struct sunxi_smhc_config *cfg = dev->config;
-	uint32_t n = 0, m = 1;
-
-	/* OSC24M / 2^n / m; n:0..3, m:1..16 */
-	for (n = 0; n <= 3; n++) {
-		m = DIV_ROUND_UP(24000000 >> n, hz);
-		if (m <= 16) {
-			break;
-		}
-	}
-	if (m > 16) {
-		return -ENOTSUP;
-	}
+	uint32_t got = 0;
+	int ret;
 
 	sys_write32(sys_read32(base + SMHC_CLKCR) & ~CLKCR_ENABLE,
 		    base + SMHC_CLKCR);
@@ -174,8 +159,11 @@ static int smhc_set_clock(const struct device *dev, uint32_t hz)
 		return -ETIMEDOUT;
 	}
 
-	sys_write32(CCU_MMC_ENABLE | CCU_MMC_SRC_OSC24M | CCU_MMC_N(n) |
-		    CCU_MMC_M(m), data->ccu + cfg->clk_off);
+	ret = clock_control_set_rate(cfg->ccu, cfg->mod_clk,
+				     (clock_control_subsys_rate_t)(uintptr_t)hz);
+	if (ret) {
+		return ret;
+	}
 
 	sys_write32(sys_read32(base + SMHC_CLKCR) | CLKCR_ENABLE,
 		    base + SMHC_CLKCR);
@@ -183,7 +171,8 @@ static int smhc_set_clock(const struct device *dev, uint32_t hz)
 		return -ETIMEDOUT;
 	}
 
-	LOG_DBG("clock %u Hz (n=%u m=%u)", (24000000 >> n) / m, n, m);
+	(void)clock_control_get_rate(cfg->ccu, cfg->mod_clk, &got);
+	LOG_DBG("clock %u Hz (asked %u)", got, hz);
 	return 0;
 }
 
@@ -472,22 +461,23 @@ static void smhc_pinmux(uintptr_t bank_phys)
 static int sdhc_sunxi_init(const struct device *dev)
 {
 	const struct sunxi_smhc_config *cfg = dev->config;
-	struct sunxi_smhc_data *data = dev->data;
-	uint32_t val;
+	int ret;
 
 	DEVICE_MMIO_MAP(dev, K_MEM_CACHE_NONE);
-	device_map(&data->ccu, cfg->ccu_base, 0x1000, K_MEM_CACHE_NONE);
+
+	if (!device_is_ready(cfg->ccu) || !device_is_ready(cfg->rst.dev)) {
+		return -ENODEV;
+	}
 
 	if (cfg->pio_bank != 0) {
 		smhc_pinmux(cfg->pio_bank);
 	}
 
 	/* deassert reset, then open the AHB gate */
-	val = sys_read32(data->ccu + cfg->bgr_off);
-	val |= BIT(cfg->bgr_bit + 16);
-	sys_write32(val, data->ccu + cfg->bgr_off);
-	val |= BIT(cfg->bgr_bit);
-	sys_write32(val, data->ccu + cfg->bgr_off);
+	ret = reset_line_deassert(cfg->rst.dev, cfg->rst.id);
+	if (ret == 0) {
+		ret = clock_control_on(cfg->ccu, cfg->ahb_clk);
+	}
 
 	/*
 	 * The controller cannot complete a soft reset without a running
@@ -495,8 +485,13 @@ static int sdhc_sunxi_init(const struct device *dev)
 	 * returns the CCU to defaults (clock off). 400 kHz from OSC24M
 	 * until set_io programs the real rate.
 	 */
-	sys_write32(CCU_MMC_ENABLE | CCU_MMC_SRC_OSC24M | CCU_MMC_N(2) |
-		    CCU_MMC_M(15), data->ccu + cfg->clk_off);
+	if (ret == 0) {
+		ret = clock_control_set_rate(cfg->ccu, cfg->mod_clk,
+				(clock_control_subsys_rate_t)400000);
+	}
+	if (ret) {
+		return ret;
+	}
 
 	return sdhc_sunxi_reset(dev);
 }
@@ -513,10 +508,12 @@ static DEVICE_API(sdhc, sdhc_sunxi_api) = {
 #define SDHC_SUNXI_INIT(inst)						\
 	static const struct sunxi_smhc_config sunxi_smhc_config_##inst = { \
 		DEVICE_MMIO_ROM_INIT(DT_DRV_INST(inst)),		\
-		.ccu_base = DT_REG_ADDR(DT_INST_PHANDLE(inst, allwinner_ccu)), \
-		.clk_off = DT_INST_PROP(inst, allwinner_ccu_clk_offset), \
-		.bgr_off = DT_INST_PROP(inst, allwinner_ccu_bgr_offset), \
-		.bgr_bit = DT_INST_PROP(inst, allwinner_ccu_bgr_bit),	\
+		.ccu = DEVICE_DT_GET(DT_INST_CLOCKS_CTLR_BY_NAME(inst, ahb)), \
+		.ahb_clk = (clock_control_subsys_t)			\
+			DT_INST_CLOCKS_CELL_BY_NAME(inst, ahb, id),	\
+		.mod_clk = (clock_control_subsys_t)			\
+			DT_INST_CLOCKS_CELL_BY_NAME(inst, mod, id),	\
+		.rst = RESET_DT_SPEC_INST_GET(inst),			\
 		.pio_bank = DT_INST_PROP_OR(inst, allwinner_pio_bank_reg, 0), \
 		.max_freq = DT_INST_PROP(inst, max_bus_freq),		\
 	};								\
