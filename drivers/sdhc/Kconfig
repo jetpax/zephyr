@@ -12,6 +12,7 @@ if SDHC
 source "drivers/sdhc/Kconfig.ambiq"
 source "drivers/sdhc/Kconfig.bcm2835"
 source "drivers/sdhc/Kconfig.bcm2835_sdhost"
+source "drivers/sdhc/Kconfig.sunxi_smhc"
 source "drivers/sdhc/Kconfig.bflb"
 source "drivers/sdhc/Kconfig.esp32"
 source "drivers/sdhc/Kconfig.imx"

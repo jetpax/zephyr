@@ -1,0 +1,50 @@
+# Copyright (c) 2026 Jonathan E. Peace <jep@alphabetiq.com>
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Allwinner SMHC SD/MMC host controller (sunxi), driven in PIO mode.
+
+  Covers the H6-generation IP (H616/H618: new timing mode, THLDC at
+  0x100, FIFO at 0x200). The driver programs the CCU module clock,
+  bus gate and reset directly through the referenced CCU node until a
+  proper sunxi clock-control driver exists.
+
+compatible: "allwinner,sunxi-smhc"
+
+include: [sdhc.yaml, base.yaml]
+
+properties:
+  reg:
+    required: true
+
+  interrupts:
+    required: true
+
+  allwinner,ccu:
+    type: phandle
+    required: true
+    description: CCU node; its reg supplies the CCU MMIO base.
+
+  allwinner,ccu-clk-offset:
+    type: int
+    required: true
+    description: Offset of this controller's module clock register.
+
+  allwinner,ccu-bgr-offset:
+    type: int
+    required: true
+    description: Offset of the MMC bus-gating/reset register.
+
+  allwinner,ccu-bgr-bit:
+    type: int
+    required: true
+    description: Gate bit index; the reset bit is this index + 16.
+
+  allwinner,pio-bank-reg:
+    type: int
+    description: |
+      PIO bank register base holding the card pins. When present the
+      driver muxes pins 0..5 of that bank to function 2 (mmc), with
+      pull-up and drive level 2. The BROM leaves this set after SD
+      boot; setting it here removes the dependence on boot path.
+
