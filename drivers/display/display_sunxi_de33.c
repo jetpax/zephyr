@@ -103,7 +103,54 @@ LOG_MODULE_REGISTER(display_de33, CONFIG_DISPLAY_LOG_LEVEL);
  * channel's scaler sits 0x800 below its register file.
  */
 #define UI_CH_BASE		(0x100000 + 0x1000 + 6 * 0x20000)
-#define UI_SCALER_CTL		(UI_CH_BASE - 0x800)
+
+/* DE33 has NO UI scaler: a UI channel scales through the VI scaler
+ * (VSU) at channel_base + 0x3000, unlike DE2/DE3 which put a GSU 0x800
+ * below the channel. Sizes use the mixer encoding, steps are
+ * source/destination ratios in a 20-bit fraction, and the horizontal
+ * filter is 8 taps split across two coefficient banks while the
+ * vertical is 4 taps in one, over 32 phase entries each.
+ */
+#define VSU_BASE		(UI_CH_BASE + 0x3000)
+#define VSU_CTRL		0x00
+#define VSU_CTRL_EN		BIT(0)
+#define VSU_CTRL_COEFF_RDY	BIT(4)
+#define VSU_SCALE_MODE		0x10
+#define VSU_SCALE_MODE_UI	0
+#define VSU_OUTSIZE		0x40
+#define VSU_YINSIZE		0x80
+#define VSU_YHSTEP		0x88
+#define VSU_YVSTEP		0x8c
+#define VSU_YHPHASE		0x90
+#define VSU_YVPHASE		0x98
+#define VSU_CINSIZE		0xc0
+#define VSU_CHSTEP		0xc8
+#define VSU_CVSTEP		0xcc
+#define VSU_CHPHASE		0xd0
+#define VSU_CVPHASE		0xd8
+#define VSU_YHCOEFF0(i)		(0x200 + 0x04 * (i))
+#define VSU_YHCOEFF1(i)		(0x300 + 0x04 * (i))
+#define VSU_YVCOEFF(i)		(0x400 + 0x04 * (i))
+#define VSU_CHCOEFF0(i)		(0x600 + 0x04 * (i))
+#define VSU_CHCOEFF1(i)		(0x700 + 0x04 * (i))
+#define VSU_CVCOEFF(i)		(0x800 + 0x04 * (i))
+#define VSU_COEFF_COUNT		32
+#define VSU_STEP_FRAC		20
+/* Nearest neighbour: one whole source pixel per phase, which is
+ * pixel-exact for an integer factor and matches the software path
+ * output bit for bit. Unity is 0x40 in a 6-bit fraction, and it sits in
+ * a different tap position in the horizontal and vertical banks.
+ * Replacing these three constants with a polyphase table is all it
+ * would take to get a smoothing filter.
+ */
+#define VSU_COEFF_H_UNITY	0x40000000
+#define VSU_COEFF_H_ZERO	0x00000000
+#define VSU_COEFF_V_UNITY	0x00004000
+
+/* DE2/DE3 keep the UI scaler 0x800 into the channel unit. DE33 does not
+ * use it, but the golden kernel still clears it, so keep parity.
+ */
+#define UI_GSU_LEGACY_CTRL	(UI_CH_BASE - 0x800)
 #define UI_ATTR			0x00
 #define UI_SIZE			0x04
 #define UI_COORD		0x08
@@ -304,7 +351,12 @@ struct de33_data {
 	 * mode by an integer factor and centred (see de33_write)
 	 */
 	uint16_t render_w, render_h;
-	uint16_t scale, off_x, off_y;
+	uint16_t scale;
+	/* framebuffer geometry: the scanout buffer is render-sized when the
+	 * hardware scales, mode-sized when the CPU does
+	 */
+	uint16_t fb_w, sw_scale, off_x, off_y;
+	bool hw_scaled;
 	uintptr_t fb_phys[2];
 	uint8_t front;
 };
@@ -345,6 +397,7 @@ static void de33_mixer_init(struct de33_data *data, uintptr_t fb_phys)
 	mm_reg_t de = data->de;
 	mm_reg_t bld = de + BLD_BASE;
 	mm_reg_t ui = de + UI_CH_BASE;
+	mm_reg_t vsu = de + VSU_BASE;
 	mm_reg_t fmt = de + FMT_BASE;
 	uint32_t size = DE_SIZE(m->w, m->h);
 
@@ -386,13 +439,60 @@ static void de33_mixer_init(struct de33_data *data, uintptr_t fb_phys)
 	}
 	sys_write32(1, fmt + FMT_CTRL);
 
-	/* plane: channel geometry, scaler bypassed, then route + commit */
-	sys_write32(size, ui + UI_SIZE);
-	sys_write32(size, ui + UI_OVL_SIZE);
-	sys_write32(0, bld + BLD_COORD(0));
-	sys_write32(size, bld + BLD_INSIZE(0));
-	sys_write32(0, de + UI_SCALER_CTL);
-	sys_write32(m->w * 4U, ui + UI_PITCH);
+	/*
+	 * plane: the channel always describes the SOURCE, the blender the
+	 * destination rectangle. Without scaling those are the same full
+	 * screen; with the scaler on, the channel reads the small render
+	 * surface and the blender places the scaled result.
+	 */
+	sys_write32(0, de + UI_GSU_LEGACY_CTRL);
+
+	if (data->hw_scaled) {
+		uint32_t out_w = data->render_w * data->scale;
+		uint32_t out_h = data->render_h * data->scale;
+		uint32_t src = DE_SIZE(data->render_w, data->render_h);
+		uint32_t dst = DE_SIZE(out_w, out_h);
+		uint32_t step = BIT(VSU_STEP_FRAC) / data->scale;
+
+		sys_write32(src, ui + UI_SIZE);
+		sys_write32(src, ui + UI_OVL_SIZE);
+		sys_write32(((uint32_t)data->off_y << 16) | data->off_x,
+			    bld + BLD_COORD(0));
+		sys_write32(dst, bld + BLD_INSIZE(0));
+
+		/* RGB source: UI scale mode, and the chroma registers track
+		 * luma because there is no subsampling
+		 */
+		sys_write32(VSU_SCALE_MODE_UI, vsu + VSU_SCALE_MODE);
+		sys_write32(dst, vsu + VSU_OUTSIZE);
+		sys_write32(src, vsu + VSU_YINSIZE);
+		sys_write32(step, vsu + VSU_YHSTEP);
+		sys_write32(step, vsu + VSU_YVSTEP);
+		sys_write32(0, vsu + VSU_YHPHASE);
+		sys_write32(0, vsu + VSU_YVPHASE);
+		sys_write32(src, vsu + VSU_CINSIZE);
+		sys_write32(step, vsu + VSU_CHSTEP);
+		sys_write32(step, vsu + VSU_CVSTEP);
+		sys_write32(0, vsu + VSU_CHPHASE);
+		sys_write32(0, vsu + VSU_CVPHASE);
+		for (int i = 0; i < VSU_COEFF_COUNT; i++) {
+			sys_write32(VSU_COEFF_H_UNITY, vsu + VSU_YHCOEFF0(i));
+			sys_write32(VSU_COEFF_H_ZERO, vsu + VSU_YHCOEFF1(i));
+			sys_write32(VSU_COEFF_V_UNITY, vsu + VSU_YVCOEFF(i));
+			sys_write32(VSU_COEFF_H_UNITY, vsu + VSU_CHCOEFF0(i));
+			sys_write32(VSU_COEFF_H_ZERO, vsu + VSU_CHCOEFF1(i));
+			sys_write32(VSU_COEFF_V_UNITY, vsu + VSU_CVCOEFF(i));
+		}
+		sys_write32(VSU_CTRL_EN | VSU_CTRL_COEFF_RDY, vsu + VSU_CTRL);
+		sys_write32(data->render_w * 4U, ui + UI_PITCH);
+	} else {
+		sys_write32(size, ui + UI_SIZE);
+		sys_write32(size, ui + UI_OVL_SIZE);
+		sys_write32(0, bld + BLD_COORD(0));
+		sys_write32(size, bld + BLD_INSIZE(0));
+		sys_write32(0, vsu + VSU_CTRL);
+		sys_write32(m->w * 4U, ui + UI_PITCH);
+	}
 	sys_write32((uint32_t)fb_phys, ui + UI_TOP_LADDR);
 	sys_write32(UI_ALPHA(0xff) | UI_FMT_XRGB8888 | UI_ATTR_EN,
 		    ui + UI_ATTR);
@@ -911,12 +1011,11 @@ static void de33_flip(struct de33_data *data, uint8_t buf)
  * it. Integer-only keeps the source aspect exact and every output pixel
  * a copy of exactly one source pixel, which is what pixel art wants.
  *
- * The expansion is done on the CPU. The DE33 has per-channel hardware
- * scalers (the UI channel's GSU sits 0x800 below its register file, and
- * the TCON's BASIC1 is an upscale stage) which would make this free;
- * either can replace the loop below without callers noticing, since the
- * contract is only "capabilities report the render size". The blocker on
- * the GSU is its polyphase coefficient table, not the register writes.
+ * This is the fallback path, used when the hardware scaler is disabled
+ * or the factor is 1. Its cost is a fixed ~31 ms per frame for 320x200
+ * at x5 to 1080p, which is why CONFIG_DISPLAY_SUNXI_DE33_HW_SCALER
+ * exists; either way callers see the same contract, "capabilities
+ * report the render size".
  */
 static int de33_write(const struct device *dev, const uint16_t x,
 		      const uint16_t y,
@@ -924,8 +1023,8 @@ static int de33_write(const struct device *dev, const uint16_t x,
 		      const void *buf)
 {
 	struct de33_data *data = dev->data;
-	const struct de33_mode *m = data->mode;
-	uint32_t s = data->scale;
+	uint32_t s = data->sw_scale;
+	uint16_t fb_w = data->fb_w;
 	bool full = (x == 0U && y == 0U && desc->width == data->render_w &&
 		     desc->height == data->render_h);
 	uint8_t back = data->front ^ 1U;
@@ -953,17 +1052,17 @@ static int de33_write(const struct device *dev, const uint16_t x,
 		const uint32_t *src = buf;
 
 		if (s == 1U && data->off_x == 0U && data->off_y == 0U) {
-			uint32_t *dst = &fb[(size_t)y * m->w + x];
+			uint32_t *dst = &fb[(size_t)y * fb_w + x];
 
 			for (uint16_t row = 0; row < desc->height; row++) {
 				memcpy(dst, src, desc->width * 4U);
 				src += desc->pitch;
-				dst += m->w;
+				dst += fb_w;
 			}
 		} else {
 			for (uint16_t row = 0; row < desc->height; row++) {
 				uint32_t *out = &fb[(first_row +
-						     (size_t)row * s) * m->w +
+						     (size_t)row * s) * fb_w +
 						    data->off_x +
 						    (size_t)x * s];
 				uint32_t *dst = out;
@@ -977,15 +1076,15 @@ static int de33_write(const struct device *dev, const uint16_t x,
 				}
 				/* the remaining s-1 output rows are copies */
 				for (uint32_t rep = 1; rep < s; rep++) {
-					memcpy(out + (size_t)rep * m->w, out,
+					memcpy(out + (size_t)rep * fb_w, out,
 					       (size_t)desc->width * s * 4U);
 				}
 				src += desc->pitch;
 			}
 		}
 
-		sys_cache_data_flush_range(&fb[first_row * m->w],
-					   (size_t)desc->height * s * m->w * 4U);
+		sys_cache_data_flush_range(&fb[first_row * fb_w],
+					   (size_t)desc->height * s * fb_w * 4U);
 	}
 
 	if (full) {
@@ -1041,6 +1140,21 @@ static int de33_init(const struct device *dev)
 	data->scale = MIN(m->w / data->render_w, m->h / data->render_h);
 	data->off_x = (m->w - data->render_w * data->scale) / 2U;
 	data->off_y = (m->h - data->render_h * data->scale) / 2U;
+	/*
+	 * With the scaler on, the framebuffer is the render surface itself
+	 * and the offsets are a blender placement; without it, callers get
+	 * expanded into a mode-sized buffer at those offsets by the CPU,
+	 * which costs a fixed ~31 ms per frame at 320x200 x5 to 1080p.
+	 */
+	data->hw_scaled = IS_ENABLED(CONFIG_DISPLAY_SUNXI_DE33_HW_SCALER) &&
+			  data->scale > 1U;
+	if (data->hw_scaled) {
+		data->fb_w = data->render_w;
+		data->sw_scale = 1U;
+	} else {
+		data->fb_w = m->w;
+		data->sw_scale = data->scale;
+	}
 
 	if (!device_is_ready(cfg->ccu)) {
 		return -ENODEV;
@@ -1129,10 +1243,11 @@ static int de33_init(const struct device *dev)
 	}
 
 
-	LOG_INF("%ux%u@60 up, render %ux%u x%u at +%u+%u, fb %p (phys 0x%lx)%s",
+	LOG_INF("%ux%u@60 up, render %ux%u x%u at +%u+%u (%s scaled), "
+		"fb %p (phys 0x%lx)%s",
 		m->w, m->h, data->render_w, data->render_h, data->scale,
-		data->off_x, data->off_y, (void *)de33_fb,
-		(unsigned long)fb_phys,
+		data->off_x, data->off_y, data->hw_scaled ? "VSU" : "CPU",
+		(void *)de33_fb, (unsigned long)fb_phys,
 		cfg->tcon_pattern ? " [TCON colorbar]" : "");
 
 #ifdef CONFIG_DISPLAY_SUNXI_DE33_DW_DUMP

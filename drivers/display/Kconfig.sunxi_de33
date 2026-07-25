@@ -22,3 +22,16 @@ config DISPLAY_SUNXI_DE33_DW_DUMP
 	  the same dump taken on a known-good boot. Build with
 	  CONFIG_LOG_PRINTK=n so the burst is not routed through the
 	  deferred log buffer.
+
+config DISPLAY_SUNXI_DE33_HW_SCALER
+	bool "Scale the render surface with the channel's hardware scaler"
+	depends on DISPLAY_SUNXI_DE33
+	default y
+	help
+	  When render-width/render-height ask for a surface smaller than the
+	  mode, drive the mixer channel's VI scaler (VSU) instead of expanding
+	  every frame on the CPU. The scaler reads the small surface during
+	  composition, so a frame costs a copy of the render surface rather
+	  than of the whole screen. Coefficients are nearest-neighbour, so
+	  output is identical to the software path. Say n to fall back to
+	  CPU expansion.
