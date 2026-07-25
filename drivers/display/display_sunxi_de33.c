@@ -99,8 +99,9 @@ LOG_MODULE_REGISTER(display_de33, CONFIG_DISPLAY_LOG_LEVEL);
 #define BLD_MODE(p)		(0x90 + 0x04 * (p))
 #define BLD_OUTCTL		0xfc
 
-/* first UI channel: logical route index 1, physical channel 6. The
- * channel's scaler sits 0x800 below its register file.
+/* First UI channel: logical route index 1, physical channel 6. A DE33
+ * channel unit starts at 0x100000 + 0x20000 * phy_chn and holds several
+ * blocks; this is its overlay at +0x1000.
  */
 #define UI_CH_BASE		(0x100000 + 0x1000 + 6 * 0x20000)
 
@@ -157,10 +158,11 @@ LOG_MODULE_REGISTER(display_de33, CONFIG_DISPLAY_LOG_LEVEL);
  */
 #define VSU_COEFF_UNITY		0x00004000
 
-/* DE2/DE3 keep the UI scaler 0x800 into the channel unit. DE33 does not
- * use it, but the golden kernel still clears it, so keep parity.
+/* Channel colour-space converter, 0x800 into the channel unit -- NOT a
+ * scaler, despite sitting where DE2/DE3 put the UI GSU. Bit 0 enables
+ * it, and an RGB layer feeding an RGB output wants it off.
  */
-#define UI_GSU_LEGACY_CTRL	(UI_CH_BASE - 0x800)
+#define UI_CCSC_CTRL		(UI_CH_BASE - 0x800)
 #define UI_ATTR			0x00
 #define UI_SIZE			0x04
 #define UI_COORD		0x08
@@ -462,7 +464,7 @@ static void de33_mixer_init(struct de33_data *data, uintptr_t fb_phys)
 	 * screen; with the scaler on, the channel reads the small render
 	 * surface and the blender places the scaled result.
 	 */
-	sys_write32(0, de + UI_GSU_LEGACY_CTRL);
+	sys_write32(0, de + UI_CCSC_CTRL);
 
 	if (data->hw_scaled) {
 		uint32_t out_w = data->render_w * data->scale;
