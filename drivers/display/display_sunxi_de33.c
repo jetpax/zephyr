@@ -305,10 +305,20 @@ struct de33_data {
 	 */
 	uint16_t render_w, render_h;
 	uint16_t scale, off_x, off_y;
+	uintptr_t fb_phys[2];
+	uint8_t front;
 };
 
 /* One instance per SoC; 1080p is the largest supported mode. */
-static uint32_t de33_fb[1920 * 1080] __aligned(64);
+/*
+ * Two of them: the DE33 latches the channel's register set at a frame
+ * boundary when armed (see RTMX_DBUFF), so pointing the channel at the
+ * buffer just finished and arming the commit is an atomic page flip in
+ * hardware, with no vblank interrupt and no tearing. Writing a live
+ * scanout buffer instead shows a seam on any frame that takes longer
+ * than a scanout period, which at 1080p60 is most of them.
+ */
+static uint32_t de33_fb[2][1920 * 1080] __aligned(64);
 
 /* ---- CCU shorthand -------------------------------------------------- */
 
@@ -869,6 +879,29 @@ static void dw_dump_nonzero(struct de33_data *data, uintptr_t phys)
 /* ---- display API ----------------------------------------------------- */
 
 /*
+ * Arm the frame-boundary latch and wait for the previous one to be
+ * consumed, so the caller never draws into a buffer the DE is still
+ * scanning out. The bit self-clears when the hardware takes the shadow
+ * register set; the timeout is a few frame periods, after which we
+ * proceed anyway rather than wedge a display that has stopped scanning.
+ */
+static void de33_flip(struct de33_data *data, uint8_t buf)
+{
+	mm_reg_t ui = data->de + UI_CH_BASE;
+
+	for (int us = 0; us < 50000; us += 100) {
+		if (sys_read32(data->de + RTMX_DBUFF) == 0U) {
+			break;
+		}
+		k_busy_wait(100);
+	}
+
+	sys_write32((uint32_t)data->fb_phys[buf], ui + UI_TOP_LADDR);
+	sys_write32(1, data->de + RTMX_DBUFF);
+	data->front = buf;
+}
+
+/*
  * Scanout is a fixed CEA mode, but the applications that matter here
  * (game and emulator ports through the SDL2 shim) render at their own
  * native size: 320x200, 512x342 and friends. Rather than make every one
@@ -892,9 +925,12 @@ static int de33_write(const struct device *dev, const uint16_t x,
 {
 	struct de33_data *data = dev->data;
 	const struct de33_mode *m = data->mode;
-	const uint32_t *src = buf;
 	uint32_t s = data->scale;
+	bool full = (x == 0U && y == 0U && desc->width == data->render_w &&
+		     desc->height == data->render_h);
+	uint8_t back = data->front ^ 1U;
 	size_t first_row;
+	int passes;
 
 	if (x + desc->width > data->render_w ||
 	    y + desc->height > data->render_h) {
@@ -903,39 +939,58 @@ static int de33_write(const struct device *dev, const uint16_t x,
 
 	first_row = (size_t)data->off_y + (size_t)y * s;
 
-	if (s == 1U && data->off_x == 0U && data->off_y == 0U) {
-		uint32_t *dst = &de33_fb[(size_t)y * m->w + x];
+	/*
+	 * A full-surface write goes to the back buffer and is flipped. A
+	 * partial one has no previous content in the back buffer to build
+	 * on, so it is applied to both: the visible copy updates in place
+	 * (as before, so a partial update can still tear in its own small
+	 * region) and the other stays coherent for the next flip.
+	 */
+	passes = full ? 1 : 2;
+	for (int pass = 0; pass < passes; pass++) {
+		uint32_t *fb = de33_fb[full ? back : (uint8_t)(data->front ^
+							       (uint8_t)pass)];
+		const uint32_t *src = buf;
 
-		for (uint16_t row = 0; row < desc->height; row++) {
-			memcpy(dst, src, desc->width * 4U);
-			src += desc->pitch;
-			dst += m->w;
-		}
-	} else {
-		for (uint16_t row = 0; row < desc->height; row++) {
-			uint32_t *out = &de33_fb[(first_row + (size_t)row * s) *
-						 m->w + data->off_x +
-						 (size_t)x * s];
-			uint32_t *dst = out;
+		if (s == 1U && data->off_x == 0U && data->off_y == 0U) {
+			uint32_t *dst = &fb[(size_t)y * m->w + x];
 
-			for (uint16_t col = 0; col < desc->width; col++) {
-				uint32_t px = src[col];
+			for (uint16_t row = 0; row < desc->height; row++) {
+				memcpy(dst, src, desc->width * 4U);
+				src += desc->pitch;
+				dst += m->w;
+			}
+		} else {
+			for (uint16_t row = 0; row < desc->height; row++) {
+				uint32_t *out = &fb[(first_row +
+						     (size_t)row * s) * m->w +
+						    data->off_x +
+						    (size_t)x * s];
+				uint32_t *dst = out;
 
-				for (uint32_t rep = 0; rep < s; rep++) {
-					*dst++ = px;
+				for (uint16_t col = 0; col < desc->width; col++) {
+					uint32_t px = src[col];
+
+					for (uint32_t rep = 0; rep < s; rep++) {
+						*dst++ = px;
+					}
 				}
+				/* the remaining s-1 output rows are copies */
+				for (uint32_t rep = 1; rep < s; rep++) {
+					memcpy(out + (size_t)rep * m->w, out,
+					       (size_t)desc->width * s * 4U);
+				}
+				src += desc->pitch;
 			}
-			/* the remaining s-1 output rows are copies */
-			for (uint32_t rep = 1; rep < s; rep++) {
-				memcpy(out + (size_t)rep * m->w, out,
-				       (size_t)desc->width * s * 4U);
-			}
-			src += desc->pitch;
 		}
+
+		sys_cache_data_flush_range(&fb[first_row * m->w],
+					   (size_t)desc->height * s * m->w * 4U);
 	}
 
-	sys_cache_data_flush_range(&de33_fb[first_row * m->w],
-				   (size_t)desc->height * s * m->w * 4U);
+	if (full) {
+		de33_flip(data, back);
+	}
 	return 0;
 }
 
@@ -1061,7 +1116,10 @@ static int de33_init(const struct device *dev)
 
 	memset(de33_fb, 0, sizeof(de33_fb));
 	sys_cache_data_flush_range(de33_fb, sizeof(de33_fb));
-	fb_phys = k_mem_phys_addr(de33_fb);
+	data->fb_phys[0] = k_mem_phys_addr(de33_fb[0]);
+	data->fb_phys[1] = k_mem_phys_addr(de33_fb[1]);
+	data->front = 0U;
+	fb_phys = data->fb_phys[0];
 
 	de33_mixer_init(data, fb_phys);
 	de33_tcon_init(cfg, data);
