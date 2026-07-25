@@ -1,0 +1,56 @@
+# Copyright (c) 2026 Jonathan E. Peace <jep@alphabetiq.com>
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Allwinner H616/H618 display pipeline: DE33 mixer -> TCON-TV0 ->
+  DesignWare HDMI TX + Allwinner PHY, fixed video mode.
+
+  One node covers the whole path (the vendor DT shape): reg entries
+  name the DE block, TCON-TOP, TCON-TV0, the DW-HDMI core and the PHY
+  wrapper. Clock and reset names follow the roles in the recipes doc,
+  with the H6 convention for the two HDMI resets (ctrl = RST_BUS_HDMI_SUB,
+  phy = RST_BUS_HDMI).
+
+compatible: "allwinner,sun50i-h616-display"
+
+include: [base.yaml, reset-device.yaml]
+
+properties:
+  reg:
+    required: true
+
+  reg-names:
+    required: true
+    description: Must be "de", "tcon_top", "tcon_tv", "hdmi", "hdmi_phy".
+
+  clocks:
+    required: true
+
+  clock-names:
+    required: true
+    description: |
+      Must be "bus_de", "de", "bus_tcon_top", "bus_tcon_tv", "tcon_tv",
+      "bus_hdmi", "hdmi", "hdmi_slow".
+
+  resets:
+    required: true
+
+  reset-names:
+    required: true
+    description: Must be "de", "tcon_top", "tcon_tv", "hdmi_ctrl", "hdmi_phy".
+
+  mode:
+    type: string
+    default: "1080p60"
+    enum:
+      - "1080p60"
+      - "720p60"
+      - "576p50"
+    description: Fixed output mode; picked by what the monitor accepts.
+
+  tcon-test-pattern:
+    type: boolean
+    description: |
+      Bring-up bisect. Drive TCON-TV from its internal colorbar
+      generator instead of the DE33 mixer; proves TCON + tcon-top +
+      HDMI + PHY + clocks without trusting the DE path.

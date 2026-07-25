@@ -1,0 +1,24 @@
+# Copyright (c) 2026 Jonathan E. Peace <jep@alphabetiq.com>
+# SPDX-License-Identifier: Apache-2.0
+
+config DISPLAY_SUNXI_DE33
+	bool "Allwinner H616/H618 DE33 + TCON-TV + DW-HDMI display"
+	default y
+	depends on DT_HAS_ALLWINNER_SUN50I_H616_DISPLAY_ENABLED
+	select CLOCK_CONTROL
+	select RESET
+	help
+	  Fixed-mode display pipeline driver for the Allwinner H616/H618:
+	  DE33 mixer scanning out one XRGB8888 UI channel through
+	  TCON-TV0 and the DesignWare HDMI controller.
+
+config DISPLAY_SUNXI_DE33_DW_DUMP
+	bool "Dump nonzero DW-HDMI core bytes after init"
+	depends on DISPLAY_SUNXI_DE33
+	help
+	  Bring-up diagnostic: after the pipeline is up, print every
+	  nonzero byte of the DW-HDMI core register file (0x0000-0x5100
+	  and 0x7e00-0x7f00) over the console for a field diff against
+	  the same dump taken on a known-good boot. Build with
+	  CONFIG_LOG_PRINTK=n so the burst is not routed through the
+	  deferred log buffer.

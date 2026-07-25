@@ -103,6 +103,39 @@
 			status = "disabled";
 		};
 
+		display: display@1000000 {
+			compatible = "allwinner,sun50i-h616-display";
+			reg = <0x01000000 0x400000>,
+			      <0x06510000 0x1000>,
+			      <0x06515000 0x1000>,
+			      <0x06000000 0x8000>,
+			      <0x06010000 0x1000>;
+			reg-names = "de", "tcon_top", "tcon_tv",
+				    "hdmi", "hdmi_phy";
+			interrupts = <GIC_SPI 88 IRQ_TYPE_LEVEL
+				      IRQ_DEFAULT_PRIORITY>,
+				     <GIC_SPI 66 IRQ_TYPE_LEVEL
+				      IRQ_DEFAULT_PRIORITY>;
+			interrupt-names = "de", "tcon_tv";
+			clocks = <&ccu CLK_BUS_DE>, <&ccu CLK_DE>,
+				 <&ccu CLK_BUS_TCON_TOP>,
+				 <&ccu CLK_BUS_TCON_TV0>,
+				 <&ccu CLK_TCON_TV0>,
+				 <&ccu CLK_BUS_HDMI>, <&ccu CLK_HDMI>,
+				 <&ccu CLK_HDMI_SLOW>;
+			clock-names = "bus_de", "de", "bus_tcon_top",
+				      "bus_tcon_tv", "tcon_tv",
+				      "bus_hdmi", "hdmi", "hdmi_slow";
+			resets = <&ccu_rst RST_BUS_DE>,
+				 <&ccu_rst RST_BUS_TCON_TOP>,
+				 <&ccu_rst RST_BUS_TCON_TV0>,
+				 <&ccu_rst RST_BUS_HDMI_SUB>,
+				 <&ccu_rst RST_BUS_HDMI>;
+			reset-names = "de", "tcon_top", "tcon_tv",
+				      "hdmi_ctrl", "hdmi_phy";
+			status = "disabled";
+		};
+
 		uart0: uart@5000000 {
 			compatible = "snps,dw-apb-uart", "ns16550";
 			reg = <0x05000000 0x400>;
