@@ -293,12 +293,18 @@ struct de33_config {
 	struct reset_dt_spec rst_de, rst_top, rst_tcon, rst_ctrl, rst_phy;
 	uint8_t mode_idx;
 	bool tcon_pattern;
+	uint16_t render_w, render_h;
 };
 
 struct de33_data {
 	mm_reg_t de, top, tcon, hdmi, phy;
 	const struct de33_mode *mode;
 	enum display_pixel_format format;
+	/* render surface: what callers draw into, scaled up to the scanout
+	 * mode by an integer factor and centred (see de33_write)
+	 */
+	uint16_t render_w, render_h;
+	uint16_t scale, off_x, off_y;
 };
 
 /* One instance per SoC; 1080p is the largest supported mode. */
@@ -862,6 +868,23 @@ static void dw_dump_nonzero(struct de33_data *data, uintptr_t phys)
 
 /* ---- display API ----------------------------------------------------- */
 
+/*
+ * Scanout is a fixed CEA mode, but the applications that matter here
+ * (game and emulator ports through the SDL2 shim) render at their own
+ * native size: 320x200, 512x342 and friends. Rather than make every one
+ * of them scale, the driver presents a render surface of the size given
+ * by the render-width / render-height properties and blows it up to the
+ * mode by the largest integer factor that fits, centred, black around
+ * it. Integer-only keeps the source aspect exact and every output pixel
+ * a copy of exactly one source pixel, which is what pixel art wants.
+ *
+ * The expansion is done on the CPU. The DE33 has per-channel hardware
+ * scalers (the UI channel's GSU sits 0x800 below its register file, and
+ * the TCON's BASIC1 is an upscale stage) which would make this free;
+ * either can replace the loop below without callers noticing, since the
+ * contract is only "capabilities report the render size". The blocker on
+ * the GSU is its polyphase coefficient table, not the register writes.
+ */
 static int de33_write(const struct device *dev, const uint16_t x,
 		      const uint16_t y,
 		      const struct display_buffer_descriptor *desc,
@@ -870,19 +893,49 @@ static int de33_write(const struct device *dev, const uint16_t x,
 	struct de33_data *data = dev->data;
 	const struct de33_mode *m = data->mode;
 	const uint32_t *src = buf;
-	uint32_t *dst = &de33_fb[(size_t)y * m->w + x];
+	uint32_t s = data->scale;
+	size_t first_row;
 
-	if (x + desc->width > m->w || y + desc->height > m->h) {
+	if (x + desc->width > data->render_w ||
+	    y + desc->height > data->render_h) {
 		return -EINVAL;
 	}
 
-	for (uint16_t row = 0; row < desc->height; row++) {
-		memcpy(dst, src, desc->width * 4U);
-		src += desc->pitch;
-		dst += m->w;
+	first_row = (size_t)data->off_y + (size_t)y * s;
+
+	if (s == 1U && data->off_x == 0U && data->off_y == 0U) {
+		uint32_t *dst = &de33_fb[(size_t)y * m->w + x];
+
+		for (uint16_t row = 0; row < desc->height; row++) {
+			memcpy(dst, src, desc->width * 4U);
+			src += desc->pitch;
+			dst += m->w;
+		}
+	} else {
+		for (uint16_t row = 0; row < desc->height; row++) {
+			uint32_t *out = &de33_fb[(first_row + (size_t)row * s) *
+						 m->w + data->off_x +
+						 (size_t)x * s];
+			uint32_t *dst = out;
+
+			for (uint16_t col = 0; col < desc->width; col++) {
+				uint32_t px = src[col];
+
+				for (uint32_t rep = 0; rep < s; rep++) {
+					*dst++ = px;
+				}
+			}
+			/* the remaining s-1 output rows are copies */
+			for (uint32_t rep = 1; rep < s; rep++) {
+				memcpy(out + (size_t)rep * m->w, out,
+				       (size_t)desc->width * s * 4U);
+			}
+			src += desc->pitch;
+		}
 	}
-	sys_cache_data_flush_range(&de33_fb[(size_t)y * m->w],
-				   (size_t)desc->height * m->w * 4U);
+
+	sys_cache_data_flush_range(&de33_fb[first_row * m->w],
+				   (size_t)desc->height * s * m->w * 4U);
 	return 0;
 }
 
@@ -892,8 +945,8 @@ static void de33_get_capabilities(const struct device *dev,
 	struct de33_data *data = dev->data;
 
 	memset(caps, 0, sizeof(*caps));
-	caps->x_resolution = data->mode->w;
-	caps->y_resolution = data->mode->h;
+	caps->x_resolution = data->render_w;
+	caps->y_resolution = data->render_h;
 	caps->supported_pixel_formats = PIXEL_FORMAT_ARGB_8888;
 	caps->current_pixel_format = PIXEL_FORMAT_ARGB_8888;
 	caps->current_orientation = DISPLAY_ORIENTATION_NORMAL;
@@ -923,6 +976,16 @@ static int de33_init(const struct device *dev)
 	int ret;
 
 	data->mode = m;
+	data->render_w = cfg->render_w ? cfg->render_w : m->w;
+	data->render_h = cfg->render_h ? cfg->render_h : m->h;
+	if (data->render_w > m->w || data->render_h > m->h) {
+		LOG_ERR("render %ux%u exceeds mode %ux%u", data->render_w,
+			data->render_h, m->w, m->h);
+		return -EINVAL;
+	}
+	data->scale = MIN(m->w / data->render_w, m->h / data->render_h);
+	data->off_x = (m->w - data->render_w * data->scale) / 2U;
+	data->off_y = (m->h - data->render_h * data->scale) / 2U;
 
 	if (!device_is_ready(cfg->ccu)) {
 		return -ENODEV;
@@ -1008,8 +1071,10 @@ static int de33_init(const struct device *dev)
 	}
 
 
-	LOG_INF("%ux%u@60 up, fb %p (phys 0x%lx)%s", m->w, m->h,
-		(void *)de33_fb, (unsigned long)fb_phys,
+	LOG_INF("%ux%u@60 up, render %ux%u x%u at +%u+%u, fb %p (phys 0x%lx)%s",
+		m->w, m->h, data->render_w, data->render_h, data->scale,
+		data->off_x, data->off_y, (void *)de33_fb,
+		(unsigned long)fb_phys,
 		cfg->tcon_pattern ? " [TCON colorbar]" : "");
 
 #ifdef CONFIG_DISPLAY_SUNXI_DE33_DW_DUMP
@@ -1046,6 +1111,8 @@ static DEVICE_API(display, de33_api) = {
 		.rst_phy = RESET_DT_SPEC_INST_GET_BY_IDX(inst, 4),	\
 		.mode_idx = DT_INST_ENUM_IDX(inst, mode),		\
 		.tcon_pattern = DT_INST_PROP(inst, tcon_test_pattern),	\
+		.render_w = DT_INST_PROP_OR(inst, render_width, 0),	\
+		.render_h = DT_INST_PROP_OR(inst, render_height, 0),	\
 	};								\
 	static struct de33_data de33_data_##inst;			\
 									\

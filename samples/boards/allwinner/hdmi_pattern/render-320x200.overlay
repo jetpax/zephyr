@@ -1,0 +1,15 @@
+/*
+ * Copyright (c) 2026 Jonathan E. Peace <jep@alphabetiq.com>
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Render surface at Doom's native 320x200 inside the 1080p60 mode: the
+ * driver should report 320x200 capabilities and scale x5 to 1600x1000,
+ * centred, leaving a 160px black margin left and right and 40px top and
+ * bottom. Build with:
+ *   west build ... -- -DEXTRA_DTC_OVERLAY_FILE=render-320x200.overlay
+ */
+
+&display {
+	render-width = <320>;
+	render-height = <200>;
+};

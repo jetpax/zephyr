@@ -54,3 +54,18 @@ properties:
       Bring-up bisect. Drive TCON-TV from its internal colorbar
       generator instead of the DE33 mixer; proves TCON + tcon-top +
       HDMI + PHY + clocks without trusting the DE path.
+
+  render-width:
+    type: int
+    description: |
+      Width of the surface applications draw into, in pixels. Defaults to
+      the mode width. When smaller, the driver scales the surface up to
+      the mode by the largest integer factor that fits and centres it,
+      so display_get_capabilities reports this size, not the mode. Lets
+      a 320x200 or 512x342 application fill the screen unmodified.
+
+  render-height:
+    type: int
+    description: |
+      Height of the render surface, in pixels. Defaults to the mode
+      height. See render-width.
