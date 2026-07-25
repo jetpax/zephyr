@@ -17,6 +17,7 @@
 		zephyr,console = &uart0;
 		zephyr,shell-uart = &uart0;
 		zephyr,sram = &dram0;
+		zephyr,display = &display;
 	};
 
 	aliases {
@@ -51,4 +52,15 @@
 		compatible = "zephyr,sdmmc-disk";
 		disk-name = "SD";
 	};
+};
+
+/*
+ * HDMI socket, fixed 1080p60 with no EDID or HPD dependence. Enabled at
+ * board level because the connector is fitted; an application picks it
+ * up through the zephyr,display chosen node and pays for it only by
+ * setting CONFIG_DISPLAY=y, which is what brings in the driver and its
+ * static 1920x1080 XRGB8888 framebuffer (~8 MiB of the 4 GiB fitted).
+ */
+&display {
+	status = "okay";
 };
