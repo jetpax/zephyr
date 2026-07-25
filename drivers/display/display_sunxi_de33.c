@@ -106,15 +106,26 @@ LOG_MODULE_REGISTER(display_de33, CONFIG_DISPLAY_LOG_LEVEL);
 
 /* DE33 has NO UI scaler: a UI channel scales through the VI scaler
  * (VSU) at channel_base + 0x3000, unlike DE2/DE3 which put a GSU 0x800
- * below the channel. Sizes use the mixer encoding, steps are
- * source/destination ratios in a 20-bit fraction, and the horizontal
- * filter is 8 taps split across two coefficient banks while the
- * vertical is 4 taps in one, over 32 phase entries each.
+ * below the channel. Sizes use the mixer encoding and steps are
+ * source/destination ratios in a 20-bit fraction.
+ *
+ * The three VSU flavours are NOT register-compatible, and which one a
+ * channel gets is fixed in silicon. On H616/H618 the vendor feature
+ * table (orange-pi-4.9-sun50iw9, lowlevel_v33x/de330/de330_feat.c)
+ * gives physical channel 0 a VSU_ED, channel 1 a VSU10, and every
+ * other channel -- including all three UI channels, 6 to 8 -- a
+ * **VSU8**. A VSU8 filters with 4 horizontal taps and 2 vertical, and
+ * so has ONE coefficient bank per axis: y_hori at 0x200, y_vert at
+ * 0x400, c_hori at 0x600, 32 phase entries each. VSU10/VSU_ED's second
+ * horizontal bank at 0x300 and chroma banks at 0x700/0x800 do not
+ * exist here; those addresses are padding. Its CTRL has only EN (bit
+ * 0) and RESET (bit 30) -- there is no COEFF_RDY, the vendor never
+ * arms one, and the coefficients take effect on the DBUFF commit like
+ * every other register.
  */
 #define VSU_BASE		(UI_CH_BASE + 0x3000)
 #define VSU_CTRL		0x00
 #define VSU_CTRL_EN		BIT(0)
-#define VSU_CTRL_COEFF_RDY	BIT(4)
 #define VSU_SCALE_MODE		0x10
 #define VSU_SCALE_MODE_UI	0
 #define VSU_OUTSIZE		0x40
@@ -128,24 +139,23 @@ LOG_MODULE_REGISTER(display_de33, CONFIG_DISPLAY_LOG_LEVEL);
 #define VSU_CVSTEP		0xcc
 #define VSU_CHPHASE		0xd0
 #define VSU_CVPHASE		0xd8
-#define VSU_YHCOEFF0(i)		(0x200 + 0x04 * (i))
-#define VSU_YHCOEFF1(i)		(0x300 + 0x04 * (i))
+#define VSU_YHCOEFF(i)		(0x200 + 0x04 * (i))
 #define VSU_YVCOEFF(i)		(0x400 + 0x04 * (i))
-#define VSU_CHCOEFF0(i)		(0x600 + 0x04 * (i))
-#define VSU_CHCOEFF1(i)		(0x700 + 0x04 * (i))
-#define VSU_CVCOEFF(i)		(0x800 + 0x04 * (i))
+#define VSU_CHCOEFF(i)		(0x600 + 0x04 * (i))
 #define VSU_COEFF_COUNT		32
 #define VSU_STEP_FRAC		20
 /* Nearest neighbour: one whole source pixel per phase, which is
  * pixel-exact for an integer factor and matches the software path
- * output bit for bit. Unity is 0x40 in a 6-bit fraction, and it sits in
- * a different tap position in the horizontal and vertical banks.
- * Replacing these three constants with a polyphase table is all it
- * would take to get a smoothing filter.
+ * output bit for bit. A coefficient word packs four signed 8-bit taps,
+ * unity is 0x40 in a 6-bit fraction, and it belongs at the kernel
+ * centre -- tap 1 for both of the VSU8's filters, which is exactly
+ * phase 0 of the vendor's own 4-tap table (lan2coefftab32[0] =
+ * 0x00004000). The 8-tap tables put unity at tap 3 (0x40000000); using
+ * that word here reads two source pixels to the right of centre.
+ * Replacing this constant with a polyphase table is all it would take
+ * to get a smoothing filter.
  */
-#define VSU_COEFF_H_UNITY	0x40000000
-#define VSU_COEFF_H_ZERO	0x00000000
-#define VSU_COEFF_V_UNITY	0x00004000
+#define VSU_COEFF_UNITY		0x00004000
 
 /* DE2/DE3 keep the UI scaler 0x800 into the channel unit. DE33 does not
  * use it, but the golden kernel still clears it, so keep parity.
@@ -476,14 +486,11 @@ static void de33_mixer_init(struct de33_data *data, uintptr_t fb_phys)
 		sys_write32(0, vsu + VSU_CHPHASE);
 		sys_write32(0, vsu + VSU_CVPHASE);
 		for (int i = 0; i < VSU_COEFF_COUNT; i++) {
-			sys_write32(VSU_COEFF_H_UNITY, vsu + VSU_YHCOEFF0(i));
-			sys_write32(VSU_COEFF_H_ZERO, vsu + VSU_YHCOEFF1(i));
-			sys_write32(VSU_COEFF_V_UNITY, vsu + VSU_YVCOEFF(i));
-			sys_write32(VSU_COEFF_H_UNITY, vsu + VSU_CHCOEFF0(i));
-			sys_write32(VSU_COEFF_H_ZERO, vsu + VSU_CHCOEFF1(i));
-			sys_write32(VSU_COEFF_V_UNITY, vsu + VSU_CVCOEFF(i));
+			sys_write32(VSU_COEFF_UNITY, vsu + VSU_YHCOEFF(i));
+			sys_write32(VSU_COEFF_UNITY, vsu + VSU_YVCOEFF(i));
+			sys_write32(VSU_COEFF_UNITY, vsu + VSU_CHCOEFF(i));
 		}
-		sys_write32(VSU_CTRL_EN | VSU_CTRL_COEFF_RDY, vsu + VSU_CTRL);
+		sys_write32(VSU_CTRL_EN, vsu + VSU_CTRL);
 		sys_write32(data->render_w * 4U, ui + UI_PITCH);
 	} else {
 		sys_write32(size, ui + UI_SIZE);
