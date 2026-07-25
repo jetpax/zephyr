@@ -20,3 +20,9 @@ CONFIG_PM_CPU_OPS=y
 CONFIG_ARM64_VA_BITS_36=y
 CONFIG_ARM64_PA_BITS_36=y
 CONFIG_MAX_XLAT_TABLES=16
+# The kernel's virtual window defaults to 8 MiB, which is far too small
+# for a board with 4 GiB fitted: an application whose static footprint
+# passes it (two 1080p framebuffers and a game's zone heap do it easily)
+# keeps working, but k_mem_phys_addr asserts on anything allocated above
+# the line. 256 MiB covers the display driver plus generous app arenas.
+CONFIG_KERNEL_VM_SIZE=0x10000000
