@@ -34,6 +34,7 @@ LOG_MODULE_REGISTER(ccu_h616, CONFIG_CLOCK_CONTROL_LOG_LEVEL);
 #define PLL_PERIPH0_REG		0x020
 #define PLL_VIDEO0_REG		0x040
 #define PLL_VIDEO1_REG		0x048
+#define PLL_DE_REG		0x060
 
 #define PLL_ENABLE		BIT(31)
 #define PLL_LOCK_ENABLE		BIT(29)
@@ -70,6 +71,7 @@ enum ccu_parent {
 	P_VIDEO0_4X,
 	P_VIDEO1,
 	P_VIDEO1_4X,
+	P_PLL_DE,
 };
 
 struct ccu_clk {
@@ -106,12 +108,13 @@ static const struct ccu_clk ccu_clks[] = {
 	  .p_shift = 8, .p_width = 2, .mux_shift = 24, .mux_width = 2,
 	  .parent = { P_OSC24M, P_NONE, P_NONE, P_NONE } },
 
-	/* mux 0 is pll-de, not modelled: pll-periph0-2x / 4 = 300 MHz
-	 * covers the DE33 without waking another PLL
+	/* mux 0 = pll-de: the working Linux pipeline runs CLK_DE from
+	 * PLL_DE at div 1 (golden CCU dump), so model it; periph0-2x
+	 * stays as the PLL-free fallback on mux 1
 	 */
 	{ .id = CLK_DE, .type = T_MOD, .reg = 0x600, .m_width = 4,
 	  .mux_shift = 24, .mux_width = 1,
-	  .parent = { P_NONE, P_PERIPH0_2X, P_NONE, P_NONE } },
+	  .parent = { P_PLL_DE, P_PERIPH0_2X, P_NONE, P_NONE } },
 
 	{ .id = CLK_TCON_TV0, .type = T_MOD, .reg = 0xb80, .m_width = 4,
 	  .p_shift = 8, .p_width = 2, .mux_shift = 24, .mux_width = 3,
@@ -124,6 +127,7 @@ static const struct ccu_clk ccu_clks[] = {
 
 	{ .id = CLK_PLL_VIDEO0, .type = T_PLL, .reg = PLL_VIDEO0_REG },
 	{ .id = CLK_PLL_VIDEO1, .type = T_PLL, .reg = PLL_VIDEO1_REG },
+	{ .id = CLK_PLL_DE,     .type = T_PLL, .reg = PLL_DE_REG },
 };
 
 struct ccu_data {
@@ -131,6 +135,7 @@ struct ccu_data {
 	struct k_spinlock lock;
 	uint32_t periph0_2x_hz;
 	uint32_t pll_video_hz[2];
+	uint32_t pll_de_hz;
 };
 
 static const struct ccu_clk *ccu_find(uint32_t id)
@@ -163,6 +168,8 @@ static uint32_t parent_rate(struct ccu_data *data, enum ccu_parent p)
 		return data->pll_video_hz[1];
 	case P_VIDEO1_4X:
 		return data->pll_video_hz[1] * 4U;
+	case P_PLL_DE:
+		return data->pll_de_hz;
 	default:
 		return 0;
 	}
@@ -179,19 +186,80 @@ static int pll_video_wait_lock(mm_reg_t base, uint16_t reg)
 	return -ETIMEDOUT;
 }
 
+static bool pll_video_solve(uint32_t rate, uint32_t *n_out, bool *div2_out)
+{
+	/* Prefer the input-div-2 solution: it halves the VCO rate, and
+	 * the working Linux pipeline on this die always runs the video
+	 * PLL VCO low (1.188 GHz for 1080p, never 2.376 GHz). The
+	 * high-VCO solution locks but serializes dirty TMDS.
+	 */
+	uint64_t vco = (uint64_t)rate * 4U;
+
+	for (int div2 = 1; div2 >= 0; div2--) {
+		uint32_t ref = OSC24M_HZ / (div2 ? 2 : 1);
+		uint32_t n = vco / ref;
+
+		if ((vco % ref) == 0 && n >= PLL_N_MIN && n <= PLL_N_MAX &&
+		    vco <= PLL_VCO_MAX) {
+			*n_out = n;
+			*div2_out = div2;
+			return true;
+		}
+	}
+	return false;
+}
+
 static int pll_video_program(const struct device *dev, const struct ccu_clk *clk,
 			     uint32_t rate)
 {
 	struct ccu_data *data = dev->data;
 	mm_reg_t base = DEVICE_MMIO_GET(dev);
-	uint64_t vco = (uint64_t)rate * 4U;
-	uint32_t n = vco / OSC24M_HZ;
 	k_spinlock_key_t key;
-	uint32_t val;
+	uint32_t val, n;
+	bool div2;
 	int ret;
 
-	if ((rate % PLL_VIDEO_STEP_HZ) != 0 || n < PLL_N_MIN ||
-	    n > PLL_N_MAX || vco > PLL_VCO_MAX) {
+	if (!pll_video_solve(rate, &n, &div2)) {
+		return -ENOTSUP;
+	}
+
+	key = k_spin_lock(&data->lock);
+	val = sys_read32(base + clk->reg);
+	val &= ~(0xffU << 8);
+	val &= ~(PLL_INPUT_DIV2 | PLL_OUTPUT_DIV2);
+	val |= PLL_N_FIELD(n);
+	if (div2) {
+		val |= PLL_INPUT_DIV2;
+	}
+	val |= PLL_ENABLE | PLL_LOCK_ENABLE | PLL_OUTPUT_ENABLE;
+	sys_write32(val, base + clk->reg);
+	k_spin_unlock(&data->lock, key);
+
+	ret = pll_video_wait_lock(base, clk->reg);
+	if (ret) {
+		LOG_ERR("pll-video%d lock timeout (N=%u)",
+			pll_video_index(clk), n);
+		return ret;
+	}
+
+	data->pll_video_hz[pll_video_index(clk)] = rate;
+	LOG_DBG("pll-video%d = %u Hz (N=%u)", pll_video_index(clk), rate, n);
+	return 0;
+}
+
+/* PLL_DE: same NM register layout as the video PLLs but the output is
+ * the VCO directly (no fixed /4 tap), so rate = 24 MHz * N.
+ */
+static int pll_de_program(const struct device *dev, const struct ccu_clk *clk,
+			  uint32_t rate)
+{
+	struct ccu_data *data = dev->data;
+	mm_reg_t base = DEVICE_MMIO_GET(dev);
+	k_spinlock_key_t key;
+	uint32_t val, n = rate / OSC24M_HZ;
+	int ret;
+
+	if ((rate % OSC24M_HZ) != 0 || n < PLL_N_MIN || n > PLL_N_MAX) {
 		return -ENOTSUP;
 	}
 
@@ -206,13 +274,12 @@ static int pll_video_program(const struct device *dev, const struct ccu_clk *clk
 
 	ret = pll_video_wait_lock(base, clk->reg);
 	if (ret) {
-		LOG_ERR("pll-video%d lock timeout (N=%u)",
-			pll_video_index(clk), n);
+		LOG_ERR("pll-de lock timeout (N=%u)", n);
 		return ret;
 	}
 
-	data->pll_video_hz[pll_video_index(clk)] = rate;
-	LOG_DBG("pll-video%d = %u Hz (N=%u)", pll_video_index(clk), rate, n);
+	data->pll_de_hz = rate;
+	LOG_DBG("pll-de = %u Hz (N=%u)", rate, n);
 	return 0;
 }
 
@@ -294,15 +361,19 @@ static int mod_set_rate(const struct device *dev, const struct ccu_clk *clk,
 			}
 
 			for (uint32_t p = 0; p < BIT(clk->p_width ? clk->p_width : 1); p++) {
+				/* ascending m: first valid hit = smallest
+				 * PLL rate = lowest VCO, which this die
+				 * needs for clean TMDS
+				 */
 				for (uint32_t m = 1; m <= BIT(clk->m_width); m++) {
 					uint64_t leaf = (uint64_t)rate * m << p;
 					uint64_t pll = leaf / mult;
 					const struct ccu_clk *pc;
+					uint32_t pn;
+					bool pdiv2;
 
 					if (leaf % mult ||
-					    pll % PLL_VIDEO_STEP_HZ ||
-					    pll * 4 / OSC24M_HZ < PLL_N_MIN ||
-					    pll * 4 > PLL_VCO_MAX) {
+					    !pll_video_solve(pll, &pn, &pdiv2)) {
 						continue;
 					}
 					pc = ccu_find((par == P_VIDEO0 ||
@@ -419,7 +490,8 @@ static int ccu_h616_get_rate(const struct device *dev,
 			return 0;
 		}
 		phz = OSC24M_HZ / ((val & PLL_INPUT_DIV2) ? 2 : 1);
-		*rate = (uint32_t)(((uint64_t)phz * PLL_N(val)) / 4U);
+		*rate = (uint32_t)((uint64_t)phz * PLL_N(val) /
+				   ((clk->reg == PLL_DE_REG) ? 1U : 4U));
 		return 0;
 	case T_MOD: {
 		uint32_t mux, m, p;
@@ -454,6 +526,9 @@ static int ccu_h616_set_rate(const struct device *dev,
 
 	switch (clk->type) {
 	case T_PLL:
+		if (clk->reg == PLL_DE_REG) {
+			return pll_de_program(dev, clk, rate);
+		}
 		return pll_video_program(dev, clk, rate);
 	case T_MOD:
 		return mod_set_rate(dev, clk, rate);

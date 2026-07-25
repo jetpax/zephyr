@@ -120,5 +120,6 @@
  */
 #define CLK_PLL_VIDEO0		192
 #define CLK_PLL_VIDEO1		193
+#define CLK_PLL_DE		194
 
 #endif /* _DT_BINDINGS_CLK_SUN50I_H616_H_ */
