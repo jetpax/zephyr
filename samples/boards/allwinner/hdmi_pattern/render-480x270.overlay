@@ -1,0 +1,16 @@
+/*
+ * Copyright (c) 2026 Jonathan E. Peace <jep@alphabetiq.com>
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Render surface that scales to the mode exactly: 480x270 x4 fills
+ * 1920x1080, so both centring offsets are zero and no black margin is
+ * drawn. The zero-offset case exercises de33_write's fast path, so
+ * pair it with an offset case such as render-400x250 -- a fault in the
+ * centring is invisible here. Build with:
+ *   west build ... -- -DEXTRA_DTC_OVERLAY_FILE=render-480x270.overlay
+ */
+
+&display {
+	render-width = <480>;
+	render-height = <270>;
+};

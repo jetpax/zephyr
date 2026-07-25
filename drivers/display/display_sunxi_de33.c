@@ -362,10 +362,17 @@ struct de33_data {
 	 */
 	uint16_t render_w, render_h;
 	uint16_t scale;
-	/* framebuffer geometry: the scanout buffer is render-sized when the
-	 * hardware scales, mode-sized when the CPU does
+	/* Where the scaled image sits in the mode. This is a BLENDER
+	 * placement and nothing else; it is emphatically not a framebuffer
+	 * coordinate when the hardware scales.
 	 */
-	uint16_t fb_w, sw_scale, off_x, off_y;
+	uint16_t off_x, off_y;
+	/* Framebuffer geometry, the only thing de33_write may use: the
+	 * scanout buffer is render-sized at 1:1 when the hardware scales,
+	 * and mode-sized with the expansion and the centring baked in when
+	 * the CPU does.
+	 */
+	uint16_t fb_w, sw_scale, sw_off_x, sw_off_y;
 	bool hw_scaled;
 	uintptr_t fb_phys[2];
 	uint8_t front;
@@ -1043,7 +1050,7 @@ static int de33_write(const struct device *dev, const uint16_t x,
 		return -EINVAL;
 	}
 
-	first_row = (size_t)data->off_y + (size_t)y * s;
+	first_row = (size_t)data->sw_off_y + (size_t)y * s;
 
 	/*
 	 * A full-surface write goes to the back buffer and is flipped. A
@@ -1058,7 +1065,7 @@ static int de33_write(const struct device *dev, const uint16_t x,
 							       (uint8_t)pass)];
 		const uint32_t *src = buf;
 
-		if (s == 1U && data->off_x == 0U && data->off_y == 0U) {
+		if (s == 1U && data->sw_off_x == 0U && data->sw_off_y == 0U) {
 			uint32_t *dst = &fb[(size_t)y * fb_w + x];
 
 			for (uint16_t row = 0; row < desc->height; row++) {
@@ -1070,7 +1077,7 @@ static int de33_write(const struct device *dev, const uint16_t x,
 			for (uint16_t row = 0; row < desc->height; row++) {
 				uint32_t *out = &fb[(first_row +
 						     (size_t)row * s) * fb_w +
-						    data->off_x +
+						    data->sw_off_x +
 						    (size_t)x * s];
 				uint32_t *dst = out;
 
@@ -1148,19 +1155,29 @@ static int de33_init(const struct device *dev)
 	data->off_x = (m->w - data->render_w * data->scale) / 2U;
 	data->off_y = (m->h - data->render_h * data->scale) / 2U;
 	/*
-	 * With the scaler on, the framebuffer is the render surface itself
-	 * and the offsets are a blender placement; without it, callers get
-	 * expanded into a mode-sized buffer at those offsets by the CPU,
-	 * which costs a fixed ~31 ms per frame at 320x200 x5 to 1080p.
+	 * With the scaler on, the framebuffer IS the render surface: it is
+	 * render-wide, written 1:1, and the centring is done downstream by
+	 * the blender, so de33_write must apply no offset at all. Adding
+	 * off_x to a render-wide row runs each row off its own end and into
+	 * the start of the next one, which reads as a horizontal rotation
+	 * by off_x pixels -- and at 320x200 in 1080p, where off_x happens to
+	 * be exactly half the render width, as the half-width rotation that
+	 * cost this driver a bring-up session. Without the scaler the CPU
+	 * expands into a mode-sized buffer and the centring does belong
+	 * here, at a fixed ~31 ms per frame for 320x200 x5 to 1080p.
 	 */
 	data->hw_scaled = IS_ENABLED(CONFIG_DISPLAY_SUNXI_DE33_HW_SCALER) &&
 			  data->scale > 1U;
 	if (data->hw_scaled) {
 		data->fb_w = data->render_w;
 		data->sw_scale = 1U;
+		data->sw_off_x = 0U;
+		data->sw_off_y = 0U;
 	} else {
 		data->fb_w = m->w;
 		data->sw_scale = data->scale;
+		data->sw_off_x = data->off_x;
+		data->sw_off_y = data->off_y;
 	}
 
 	if (!device_is_ready(cfg->ccu)) {

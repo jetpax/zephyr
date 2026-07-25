@@ -1,0 +1,17 @@
+/*
+ * Copyright (c) 2026 Jonathan E. Peace <jep@alphabetiq.com>
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Render surface where the centring offset is NOT half the render
+ * width: 400x250 scales x4 to 1600x1000 at +160+140, so off_x is 160
+ * while half the width is 200. At 320x200 and 640x400 the two happen
+ * to be equal, which is what disguised a rotation by off_x as a
+ * rotation by half the width. Keep this case in any scaler bisect.
+ * Build with:
+ *   west build ... -- -DEXTRA_DTC_OVERLAY_FILE=render-400x250.overlay
+ */
+
+&display {
+	render-width = <400>;
+	render-height = <250>;
+};
