@@ -1,0 +1,66 @@
+/*
+ * Copyright (c) 2026 Jonathan E. Peace <jep@alphabetiq.com>
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/dts-v1/;
+
+#include <allwinner/sun50i-h618.dtsi>
+#include <common/mem.h>
+
+/ {
+	model = "FX-H618-D4 V10 TV box";
+	compatible = "fx,h618-d4", "allwinner,sun50i-h618";
+
+	chosen {
+		zephyr,console = &uart0;
+		zephyr,shell-uart = &uart0;
+		zephyr,sram = &dram0;
+		zephyr,display = &display;
+	};
+
+	aliases {
+		sdhc0 = &smhc0;
+	};
+
+	/*
+	 * 4 GiB fitted. BL31 owns [0x40000000, 0x40040000); Zephyr
+	 * claims the rest of DRAM from its 0x40080000 entry point.
+	 */
+	dram0: memory@40080000 {
+		device_type = "memory";
+		compatible = "mmio-sram";
+		reg = <0x40080000 0xfff80000>;
+	};
+};
+
+&uart0 {
+	status = "okay";
+	current-speed = <115200>;
+};
+
+/*
+ * microSD slot (sdc0). The card doubles as the FEL-entry medium:
+ * fel-sdboot lives at 8 KB, so the first 16 KB of the raw device are
+ * off-limits to writes.
+ */
+&smhc0 {
+	status = "okay";
+
+	sdmmc {
+		compatible = "zephyr,sdmmc-disk";
+		disk-name = "SD";
+	};
+};
+
+/*
+ * HDMI socket, fixed 1080p60 with no EDID or HPD dependence. Enabled at
+ * board level because the connector is fitted; an application picks it
+ * up through the zephyr,display chosen node and pays for it only by
+ * setting CONFIG_DISPLAY=y, which is what brings in the driver and its
+ * static 1920x1080 XRGB8888 framebuffer (~8 MiB of the 4 GiB fitted).
+ */
+&display {
+	status = "okay";
+};

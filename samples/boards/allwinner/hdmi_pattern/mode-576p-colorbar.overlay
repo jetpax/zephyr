@@ -1,0 +1,11 @@
+/*
+ * Copyright (c) 2026 Jonathan E. Peace <jep@alphabetiq.com>
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Rate bisect: 576p50 (27 MHz pixel clock) + TCON colorbar.
+ */
+
+&display {
+	mode = "576p50";
+	tcon-test-pattern;
+};

@@ -1,0 +1,10 @@
+# Copyright (c) 2026 Jonathan E. Peace <jep@alphabetiq.com>
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Allwinner H618 CCU. The H618 unit is the H616 one; see
+  allwinner,sun50i-h616-ccu.yaml.
+
+compatible: "allwinner,sun50i-h618-ccu"
+
+include: allwinner,sun50i-h616-ccu.yaml

@@ -1,0 +1,23 @@
+# Copyright (c) 2026 Jonathan E. Peace <jep@alphabetiq.com>
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Allwinner H616/H618 clock control unit (CCU).
+
+  Clock consumers reference clocks by the identifiers in
+  include/zephyr/dt-bindings/clock/sun50i-h616-ccu.h, which mirror the
+  Linux binding.
+
+compatible: "allwinner,sun50i-h616-ccu"
+
+include: [clock-controller.yaml, base.yaml]
+
+properties:
+  reg:
+    required: true
+
+  "#clock-cells":
+    const: 1
+
+clock-cells:
+  - id

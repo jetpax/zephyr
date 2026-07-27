@@ -1,0 +1,10 @@
+# Copyright (c) 2026 Jonathan E. Peace <jep@alphabetiq.com>
+# SPDX-License-Identifier: Apache-2.0
+
+config RESET_SUN50I_H616_CCU
+	bool "Allwinner sun50i H616/H618 CCU reset driver"
+	default y
+	depends on DT_HAS_ALLWINNER_SUN50I_H616_CCU_RESET_ENABLED
+	help
+	  Reset controller driver for the block reset lines in the
+	  Allwinner H616/H618 clock control unit.

@@ -1,0 +1,15 @@
+# Copyright (c) 2026 Jonathan E. Peace <jep@alphabetiq.com>
+# SPDX-License-Identifier: Apache-2.0
+
+config SDHC_SUNXI_SMHC
+	bool "Allwinner sunxi SMHC host controller"
+	default y
+	depends on DT_HAS_ALLWINNER_SUNXI_SMHC_ENABLED
+	select SDHC_SUPPORTS_NATIVE_MODE
+	select CLOCK_CONTROL
+	select RESET
+	help
+	  Enable the Allwinner SMHC SD/MMC host controller driver
+	  (H6-generation IP: H616/H618). Polled PIO implementation of
+	  the sdhc.h device API; module clock from OSC24M, no IRQ, no
+	  DMA yet.

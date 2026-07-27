@@ -1,0 +1,19 @@
+# Copyright (c) 2026 Jonathan E. Peace <jep@alphabetiq.com>
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Reset lines of the Allwinner H616/H618 CCU. Child node of the CCU;
+  the register block is the parent's. Line identifiers live in
+  include/zephyr/dt-bindings/reset/sun50i-h616-ccu.h and mirror the
+  Linux binding.
+
+compatible: "allwinner,sun50i-h616-ccu-reset"
+
+include: [reset-controller.yaml, base.yaml]
+
+properties:
+  "#reset-cells":
+    const: 1
+
+reset-cells:
+  - id
