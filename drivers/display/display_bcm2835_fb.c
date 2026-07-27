@@ -67,11 +67,21 @@
 
 LOG_MODULE_REGISTER(bcm2835_fb, CONFIG_DISPLAY_LOG_LEVEL);
 
-/* Pixel order 1 = RGB. With depth 32 this puts R in bits [23:16] of
- * the ARGB8888 word; with depth 16 it puts R in the top 5 bits of the
- * RGB565 halfword -- both matching the Zephyr PIXEL_FORMAT_* layouts.
+/* VC SET_PIXEL_ORDER tag values (0x00048006): 0 = BGR, 1 = RGB.
+ *
+ * The tag names the channel order in the scanned word. A Zephyr consumer
+ * writes ARGB8888 = 0xAARRGGBB (R in bits [23:16]); to scan that back as
+ * red, the VC must be told the word is R-G-B from the top. Intuitively
+ * that is order 1 (RGB), and that is what this driver requested. But on
+ * the VC firmware shipped with the current card, order 1 scans a
+ * 0xAARRGGBB word with R and B EXCHANGED (verified on HDMI: every app's
+ * red renders blue, fleet-wide). Order 0 (BGR) is what actually yields
+ * correct RGB scanout here, so that is the request. The order the VC
+ * reports back is logged at init.
  */
+#define BCM2835_FB_PIXEL_ORDER_BGR 0U
 #define BCM2835_FB_PIXEL_ORDER_RGB 1U
+#define BCM2835_FB_PIXEL_ORDER_CORRECT BCM2835_FB_PIXEL_ORDER_BGR
 
 /* VC-bus alias mask: lower 30 bits = ARM physical address. */
 #define BCM2835_VC_BUS_MASK 0x3FFFFFFFU
@@ -389,6 +399,78 @@ int bcm2835_fb_wait(const struct device *dev, k_timeout_t timeout)
 	return bcm2835_fb_dma_wait(data, timeout);
 }
 
+int bcm2835_fb_set_render_size(const struct device *dev, uint16_t w, uint16_t h)
+{
+	struct bcm2835_fb_data *data = dev->data;
+	const struct device *fw = DEVICE_DT_GET_ONE(raspberrypi_bcm283x_firmware);
+	uint32_t phys_wh[2] = {0U, 0U};
+	uint32_t phys_w, phys_h, virt_w = w, virt_h = h;
+	uint32_t depth = (uint32_t)data->bpp * 8U;
+	uint32_t order = BCM2835_FB_PIXEL_ORDER_CORRECT;
+	uintptr_t fb_bus = 0, fb_phys;
+	uint32_t new_size = 0, pitch = 0;
+	int err;
+
+	if (w == 0U || h == 0U) {
+		return -EINVAL;
+	}
+	if ((uint32_t)w == data->width && (uint32_t)h == data->height) {
+		return 0; /* already this render size */
+	}
+	if (!device_is_ready(fw)) {
+		return -ENODEV;
+	}
+
+	/* The physical scanout mode is fixed (EDID); only the virtual size
+	 * changes, and the VC HVS rescales it to phys. So a core-sized FB
+	 * fills the screen with no launcher-side letterbox.
+	 */
+	if (rpi_fw_transfer(fw, RPI_FW_TAG_FB_GET_PHYSICAL_SIZE, phys_wh,
+			    sizeof(phys_wh)) < 0) {
+		return -EIO;
+	}
+	phys_w = phys_wh[0];
+	phys_h = phys_wh[1];
+
+	err = rpi_fw_fb_setup(fw, &phys_w, &phys_h, &virt_w, &virt_h, &depth,
+			      &order, 256U, &fb_bus, &new_size, &pitch);
+	if (err < 0) {
+		return err;
+	}
+	if (fb_bus == 0U || new_size == 0U || pitch == 0U ||
+	    (pitch % data->bpp) != 0U) {
+		return -EIO;
+	}
+	fb_phys = (uintptr_t)fb_bus & BCM2835_VC_BUS_MASK;
+
+	/* No outstanding DMA can straddle the remap. */
+	(void)bcm2835_fb_dma_wait(data, K_MSEC(250));
+
+	/* Remap only when the VC hands back a different buffer, or one
+	 * larger than the current mapping covers (shrinking within the boot
+	 * allocation typically returns the same address -- no remap).
+	 */
+	if (fb_phys != data->fb_phys || new_size > data->fb_size) {
+		if (data->fb_map != 0U) {
+			k_mem_unmap_phys_bare((uint8_t *)data->fb_map,
+					      data->fb_size);
+		}
+		device_map(&data->fb_map, fb_phys, new_size, K_MEM_ARM_NORMAL_NC);
+		data->fb = (uint8_t *)data->fb_map;
+		data->fb_phys = fb_phys;
+		data->fb_size = new_size;
+		LOG_INF("render %ux%u: FB remapped size %u pitch %u",
+			virt_w, virt_h, new_size, pitch);
+	} else {
+		LOG_INF("render %ux%u: same buffer, pitch %u",
+			virt_w, virt_h, pitch);
+	}
+	data->width = virt_w;
+	data->height = virt_h;
+	data->pitch = pitch;
+	return 0;
+}
+
 static DEVICE_API(display, bcm2835_fb_api) = {
 	.write = bcm2835_fb_write,
 	.read = bcm2835_fb_read,
@@ -407,7 +489,7 @@ static int bcm2835_fb_init(const struct device *dev)
 	uint32_t virt_w = cfg->render_width;   /* 0 = match phys */
 	uint32_t virt_h = cfg->render_height;
 	uint32_t depth;
-	uint32_t order = BCM2835_FB_PIXEL_ORDER_RGB;
+	uint32_t order = BCM2835_FB_PIXEL_ORDER_CORRECT;
 	uintptr_t fb_bus = 0;
 	uintptr_t fb_phys;
 	uint32_t pitch = 0;
@@ -499,6 +581,18 @@ static int bcm2835_fb_init(const struct device *dev)
 	LOG_INF("pitch %u bytes (W*bpp = %u; %s)", pitch,
 		(unsigned)(virt_w * data->bpp),
 		(pitch == virt_w * data->bpp) ? "no padding" : "PADDED");
+
+	/* SET_PIXEL_ORDER is a request; VC writes back what it actually
+	 * applied. A word written 0x00RRGGBB scans out correctly only when
+	 * this is RGB(1). If VC forced BGR(0) here, red and blue are
+	 * swapped on the panel -- surface it rather than let it show up as
+	 * "colours look off". (Diagnostic while chasing the retro-frontend
+	 * R/B swap; harmless to keep.)
+	 */
+	LOG_INF("pixel order: requested %u, VC applied %u (%s)",
+		BCM2835_FB_PIXEL_ORDER_CORRECT, order,
+		order == BCM2835_FB_PIXEL_ORDER_CORRECT ? "honored"
+						        : "VC OVERRODE");
 
 	/* VC-bus to ARM-physical translation: VC firmware returns
 	 * addresses in the 0xC0000000-aliased range (L2-coherent view);
