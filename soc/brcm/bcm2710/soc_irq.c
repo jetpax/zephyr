@@ -51,7 +51,24 @@
 #include <zephyr/sys/sys_io.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/sys/util_macro.h>
-#ifdef CONFIG_FPU_SHARING
+/*
+ * The whole mailbox-0 IPI apparatus below is SMP-only: its handlers
+ * (sched_ipi_handler, flush_fpu_ipi_handler) live in
+ * arch/arm64/core/smp.c, which is compiled only when
+ * CONFIG_MP_MAX_NUM_CPUS > 1 or CONFIG_SMP. Referencing them from an
+ * unconditional -- or merely FPU_SHARING-conditional -- code path
+ * leaves undefined symbols at link time in a single-core build, and
+ * FPU_SHARING is on by default in apps that never ask for SMP.
+ */
+#if defined(CONFIG_SMP) || (CONFIG_MP_MAX_NUM_CPUS > 1)
+#define SOC_IPI 1
+#endif
+
+#if defined(SOC_IPI) && defined(CONFIG_FPU_SHARING)
+#define SOC_FPU_IPI 1
+#endif
+
+#ifdef SOC_FPU_IPI
 #include <zephyr/kernel_structs.h>
 #include <kernel_arch_interface.h>
 #endif
@@ -144,8 +161,9 @@ static inline unsigned int this_core(void)
 #define MBOX0_IPI_SCHED         BIT(0)
 #define MBOX0_IPI_FPU           BIT(1)
 
+#ifdef SOC_IPI
 extern void sched_ipi_handler(const void *unused);
-#ifdef CONFIG_FPU_SHARING
+#ifdef SOC_FPU_IPI
 extern void flush_fpu_ipi_handler(const void *unused);
 #endif
 
@@ -171,7 +189,7 @@ static void mbox0_ipi_isr(const void *arg)
 		sys_write32(mbox, L1_MBOX_RDCLR(this_core()));
 	}
 	sched_ipi_handler(NULL);
-#ifdef CONFIG_FPU_SHARING
+#ifdef SOC_FPU_IPI
 	/*
 	 * FPU flush LAST: flush_fpu_ipi_handler() masks IRQs at DAIF and
 	 * deliberately leaves them masked (exception return restores the
@@ -192,8 +210,9 @@ void soc_sched_ipi(uint64_t target_mpidr)
 
 	sys_write32(MBOX0_IPI_SCHED, L1_MBOX_SET(core));
 }
+#endif /* SOC_IPI */
 
-#ifdef CONFIG_FPU_SHARING
+#ifdef SOC_FPU_IPI
 /* Raise the FPU-flush IPI on the target core (arch_flush_fpu_ipi hook). */
 void soc_flush_fpu_ipi(uint64_t target_mpidr)
 {
@@ -220,7 +239,7 @@ void soc_flush_fpu_ipi(uint64_t target_mpidr)
  */
 void arch_spin_relax(void)
 {
-#ifdef CONFIG_FPU_SHARING
+#ifdef SOC_FPU_IPI
 	unsigned int core = this_core();
 
 	if ((sys_read32(L1_MBOX_RDCLR(core)) & MBOX0_IPI_FPU) != 0U) {
@@ -235,7 +254,9 @@ void arch_spin_relax(void)
 /* Per-core: enable this core's mailbox-0 IPI (handler wired in z_soc_irq_init). */
 void soc_per_core_init_hook(void)
 {
+#ifdef SOC_IPI
 	irq_enable(IPI_IRQ);
+#endif
 }
 
 void z_soc_irq_init(void)
@@ -260,8 +281,10 @@ void z_soc_irq_init(void)
 	/* Cancel any FIQ left enabled by the boot firmware. */
 	sys_write32(0, ARMC_FIQ_CONTROL);
 
+#ifdef SOC_IPI
 	/* Register the scheduler-IPI handler (each core's mailbox 0). */
 	IRQ_CONNECT(IPI_IRQ, 0, mbox0_ipi_isr, NULL, 0);
+#endif
 }
 
 void z_soc_irq_enable(unsigned int irq)
