@@ -9,8 +9,22 @@ CONFIG_ARM64_PAGE_SIZE_64KB=y
 
 # The default 8 MMU translation tables are insufficient once the image
 # map, the SoC device regions and the 64 KiB-granule table splits are
-# accounted for.
-CONFIG_MAX_XLAT_TABLES=12
+# accounted for. Raised again with KERNEL_VM_SIZE below: a wider virtual
+# window can spread the same mappings across more 64 KiB-granule L3
+# blocks (each covers 32 MiB), and running out is a boot-time failure,
+# not a build error. arch/arm64/core/mmu.c logs "xlat tables: peak N of
+# M allocated" and warns above 7/8, so the real figure is observable.
+CONFIG_MAX_XLAT_TABLES=16
+
+# Kernel virtual address window. Zephyr's 8 MiB default is 8388608 bytes
+# against a 1920x1080 ARGB8888 framebuffer of 8355840 -- about 32 KiB of
+# slack in a window that must also hold every MMIO mapping. That is luck,
+# not headroom: device_map() fails with "insufficient virtual address
+# space" as soon as anything else needs mapping. The Pi Zero W hit this
+# for real (see its defconfig); the arm64 side cannot hit the companion
+# failure where the kernel image outgrows its own window, because the
+# image is mapped outside this allocator.
+CONFIG_KERNEL_VM_SIZE=0x2000000
 
 # RAM-loaded image -- no execute-in-place flash.
 CONFIG_XIP=n
