@@ -153,10 +153,16 @@
 		/*
 		 * AUX mini-UART (UART1). reg points at the mini-UART register
 		 * block (AUX base 0x20215000 + 0x40), matching the driver's
-		 * MU_* offsets. The driver does not touch AUX_ENABLES and trusts
-		 * the firmware-programmed baud, so config.txt must carry
-		 * enable_uart=1 (which enables the AUX block and the core-clock
-		 * lock the mini-UART baud divisor depends on).
+		 * MU_* offsets; the driver reaches AUX_ENABLES at 0x20215004
+		 * relative to that.
+		 *
+		 * config.txt should still carry enable_uart=1, which pins the
+		 * core clock the mini-UART baud divisor is derived from. On
+		 * parts with Bluetooth that also enables the AUX block and
+		 * programs the divisor, and the driver keeps both. On parts
+		 * without Bluetooth the PL011 is the primary UART, so
+		 * enable_uart=1 brings that up instead and the driver enables
+		 * AUX and programs the divisor itself.
 		 */
 		uart1: uart@20215040 {
 			compatible = "brcm,bcm2711-aux-uart";
