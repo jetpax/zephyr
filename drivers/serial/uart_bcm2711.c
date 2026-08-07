@@ -50,6 +50,24 @@
 #define BCM2711_MU_CNTL_RX_ENABLE	BIT(0)
 #define BCM2711_MU_CNTL_TX_ENABLE	BIT(1)
 
+/*
+ * AUX_ENABLES gates the whole AUX peripheral block. Until bit 0 is set,
+ * the mini-UART registers read as zero, so the first LSR poll in
+ * bcm2711_mu_lowlevel_init() spins forever.
+ *
+ * The node's reg window starts at the mini-UART block (AUX base + 0x40),
+ * so AUX_ENABLES (AUX base + 0x04) sits 0x3c below it, inside the same
+ * page that DEVICE_MMIO_MAP() maps. AUX_ENABLES is readable and writable
+ * while the block is disabled; it is the gate, not a gated register.
+ *
+ * The firmware normally sets this for us, but only on parts where the
+ * mini-UART is the primary UART. On a Pi without Bluetooth the PL011 is
+ * primary, enable_uart=1 brings that up instead, and the AUX block stays
+ * dark.
+ */
+#define BCM2711_AUX_ENABLES_OFFSET	0x3c
+#define BCM2711_AUX_ENABLE_MU		BIT(0)
+
 struct bcm2711_uart_config {
 	DEVICE_MMIO_ROM; /* Must be first */
 	uint32_t baud_rate;
@@ -68,6 +86,26 @@ struct bcm2711_uart_data {
 	void *cb_data;
 #endif
 };
+
+/*
+ * Enable the AUX mini-UART if the firmware has not. Returns true when we
+ * were the ones to enable it, which also means the firmware never
+ * programmed a baud divisor and the caller has to.
+ */
+static bool bcm2711_aux_enable_mu(mem_addr_t base)
+{
+	mem_addr_t aux_enables = base - BCM2711_AUX_ENABLES_OFFSET;
+	uint32_t val = sys_read32(aux_enables);
+
+	if (val & BCM2711_AUX_ENABLE_MU) {
+		return false;
+	}
+
+	/* Read-modify-write: SPI1/SPI2 share this register. */
+	sys_write32(val | BCM2711_AUX_ENABLE_MU, aux_enables);
+
+	return true;
+}
 
 static bool bcm2711_mu_lowlevel_can_getc(mem_addr_t base)
 {
@@ -131,6 +169,7 @@ static int uart_bcm2711_init(const struct device *dev)
 {
 	const struct bcm2711_uart_config *uart_cfg = dev->config;
 	struct bcm2711_uart_data *uart_data = dev->data;
+	bool fw_configured;
 	int err;
 
 	DEVICE_MMIO_MAP(dev, K_MEM_CACHE_NONE);
@@ -141,7 +180,15 @@ static int uart_bcm2711_init(const struct device *dev)
 		return err;
 	}
 
-	bcm2711_mu_lowlevel_init(uart_data->uart_addr, 1, uart_cfg->baud_rate, uart_cfg->clocks);
+	/*
+	 * Keep trusting the firmware's baud divisor where the firmware
+	 * brought the block up, so parts that already worked are untouched.
+	 * Where we had to enable it ourselves there is no divisor to trust.
+	 */
+	fw_configured = !bcm2711_aux_enable_mu(uart_data->uart_addr);
+
+	bcm2711_mu_lowlevel_init(uart_data->uart_addr, fw_configured, uart_cfg->baud_rate,
+				 uart_cfg->clocks);
 
 #ifdef CONFIG_UART_INTERRUPT_DRIVEN
 	uart_cfg->irq_config_func(dev);
